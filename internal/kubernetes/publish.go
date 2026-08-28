@@ -23,33 +23,55 @@ const publishIntentAnnotation = "coding-agent/publish-intent"
 
 var commitSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// PublishSource describes an eligible session workspace that can be published.
 type PublishSource struct {
-	Repository     string
-	Base           string
-	Image          string
+	// Repository is the Git repository configured for the session.
+	Repository string
+	// Base is the Git ref from which the session started.
+	Base string
+	// Image is the agent image used to run the publisher.
+	Image string
+	// WorkspaceClaim is the bound claim containing the source workspace.
 	WorkspaceClaim string
 }
 
+// PublishRequest defines one bounded publisher Job.
 type PublishRequest struct {
-	Namespace     string
-	Session       string
-	Intent        string
-	Repository    string
-	Base          string
-	Branch        string
+	// Namespace owns the session and publisher resources.
+	Namespace string
+	// Session identifies the source session.
+	Session string
+	// Intent identifies an idempotent publish attempt.
+	Intent string
+	// Repository is the remote Git repository URL.
+	Repository string
+	// Base is the trusted remote ref cloned before copying workspace changes.
+	Base string
+	// Branch is the new remote branch created by the publisher.
+	Branch string
+	// CommitMessage is the message used for the workspace commit.
 	CommitMessage string
-	AuthorName    string
-	AuthorEmail   string
-	Image         string
-	Workspace     string
-	Timeout       time.Duration
+	// AuthorName is the Git commit author's display name.
+	AuthorName string
+	// AuthorEmail is the Git commit author's email address.
+	AuthorEmail string
+	// Image contains the publisher entrypoint.
+	Image string
+	// Workspace is the claim containing the source workspace.
+	Workspace string
+	// Timeout bounds the publisher Job and the wait for its result.
+	Timeout time.Duration
 }
 
+// PublishResult identifies the branch and commit pushed by a publisher Job.
 type PublishResult struct {
+	// Branch is the remote branch created by the publisher.
 	Branch string
+	// Commit is the commit SHA verified on the remote branch.
 	Commit string
 }
 
+// PublishSource finds and validates a completed update session or stopped long session.
 func (c *Client) PublishSource(ctx context.Context, namespace, session string) (PublishSource, error) {
 	job, jobErr := c.typed.BatchV1().Jobs(namespace).Get(ctx, session, metav1.GetOptions{})
 	set, setErr := c.typed.AppsV1().StatefulSets(namespace).Get(ctx, session, metav1.GetOptions{})
@@ -98,7 +120,7 @@ func (c *Client) PublishSource(ctx context.Context, namespace, session string) (
 	if environment["AGENT_REPOSITORY"] == "" || environment["AGENT_REF"] == "" {
 		return PublishSource{}, errors.New("session repository and base ref are required for publishing")
 	}
-	workspaceClaim := "workspace-" + session
+	workspaceClaim := agent.WorkspaceClaimName(session)
 	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, workspaceClaim, metav1.GetOptions{})
 	if err != nil {
 		return PublishSource{}, fmt.Errorf("get workspace PersistentVolumeClaim: %w", err)
@@ -114,8 +136,9 @@ func (c *Client) PublishSource(ctx context.Context, namespace, session string) (
 	}, nil
 }
 
-func (c *Client) GitHubToken(ctx context.Context, namespace, secretName string) (string, error) {
-	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
+// GitHubToken returns the token stored in the namespace's GitHub Secret.
+func (c *Client) GitHubToken(ctx context.Context, namespace string) (string, error) {
+	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, agent.GitSecretName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("get GitHub Secret: %w", err)
 	}
@@ -126,6 +149,7 @@ func (c *Client) GitHubToken(ctx context.Context, namespace, secretName string) 
 	return token, nil
 }
 
+// PublisherIntent returns the recorded intent and whether the publisher Job exists.
 func (c *Client) PublisherIntent(ctx context.Context, namespace, session string) (string, bool, error) {
 	job, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(session), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -137,6 +161,7 @@ func (c *Client) PublisherIntent(ctx context.Context, namespace, session string)
 	return job.Annotations[publishIntentAnnotation], true, nil
 }
 
+// RunPublisher creates or resumes the matching publisher Job and waits for its result.
 func (c *Client) RunPublisher(ctx context.Context, request PublishRequest) (PublishResult, error) {
 	if request.Timeout < time.Second {
 		return PublishResult{}, errors.New("publisher timeout must be at least one second")
@@ -149,18 +174,19 @@ func (c *Client) RunPublisher(ctx context.Context, request PublishRequest) (Publ
 		if err := c.deletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
 			return PublishResult{}, err
 		}
-		job, err = c.createPublisherJob(ctx, request)
-		if err != nil {
+		if _, err := c.createPublisherJob(ctx, request); err != nil {
 			return PublishResult{}, err
 		}
 	}
 	return c.waitPublisher(ctx, request.Namespace, request.Session, request.Intent, request.Timeout)
 }
 
+// DeletePublisher removes a session's publisher Job and waits for its Pods to disappear.
 func (c *Client) DeletePublisher(ctx context.Context, namespace, session string) error {
 	return c.deletePublisherJob(ctx, namespace, session)
 }
 
+// WaitPublisher waits for an existing publisher Job with the expected intent.
 func (c *Client) WaitPublisher(ctx context.Context, namespace, session, intent string, timeout time.Duration) (PublishResult, error) {
 	return c.waitPublisher(ctx, namespace, session, intent, timeout)
 }

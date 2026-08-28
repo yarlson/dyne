@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestBuildRejectsInvalidContracts(t *testing.T) {
+func TestManifestRejectsInvalidContracts(t *testing.T) {
 	cases := []struct {
 		name    string
 		change  func(*Session)
@@ -20,7 +20,7 @@ func TestBuildRejectsInvalidContracts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			session := validSession()
 			test.change(&session)
-			if _, err := Build(session); err == nil || !strings.Contains(err.Error(), test.message) {
+			if _, err := Manifest(session); err == nil || !strings.Contains(err.Error(), test.message) {
 				t.Fatalf("got error %v, want message containing %q", err, test.message)
 			}
 		})

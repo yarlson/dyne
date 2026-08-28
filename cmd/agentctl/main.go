@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"coding-agent-k8s/internal/agent"
-	"coding-agent-k8s/internal/delivery"
 	"coding-agent-k8s/internal/kubernetes"
+	"coding-agent-k8s/internal/publish"
 )
 
 func main() {
@@ -43,7 +43,7 @@ func run(ctx context.Context, args []string) error {
 	case "shell":
 		return shell(ctx, args[1:])
 	case "publish":
-		return publish(ctx, args[1:])
+		return publishPullRequest(ctx, args[1:])
 	case "stop":
 		return scale(ctx, args[1:], 0)
 	case "resume":
@@ -70,13 +70,9 @@ func bootstrap(ctx context.Context, args []string) error {
 	if *authFile != "" && *apiKeyEnv != "" {
 		return errors.New("use either --auth-file or --api-key-env")
 	}
-	resources, err := agent.Bootstrap(*namespace, *authFile, *apiKeyEnv, *githubTokenEnv)
+	manifest, err := agent.Bootstrap(*namespace, *authFile, *apiKeyEnv, *githubTokenEnv)
 	if err != nil {
 		return err
-	}
-	manifest, err := agent.JSON(resources)
-	if err != nil {
-		return fmt.Errorf("encode bootstrap resources: %w", err)
 	}
 	client, err := kubernetes.New(*contextName)
 	if err != nil {
@@ -103,7 +99,7 @@ func start(ctx context.Context, args []string) error {
 		return err
 	}
 	seconds := int64(timeout.Seconds())
-	resources, err := agent.Build(agent.Session{
+	manifest, err := agent.Manifest(agent.Session{
 		Name:        *name,
 		Namespace:   *namespace,
 		Image:       *image,
@@ -119,10 +115,6 @@ func start(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	manifest, err := agent.JSON(resources)
-	if err != nil {
-		return fmt.Errorf("encode session resources: %w", err)
-	}
 	client, err := kubernetes.New(*contextName)
 	if err != nil {
 		return err
@@ -131,11 +123,11 @@ func start(ctx context.Context, args []string) error {
 }
 
 func status(ctx context.Context, args []string) error {
-	common, err := parseCommon("status", args)
+	target, err := parseSessionTarget("status", args)
 	if err != nil {
 		return err
 	}
-	return common.client.Status(ctx, common.namespace, common.name)
+	return target.client.Status(ctx, target.namespace, target.name)
 }
 
 func logs(ctx context.Context, args []string) error {
@@ -190,18 +182,18 @@ func task(ctx context.Context, args []string) error {
 }
 
 func shell(ctx context.Context, args []string) error {
-	common, err := parseCommon("shell", args)
+	target, err := parseSessionTarget("shell", args)
 	if err != nil {
 		return err
 	}
-	pod, err := common.client.WaitPodReady(ctx, common.namespace, common.name, 120*time.Second)
+	pod, err := target.client.WaitPodReady(ctx, target.namespace, target.name, 120*time.Second)
 	if err != nil {
 		return err
 	}
-	return common.client.Exec(ctx, common.namespace, pod, "agent", []string{"bash"}, true)
+	return target.client.Exec(ctx, target.namespace, pod, "agent", []string{"bash"}, true)
 }
 
-func publish(ctx context.Context, args []string) error {
+func publishPullRequest(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("publish", flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
@@ -223,7 +215,7 @@ func publish(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	request := delivery.Request{
+	request := publish.Request{
 		Namespace:     *namespace,
 		Session:       *name,
 		Branch:        *branch,
@@ -234,18 +226,18 @@ func publish(ctx context.Context, args []string) error {
 		Draft:         !*ready,
 		Timeout:       *timeout,
 	}
-	if err := delivery.Validate(request); err != nil {
+	if err := request.Validate(); err != nil {
 		return err
 	}
 	cluster, err := kubernetes.New(*contextName)
 	if err != nil {
 		return err
 	}
-	result, err := delivery.Publish(ctx, cluster, request)
+	result, err := publish.Run(ctx, cluster, request)
 	if err != nil {
 		return err
 	}
-	printDelivery(result)
+	printPublishResult(result)
 	return nil
 }
 
@@ -254,47 +246,50 @@ func scale(ctx context.Context, args []string, replicas int32) error {
 	if replicas == 1 {
 		command = "resume"
 	}
-	common, err := parseCommon(command, args)
+	target, err := parseSessionTarget(command, args)
 	if err != nil {
 		return err
 	}
-	return common.client.ScaleStatefulSet(ctx, common.namespace, common.name, replicas)
+	if replicas == 0 {
+		return target.client.StopSession(ctx, target.namespace, target.name)
+	}
+	return target.client.ResumeSession(ctx, target.namespace, target.name)
 }
 
-func deleteSession(ctx context.Context, args []string, storage bool) error {
+func deleteSession(ctx context.Context, args []string, deleteStorage bool) error {
 	command := "delete"
-	if storage {
+	if deleteStorage {
 		command = "destroy"
 	}
-	common, err := parseCommon(command, args)
+	target, err := parseSessionTarget(command, args)
 	if err != nil {
 		return err
 	}
-	return common.client.DeleteSession(ctx, common.namespace, common.name, storage)
+	return target.client.DeleteSession(ctx, target.namespace, target.name, deleteStorage)
 }
 
-type commonOptions struct {
+type sessionTarget struct {
 	client    *kubernetes.Client
 	namespace string
 	name      string
 }
 
-func parseCommon(command string, args []string) (commonOptions, error) {
+func parseSessionTarget(command string, args []string) (sessionTarget, error) {
 	set := flag.NewFlagSet(command, flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	if err := set.Parse(args); err != nil {
-		return commonOptions{}, err
+		return sessionTarget{}, err
 	}
 	if *name == "" {
-		return commonOptions{}, errors.New("--name is required")
+		return sessionTarget{}, errors.New("--name is required")
 	}
 	client, err := kubernetes.New(*contextName)
 	if err != nil {
-		return commonOptions{}, err
+		return sessionTarget{}, err
 	}
-	return commonOptions{client: client, namespace: *namespace, name: *name}, nil
+	return sessionTarget{client: client, namespace: *namespace, name: *name}, nil
 }
 
 func usageError() error {
@@ -319,7 +314,7 @@ func readPullRequestBody(path string) (string, error) {
 	return string(contents), nil
 }
 
-func printDelivery(result delivery.Result) {
+func printPublishResult(result publish.Result) {
 	fmt.Printf("pull request #%d: %s\n", result.PullRequestNumber, result.PullRequestURL)
 	fmt.Printf("branch: %s\n", result.Branch)
 	if result.Commit != "" {

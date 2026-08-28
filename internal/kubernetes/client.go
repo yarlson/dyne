@@ -15,6 +15,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"coding-agent-k8s/internal/agent"
+
 	"golang.org/x/term"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -40,6 +42,7 @@ import (
 
 const fieldManager = "agentctl"
 
+// Client applies and manages coding-agent resources through the Kubernetes API.
 type Client struct {
 	config  *rest.Config
 	typed   clientset.Interface
@@ -50,6 +53,7 @@ type Client struct {
 	stderr  io.Writer
 }
 
+// New returns a client configured from the standard kubeconfig loading rules.
 func New(contextName string) (*Client, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
@@ -77,6 +81,7 @@ func New(contextName string) (*Client, error) {
 	}, nil
 }
 
+// Apply server-side applies every resource in a Kubernetes List manifest.
 func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	var list unstructured.UnstructuredList
 	if err := json.Unmarshal(manifest, &list); err != nil {
@@ -121,6 +126,7 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	return nil
 }
 
+// Status writes the workloads, Pods, and claims owned by a session to the client's output.
 func (c *Client) Status(ctx context.Context, namespace, session string) error {
 	selector := sessionSelector(session)
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
@@ -159,6 +165,7 @@ func (c *Client) Status(ctx context.Context, namespace, session string) error {
 	return nil
 }
 
+// Logs streams logs from one container to the client's output.
 func (c *Client) Logs(ctx context.Context, namespace, pod, container string, follow bool) (result error) {
 	stream, err := c.typed.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
 		Container: container,
@@ -178,6 +185,7 @@ func (c *Client) Logs(ctx context.Context, namespace, pod, container string, fol
 	return nil
 }
 
+// Exec runs a command in a container and optionally connects the local terminal.
 func (c *Client) Exec(ctx context.Context, namespace, pod, container string, command []string, interactive bool) (result error) {
 	request := c.typed.CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -222,16 +230,24 @@ func (c *Client) Exec(ctx context.Context, namespace, pod, container string, com
 	return nil
 }
 
-func (c *Client) ScaleStatefulSet(ctx context.Context, namespace, name string, replicas int32) error {
-	if replicas > 0 {
-		publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
-		if err == nil && !jobComplete(publisher) && !jobFailed(publisher) {
-			return fmt.Errorf("cannot resume while publisher Job %s is active", publisher.Name)
-		}
-		if err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("check publisher Job before resume: %w", err)
-		}
+// StopSession scales a long session to zero while retaining its storage.
+func (c *Client) StopSession(ctx context.Context, namespace, name string) error {
+	return c.scaleSession(ctx, namespace, name, 0)
+}
+
+// ResumeSession starts a stopped long session unless its publisher is active.
+func (c *Client) ResumeSession(ctx context.Context, namespace, name string) error {
+	publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
+	if err == nil && !jobComplete(publisher) && !jobFailed(publisher) {
+		return fmt.Errorf("cannot resume while publisher Job %s is active", publisher.Name)
 	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("check publisher Job before resume: %w", err)
+	}
+	return c.scaleSession(ctx, namespace, name, 1)
+}
+
+func (c *Client) scaleSession(ctx context.Context, namespace, name string, replicas int32) error {
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		scale, err := c.typed.AppsV1().StatefulSets(namespace).GetScale(ctx, name, metav1.GetOptions{})
 		if err != nil {
@@ -248,18 +264,19 @@ func (c *Client) ScaleStatefulSet(ctx context.Context, namespace, name string, r
 	return nil
 }
 
-func (c *Client) DeleteSession(ctx context.Context, namespace, name string, storage bool) error {
+// DeleteSession removes a session's compute resources and optionally its persistent claims.
+func (c *Client) DeleteSession(ctx context.Context, namespace, name string, deleteStorage bool) error {
 	if err := c.deletePublisherJob(ctx, namespace, name); err != nil {
 		return err
 	}
 	if err := c.deleteWorkloads(ctx, namespace, name); err != nil {
 		return err
 	}
-	if !storage {
+	if !deleteStorage {
 		return nil
 	}
 	var deleteErrors []error
-	for _, claim := range []string{"workspace-" + name, "home-" + name, "codex-" + name} {
+	for _, claim := range []string{agent.WorkspaceClaimName(name), agent.HomeClaimName(name), agent.CodexClaimName(name)} {
 		err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{})
 		if apierrors.IsNotFound(err) {
 			continue
@@ -301,6 +318,7 @@ func (c *Client) deleteWorkloads(ctx context.Context, namespace, name string) er
 	return errors.Join(deleteErrors...)
 }
 
+// WaitPodReady waits until the newest Pod for a session is ready.
 func (c *Client) WaitPodReady(ctx context.Context, namespace, session string, timeout time.Duration) (string, error) {
 	var podName string
 	err := wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
@@ -312,7 +330,7 @@ func (c *Client) WaitPodReady(ctx context.Context, namespace, session string, ti
 			return false, err
 		}
 		if pod.Status.Phase == corev1.PodFailed {
-			return false, fmt.Errorf("Pod %s failed", pod.Name)
+			return false, fmt.Errorf("pod %s failed", pod.Name)
 		}
 		if podReady(pod) {
 			podName = pod.Name
@@ -326,6 +344,7 @@ func (c *Client) WaitPodReady(ctx context.Context, namespace, session string, ti
 	return podName, nil
 }
 
+// PodName returns the newest Pod owned by a session.
 func (c *Client) PodName(ctx context.Context, namespace, session string) (string, error) {
 	pod, err := c.sessionPod(ctx, namespace, session)
 	if err != nil {

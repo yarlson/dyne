@@ -21,7 +21,7 @@ func TestParsePublishResultReadsTerminationContract(t *testing.T) {
 func TestResumeRefusesAnActivePublisher(t *testing.T) {
 	publisher := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "example-publish", Namespace: "coding-agents"}}
 	client := &Client{typed: fake.NewSimpleClientset(publisher), stdout: io.Discard}
-	err := client.ScaleStatefulSet(context.Background(), "coding-agents", "example", 1)
+	err := client.ResumeSession(context.Background(), "coding-agents", "example")
 	if err == nil || !strings.Contains(err.Error(), "cannot resume while publisher Job example-publish is active") {
 		t.Fatalf("got error %v", err)
 	}

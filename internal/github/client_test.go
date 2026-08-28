@@ -11,17 +11,7 @@ import (
 	"time"
 )
 
-func TestParseRepositoryURLAcceptsOneGitHubRepository(t *testing.T) {
-	repository, err := ParseRepositoryURL("https://github.com/lokalise/kargo.git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repository.Owner != "lokalise" || repository.Name != "kargo" {
-		t.Fatalf("got repository %#v", repository)
-	}
-}
-
-func TestParseRepositoryURLRejectsUnsafeOrUnsupportedLocations(t *testing.T) {
+func TestParseRepositoryRejectsUnsafeOrUnsupportedLocations(t *testing.T) {
 	for _, repositoryURL := range []string{
 		"http://github.com/lokalise/kargo.git",
 		"https://token@github.com/lokalise/kargo.git",
@@ -29,14 +19,14 @@ func TestParseRepositoryURLRejectsUnsafeOrUnsupportedLocations(t *testing.T) {
 		"https://github.com/lokalise/group/kargo.git",
 	} {
 		t.Run(repositoryURL, func(t *testing.T) {
-			if _, err := ParseRepositoryURL(repositoryURL); err == nil {
+			if _, err := ParseRepository(repositoryURL); err == nil {
 				t.Fatal("expected repository URL to be rejected")
 			}
 		})
 	}
 }
 
-func TestCreatePullRequestSendsDraftDeliveryContract(t *testing.T) {
+func TestCreatePullRequestSendsDraftRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost || request.URL.Path != "/repos/lokalise/kargo/pulls" {
 			t.Errorf("got %s %s", request.Method, request.URL.Path)
@@ -62,7 +52,7 @@ func TestCreatePullRequestSendsDraftDeliveryContract(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
-	pull, err := client.CreatePullRequest(context.Background(), Repository{Owner: "lokalise", Name: "kargo"}, "main", "yar/improve-delivery", "Improve delivery", "PR details", true)
+	pull, err := client.CreatePullRequest(context.Background(), kargoRepository(t), "main", "yar/improve-delivery", "Improve delivery", "PR details", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +61,7 @@ func TestCreatePullRequestSendsDraftDeliveryContract(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedUserProvidesGitHubCommitIdentity(t *testing.T) {
+func TestCommitAuthorUsesAuthenticatedGitHubIdentity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet || request.URL.Path != "/user" {
 			t.Errorf("got %s %s", request.Method, request.URL.Path)
@@ -81,12 +71,12 @@ func TestAuthenticatedUserProvidesGitHubCommitIdentity(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
-	user, err := client.AuthenticatedUser(context.Background())
+	name, email, err := client.CommitAuthor(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if user.CommitName() != "yar" || user.CommitEmail() != "12345+yar@users.noreply.github.com" {
-		t.Fatalf("got commit identity %q <%s>", user.CommitName(), user.CommitEmail())
+	if name != "yar" || email != "12345+yar@users.noreply.github.com" {
+		t.Fatalf("got commit identity %q <%s>", name, email)
 	}
 }
 
@@ -100,7 +90,7 @@ func TestBranchCommitPreservesNestedBranchName(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
-	commit, exists, err := client.BranchCommit(context.Background(), Repository{Owner: "lokalise", Name: "kargo"}, "yar/KARGO-123-description")
+	commit, exists, err := client.BranchCommit(context.Background(), kargoRepository(t), "yar/KARGO-123-description")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +107,7 @@ func TestBranchCommitReportsMissingBranch(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
-	commit, exists, err := client.BranchCommit(context.Background(), Repository{Owner: "lokalise", Name: "kargo"}, "yar/missing")
+	commit, exists, err := client.BranchCommit(context.Background(), kargoRepository(t), "yar/missing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +132,7 @@ func TestWaitOpenPullRequestHandlesDelayedVisibility(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
 	client.pollInterval = time.Millisecond
-	pull, err := client.WaitOpenPullRequest(context.Background(), Repository{Owner: "lokalise", Name: "kargo"}, "main", "yar/change", 100*time.Millisecond)
+	pull, err := client.WaitOpenPullRequest(context.Background(), kargoRepository(t), "main", "yar/change", 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,4 +153,13 @@ func testClient(t *testing.T, serverURL string) *Client {
 	}
 	client.api.BaseURL = baseURL
 	return client
+}
+
+func kargoRepository(t *testing.T) Repository {
+	t.Helper()
+	repository, err := ParseRepository("https://github.com/lokalise/kargo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repository
 }

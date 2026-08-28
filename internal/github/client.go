@@ -15,26 +15,27 @@ import (
 
 const maxResponseBodySize = 1 << 20
 
+// Repository identifies a parsed GitHub repository.
 type Repository struct {
-	Owner string
-	Name  string
+	owner string
+	name  string
 }
 
-type User struct {
-	Login string `json:"login"`
-	ID    int64  `json:"id"`
-}
-
+// PullRequest contains the GitHub identity of a pull request.
 type PullRequest struct {
-	Number int    `json:"number"`
-	URL    string `json:"html_url"`
+	// Number is the repository-local pull request number.
+	Number int
+	// URL is the pull request's GitHub web URL.
+	URL string
 }
 
+// Client performs the GitHub operations required by publishing.
 type Client struct {
 	api          *gh.Client
 	pollInterval time.Duration
 }
 
+// New returns an authenticated GitHub client with bounded requests and responses.
 func New(token string) (*Client, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("GitHub token is required")
@@ -51,7 +52,8 @@ func New(token string) (*Client, error) {
 	}, nil
 }
 
-func ParseRepositoryURL(rawURL string) (Repository, error) {
+// ParseRepository accepts an HTTPS github.com repository URL.
+func ParseRepository(rawURL string) (Repository, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return Repository{}, fmt.Errorf("parse repository URL: %w", err)
@@ -67,22 +69,26 @@ func ParseRepositoryURL(rawURL string) (Repository, error) {
 	if name == "" {
 		return Repository{}, errors.New("repository URL has an empty repository name")
 	}
-	return Repository{Owner: parts[0], Name: name}, nil
+	return Repository{owner: parts[0], name: name}, nil
 }
 
-func (c *Client) AuthenticatedUser(ctx context.Context) (User, error) {
-	user, _, err := c.api.Users.Get(ctx, "")
+// CommitAuthor returns the authenticated user's name and GitHub noreply email address.
+func (c *Client) CommitAuthor(ctx context.Context) (string, string, error) {
+	result, _, err := c.api.Users.Get(ctx, "")
 	if err != nil {
-		return User{}, fmt.Errorf("get authenticated GitHub user: %w", err)
+		return "", "", fmt.Errorf("get authenticated GitHub user: %w", err)
 	}
-	if user.GetLogin() == "" || user.GetID() <= 0 {
-		return User{}, errors.New("authenticated GitHub user has no login or numeric ID")
+	login := result.GetLogin()
+	id := result.GetID()
+	if login == "" || id <= 0 {
+		return "", "", errors.New("authenticated GitHub user has no login or numeric ID")
 	}
-	return User{Login: user.GetLogin(), ID: user.GetID()}, nil
+	return login, fmt.Sprintf("%d+%s@users.noreply.github.com", id, login), nil
 }
 
+// BranchCommit returns a branch's commit SHA and whether the branch exists.
 func (c *Client) BranchCommit(ctx context.Context, repository Repository, branch string) (string, bool, error) {
-	result, _, err := c.api.Git.GetRef(ctx, repository.Owner, repository.Name, "heads/"+branch)
+	result, _, err := c.api.Git.GetRef(ctx, repository.owner, repository.name, "heads/"+branch)
 	if isNotFound(err) {
 		return "", false, nil
 	}
@@ -96,6 +102,7 @@ func (c *Client) BranchCommit(ctx context.Context, repository Repository, branch
 	return commit, true, nil
 }
 
+// WaitBranchCommit waits for a branch to appear and verifies that it points to the expected commit.
 func (c *Client) WaitBranchCommit(ctx context.Context, repository Repository, branch, expected string, timeout time.Duration) error {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -120,10 +127,11 @@ func (c *Client) WaitBranchCommit(ctx context.Context, repository Repository, br
 	}
 }
 
+// OpenPullRequest returns nil when none exists and rejects multiple matches.
 func (c *Client) OpenPullRequest(ctx context.Context, repository Repository, base, branch string) (*PullRequest, error) {
-	pulls, _, err := c.api.PullRequests.List(ctx, repository.Owner, repository.Name, &gh.PullRequestListOptions{
+	pulls, _, err := c.api.PullRequests.List(ctx, repository.owner, repository.name, &gh.PullRequestListOptions{
 		State: "open",
-		Head:  repository.Owner + ":" + branch,
+		Head:  repository.owner + ":" + branch,
 		Base:  base,
 		ListOptions: gh.ListOptions{
 			PerPage: 2,
@@ -145,6 +153,7 @@ func (c *Client) OpenPullRequest(ctx context.Context, repository Repository, bas
 	return &pull, nil
 }
 
+// WaitOpenPullRequest waits for an open pull request and returns nil when the timeout expires.
 func (c *Client) WaitOpenPullRequest(ctx context.Context, repository Repository, base, branch string, timeout time.Duration) (*PullRequest, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -166,8 +175,9 @@ func (c *Client) WaitOpenPullRequest(ctx context.Context, repository Repository,
 	}
 }
 
+// CreatePullRequest opens a pull request from branch into base.
 func (c *Client) CreatePullRequest(ctx context.Context, repository Repository, base, branch, title, body string, draft bool) (PullRequest, error) {
-	result, _, err := c.api.PullRequests.Create(ctx, repository.Owner, repository.Name, &gh.NewPullRequest{
+	result, _, err := c.api.PullRequests.Create(ctx, repository.owner, repository.name, &gh.NewPullRequest{
 		Title: &title,
 		Head:  &branch,
 		Base:  &base,
@@ -178,14 +188,6 @@ func (c *Client) CreatePullRequest(ctx context.Context, repository Repository, b
 		return PullRequest{}, fmt.Errorf("create GitHub pull request: %w", err)
 	}
 	return pullRequest(result)
-}
-
-func (u User) CommitName() string {
-	return u.Login
-}
-
-func (u User) CommitEmail() string {
-	return fmt.Sprintf("%d+%s@users.noreply.github.com", u.ID, u.Login)
 }
 
 func pullRequest(result *gh.PullRequest) (PullRequest, error) {

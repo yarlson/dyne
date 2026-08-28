@@ -11,45 +11,64 @@ import (
 )
 
 const (
+	// DefaultNamespace is the namespace used when a command does not specify one.
 	DefaultNamespace = "coding-agents"
-	DefaultImage     = "coding-agent:local"
-	AuthSecretName   = "coding-agent-auth"
-	GitSecretName    = "coding-agent-git-auth"
+	// DefaultImage is the agent image used when a session does not specify one.
+	DefaultImage = "coding-agent:local"
+	// GitSecretName is the name of the Secret that stores the GitHub token.
+	GitSecretName  = "coding-agent-git-auth"
+	authSecretName = "coding-agent-auth"
 )
 
+// Mode controls the workload lifecycle and storage used by a session.
 type Mode string
 
 const (
+	// ModeExplore runs a bounded task with an ephemeral, read-only workspace.
 	ModeExplore Mode = "explore"
-	ModeUpdate  Mode = "update"
-	ModeLong    Mode = "long"
+	// ModeUpdate runs a bounded task and retains its workspace on persistent storage.
+	ModeUpdate Mode = "update"
+	// ModeLong runs a resumable interactive session on persistent storage.
+	ModeLong Mode = "long"
 )
 
+// Session defines one coding-agent workload.
 type Session struct {
-	Name        string
-	Namespace   string
-	Image       string
-	Mode        Mode
-	Repository  string
-	Ref         string
-	Setup       string
-	Prompt      string
-	CloneDepth  int
+	// Name identifies the session and prefixes its Kubernetes resources.
+	Name string
+	// Namespace is the Kubernetes namespace that owns the session.
+	Namespace string
+	// Image is the container image that runs setup and agent commands.
+	Image string
+	// Mode selects the session lifecycle and storage behavior.
+	Mode Mode
+	// Repository is the Git repository cloned into the workspace; an empty value initializes a new repository.
+	Repository string
+	// Ref is the initial Git branch or tag cloned for the session.
+	Ref string
+	// Setup is the shell command run before the agent starts.
+	Setup string
+	// Prompt is the task given to a bounded session.
+	Prompt string
+	// CloneDepth limits fetched Git history; zero fetches the full history.
+	CloneDepth int
+	// StorageSize is the requested size of each persistent workspace claim.
 	StorageSize string
-	Timeout     int64
+	// Timeout is the bounded session deadline in seconds.
+	Timeout int64
 }
 
-type Resource map[string]any
+type resource map[string]any
 
-type List struct {
+type resourceList struct {
 	APIVersion string     `json:"apiVersion"`
 	Kind       string     `json:"kind"`
-	Items      []Resource `json:"items"`
+	Items      []resource `json:"items"`
 }
 
 var dnsLabel = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
-func (s Session) Validate() error {
+func (s Session) validate() error {
 	if !dnsLabel.MatchString(s.Name) || len(s.Name) > 40 {
 		return errors.New("name must be a lowercase DNS label no longer than 40 characters")
 	}
@@ -86,38 +105,40 @@ func (s Session) Validate() error {
 	return nil
 }
 
-func Bootstrap(namespace string, authFile string, apiKeyEnv string, githubTokenEnv string) (List, error) {
+// Bootstrap returns a Kubernetes manifest for the shared namespace, network policy, and requested credentials.
+func Bootstrap(namespace string, authFile string, apiKeyEnv string, githubTokenEnv string) ([]byte, error) {
 	if !dnsLabel.MatchString(namespace) || len(namespace) > 63 {
-		return List{}, errors.New("namespace must be a lowercase DNS label no longer than 63 characters")
+		return nil, errors.New("namespace must be a lowercase DNS label no longer than 63 characters")
 	}
-	items := []Resource{namespaceResource(namespace), ingressPolicy(namespace)}
+	items := []resource{namespaceResource(namespace), ingressPolicy(namespace)}
 	secret, err := authSecret(namespace, authFile, apiKeyEnv)
 	if err != nil {
-		return List{}, err
+		return nil, err
 	}
 	if secret != nil {
 		items = append(items, secret)
 	}
 	gitSecret, err := githubSecret(namespace, githubTokenEnv)
 	if err != nil {
-		return List{}, err
+		return nil, err
 	}
 	if gitSecret != nil {
 		items = append(items, gitSecret)
 	}
-	return List{APIVersion: "v1", Kind: "List", Items: items}, nil
+	return encodeResources(items)
 }
 
-func Build(s Session) (List, error) {
-	if err := s.Validate(); err != nil {
-		return List{}, err
+// Manifest validates a session and returns the Kubernetes resources that run it.
+func Manifest(s Session) ([]byte, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
 	}
-	items := []Resource{namespaceResource(s.Namespace), ingressPolicy(s.Namespace)}
+	items := []resource{namespaceResource(s.Namespace), ingressPolicy(s.Namespace)}
 	if s.Mode != ModeExplore {
 		items = append(items,
-			persistentVolumeClaim(s.Namespace, workspaceClaim(s.Name), s.Name, s.StorageSize),
-			persistentVolumeClaim(s.Namespace, homeClaim(s.Name), s.Name, s.StorageSize),
-			persistentVolumeClaim(s.Namespace, codexClaim(s.Name), s.Name, "1Gi"),
+			persistentVolumeClaim(s.Namespace, WorkspaceClaimName(s.Name), s.Name, s.StorageSize),
+			persistentVolumeClaim(s.Namespace, HomeClaimName(s.Name), s.Name, s.StorageSize),
+			persistentVolumeClaim(s.Namespace, CodexClaimName(s.Name), s.Name, "1Gi"),
 		)
 	}
 	if s.Mode == ModeLong {
@@ -125,27 +146,30 @@ func Build(s Session) (List, error) {
 	} else {
 		items = append(items, job(s))
 	}
-	return List{APIVersion: "v1", Kind: "List", Items: items}, nil
+	return encodeResources(items)
 }
 
-func JSON(list List) ([]byte, error) {
-	return json.MarshalIndent(list, "", "  ")
+func encodeResources(items []resource) ([]byte, error) {
+	return json.MarshalIndent(resourceList{APIVersion: "v1", Kind: "List", Items: items}, "", "  ")
 }
 
-func workspaceClaim(name string) string {
+// WorkspaceClaimName returns the persistent workspace claim owned by a session.
+func WorkspaceClaimName(name string) string {
 	return "workspace-" + name
 }
 
-func homeClaim(name string) string {
+// HomeClaimName returns the persistent tool-home claim owned by a session.
+func HomeClaimName(name string) string {
 	return "home-" + name
 }
 
-func codexClaim(name string) string {
+// CodexClaimName returns the persistent Codex-state claim owned by a session.
+func CodexClaimName(name string) string {
 	return "codex-" + name
 }
 
-func namespaceResource(namespace string) Resource {
-	return Resource{
+func namespaceResource(namespace string) resource {
+	return resource{
 		"apiVersion": "v1",
 		"kind":       "Namespace",
 		"metadata": map[string]any{
@@ -159,8 +183,8 @@ func namespaceResource(namespace string) Resource {
 	}
 }
 
-func ingressPolicy(namespace string) Resource {
-	return Resource{
+func ingressPolicy(namespace string) resource {
+	return resource{
 		"apiVersion": "networking.k8s.io/v1",
 		"kind":       "NetworkPolicy",
 		"metadata": map[string]any{
@@ -174,7 +198,7 @@ func ingressPolicy(namespace string) Resource {
 	}
 }
 
-func authSecret(namespace string, authFile string, apiKeyEnv string) (Resource, error) {
+func authSecret(namespace string, authFile string, apiKeyEnv string) (resource, error) {
 	data := map[string]any{}
 	if authFile != "" {
 		contents, err := os.ReadFile(authFile)
@@ -193,11 +217,11 @@ func authSecret(namespace string, authFile string, apiKeyEnv string) (Resource, 
 	if len(data) == 0 {
 		return nil, nil
 	}
-	return Resource{
+	return resource{
 		"apiVersion": "v1",
 		"kind":       "Secret",
 		"metadata": map[string]any{
-			"name":      AuthSecretName,
+			"name":      authSecretName,
 			"namespace": namespace,
 		},
 		"type": "Opaque",
@@ -205,7 +229,7 @@ func authSecret(namespace string, authFile string, apiKeyEnv string) (Resource, 
 	}, nil
 }
 
-func githubSecret(namespace string, tokenEnv string) (Resource, error) {
+func githubSecret(namespace string, tokenEnv string) (resource, error) {
 	if tokenEnv == "" {
 		return nil, nil
 	}
@@ -213,7 +237,7 @@ func githubSecret(namespace string, tokenEnv string) (Resource, error) {
 	if !ok || value == "" {
 		return nil, fmt.Errorf("environment variable %s is empty", tokenEnv)
 	}
-	return Resource{
+	return resource{
 		"apiVersion": "v1",
 		"kind":       "Secret",
 		"metadata": map[string]any{
@@ -227,8 +251,8 @@ func githubSecret(namespace string, tokenEnv string) (Resource, error) {
 	}, nil
 }
 
-func persistentVolumeClaim(namespace string, name string, session string, size string) Resource {
-	return Resource{
+func persistentVolumeClaim(namespace string, name string, session string, size string) resource {
+	return resource{
 		"apiVersion": "v1",
 		"kind":       "PersistentVolumeClaim",
 		"metadata": map[string]any{
@@ -245,8 +269,8 @@ func persistentVolumeClaim(namespace string, name string, session string, size s
 	}
 }
 
-func headlessService(s Session) Resource {
-	return Resource{
+func headlessService(s Session) resource {
+	return resource{
 		"apiVersion": "v1",
 		"kind":       "Service",
 		"metadata": map[string]any{
@@ -261,8 +285,8 @@ func headlessService(s Session) Resource {
 	}
 }
 
-func job(s Session) Resource {
-	return Resource{
+func job(s Session) resource {
+	return resource{
 		"apiVersion": "batch/v1",
 		"kind":       "Job",
 		"metadata": map[string]any{
@@ -278,8 +302,8 @@ func job(s Session) Resource {
 	}
 }
 
-func statefulSet(s Session) Resource {
-	return Resource{
+func statefulSet(s Session) resource {
+	return resource{
 		"apiVersion": "apps/v1",
 		"kind":       "StatefulSet",
 		"metadata": map[string]any{
@@ -416,9 +440,9 @@ func volumes(s Session) []any {
 		home["emptyDir"] = map[string]any{"sizeLimit": "2Gi"}
 		codex["emptyDir"] = map[string]any{"sizeLimit": "1Gi"}
 	} else {
-		workspace["persistentVolumeClaim"] = map[string]any{"claimName": workspaceClaim(s.Name)}
-		home["persistentVolumeClaim"] = map[string]any{"claimName": homeClaim(s.Name)}
-		codex["persistentVolumeClaim"] = map[string]any{"claimName": codexClaim(s.Name)}
+		workspace["persistentVolumeClaim"] = map[string]any{"claimName": WorkspaceClaimName(s.Name)}
+		home["persistentVolumeClaim"] = map[string]any{"claimName": HomeClaimName(s.Name)}
+		codex["persistentVolumeClaim"] = map[string]any{"claimName": CodexClaimName(s.Name)}
 	}
 	return []any{
 		workspace,
@@ -428,7 +452,7 @@ func volumes(s Session) []any {
 		map[string]any{
 			"name": "auth",
 			"secret": map[string]any{
-				"secretName":  AuthSecretName,
+				"secretName":  authSecretName,
 				"optional":    true,
 				"defaultMode": 288,
 			},

@@ -1,4 +1,4 @@
-package delivery
+package publish
 
 import (
 	"context"
@@ -9,31 +9,49 @@ import (
 	"strings"
 	"time"
 
-	"coding-agent-k8s/internal/agent"
 	"coding-agent-k8s/internal/github"
 	"coding-agent-k8s/internal/kubernetes"
 )
 
+// Request defines one idempotent workspace publish operation.
 type Request struct {
-	Namespace     string
-	Session       string
-	Branch        string
-	Base          string
+	// Namespace owns the source session.
+	Namespace string
+	// Session identifies the completed or stopped source session.
+	Session string
+	// Branch is the new remote branch that will contain the changes.
+	Branch string
+	// Base is the pull request target and defaults to the session's initial ref.
+	Base string
+	// CommitMessage is the message used for the workspace commit.
 	CommitMessage string
-	Title         string
-	Body          string
-	Draft         bool
-	Timeout       time.Duration
+	// Title is the pull request title.
+	Title string
+	// Body is the pull request description.
+	Body string
+	// Draft controls whether GitHub creates a draft pull request.
+	Draft bool
+	// Timeout bounds the publisher Job and waits for its result.
+	Timeout time.Duration
 }
 
+// Result identifies the pull request, branch, and commit produced by publishing.
 type Result struct {
+	// PullRequestNumber is the repository-local pull request number.
 	PullRequestNumber int
-	PullRequestURL    string
-	Branch            string
-	Commit            string
+	// PullRequestURL is the pull request's GitHub web URL.
+	PullRequestURL string
+	// Branch is the remote branch containing the published changes.
+	Branch string
+	// Commit is the published commit SHA when this run created the branch.
+	Commit string
 }
 
-func Publish(ctx context.Context, cluster *kubernetes.Client, request Request) (Result, error) {
+// Run publishes an eligible session workspace and opens or recovers its pull request.
+func Run(ctx context.Context, cluster *kubernetes.Client, request Request) (Result, error) {
+	if err := request.Validate(); err != nil {
+		return Result{}, err
+	}
 	source, err := cluster.PublishSource(ctx, request.Namespace, request.Session)
 	if err != nil {
 		return Result{}, err
@@ -41,11 +59,11 @@ func Publish(ctx context.Context, cluster *kubernetes.Client, request Request) (
 	if request.Base == "" {
 		request.Base = source.Base
 	}
-	repository, err := github.ParseRepositoryURL(source.Repository)
+	repository, err := github.ParseRepository(source.Repository)
 	if err != nil {
 		return Result{}, err
 	}
-	token, err := cluster.GitHubToken(ctx, request.Namespace, agent.GitSecretName)
+	token, err := cluster.GitHubToken(ctx, request.Namespace)
 	if err != nil {
 		return Result{}, err
 	}
@@ -126,7 +144,7 @@ func finishExistingPublisher(ctx context.Context, cluster *kubernetes.Client, re
 }
 
 func runPublisher(ctx context.Context, cluster *kubernetes.Client, githubClient *github.Client, repository github.Repository, source kubernetes.PublishSource, request Request, intent string) (string, error) {
-	user, err := githubClient.AuthenticatedUser(ctx)
+	authorName, authorEmail, err := githubClient.CommitAuthor(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -138,8 +156,8 @@ func runPublisher(ctx context.Context, cluster *kubernetes.Client, githubClient 
 		Base:          request.Base,
 		Branch:        request.Branch,
 		CommitMessage: request.CommitMessage,
-		AuthorName:    user.CommitName(),
-		AuthorEmail:   user.CommitEmail(),
+		AuthorName:    authorName,
+		AuthorEmail:   authorEmail,
 		Image:         source.Image,
 		Workspace:     source.WorkspaceClaim,
 		Timeout:       request.Timeout,
@@ -200,7 +218,8 @@ func pullRequestResult(pull github.PullRequest, branch, commit string) Result {
 	}
 }
 
-func Validate(request Request) error {
+// Validate checks whether a request contains the values required to publish.
+func (request Request) Validate() error {
 	if strings.TrimSpace(request.Namespace) == "" {
 		return errors.New("--namespace is required")
 	}
