@@ -52,6 +52,60 @@ clone_workspace() {
   GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}"
 }
 
+publish_workspace() {
+  : "${PUBLISH_REPOSITORY:?PUBLISH_REPOSITORY is required}"
+  : "${PUBLISH_BASE:?PUBLISH_BASE is required}"
+  : "${PUBLISH_BRANCH:?PUBLISH_BRANCH is required}"
+  : "${PUBLISH_COMMIT_MESSAGE:?PUBLISH_COMMIT_MESSAGE is required}"
+  : "${PUBLISH_AUTHOR_NAME:?PUBLISH_AUTHOR_NAME is required}"
+  : "${PUBLISH_AUTHOR_EMAIL:?PUBLISH_AUTHOR_EMAIL is required}"
+  if [[ ! -f /var/run/git-auth/token ]]; then
+    printf 'GitHub token is required\n' >&2
+    exit 1
+  fi
+  git check-ref-format --branch "${PUBLISH_BRANCH}" >/dev/null
+  if find /publish -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    printf 'publish workspace is not empty\n' >&2
+    exit 1
+  fi
+  git_publish clone --branch "${PUBLISH_BASE}" --depth 1 --single-branch -- "${PUBLISH_REPOSITORY}" /publish
+  find /publish -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+  find /workspace -mindepth 1 -maxdepth 1 ! -name .git -printf '%P\0' \
+    | tar --null --directory=/workspace --files-from=- --create --file=- \
+    | tar --directory=/publish --extract --file=-
+  cd /publish
+  if [[ -z "$(git_publish status --porcelain=v1 --untracked-files=normal)" ]]; then
+    printf 'workspace has no changes relative to %s\n' "${PUBLISH_BASE}" >&2
+    exit 1
+  fi
+  git_publish switch -c "${PUBLISH_BRANCH}"
+  git_publish add -A
+  git_publish -c "user.name=${PUBLISH_AUTHOR_NAME}" -c "user.email=${PUBLISH_AUTHOR_EMAIL}" commit -m "${PUBLISH_COMMIT_MESSAGE}"
+  local commit_sha remote_sha
+  commit_sha="$(git_publish rev-parse HEAD)"
+  if ! git_publish push --porcelain -- "${PUBLISH_REPOSITORY}" "HEAD:refs/heads/${PUBLISH_BRANCH}"; then
+    remote_sha="$(git_publish ls-remote --heads -- "${PUBLISH_REPOSITORY}" "refs/heads/${PUBLISH_BRANCH}" | awk 'NR == 1 { print $1 }')"
+    if [[ "${remote_sha}" != "${commit_sha}" ]]; then
+      printf 'push failed and remote branch does not match commit %s\n' "${commit_sha}" >&2
+      exit 1
+    fi
+  fi
+  remote_sha="$(git_publish ls-remote --heads -- "${PUBLISH_REPOSITORY}" "refs/heads/${PUBLISH_BRANCH}" | awk 'NR == 1 { print $1 }')"
+  if [[ "${remote_sha}" != "${commit_sha}" ]]; then
+    printf 'remote branch points to %s instead of %s\n' "${remote_sha:-nothing}" "${commit_sha}" >&2
+    exit 1
+  fi
+  printf 'branch=%s\ncommit=%s\n' "${PUBLISH_BRANCH}" "${commit_sha}" > /dev/termination-log
+}
+
+git_publish() {
+  GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_ASKPASS=/usr/local/bin/git-askpass \
+    GIT_TERMINAL_PROMPT=0 \
+    git -c safe.directory=/publish -c core.hooksPath=/dev/null "$@"
+}
+
 run_task() {
   load_api_key
   local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
@@ -86,6 +140,9 @@ case "${1:-}" in
   auth)
     seed_auth
     ;;
+  publish)
+    publish_workspace
+    ;;
   run)
     run_task
     ;;
@@ -97,7 +154,7 @@ case "${1:-}" in
     interactive_task "$@"
     ;;
   *)
-    printf 'usage: agent-entrypoint <clone|init|auth|run|idle|task>\n' >&2
+    printf 'usage: agent-entrypoint <clone|init|auth|publish|run|idle|task>\n' >&2
     exit 2
     ;;
 esac

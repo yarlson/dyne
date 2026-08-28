@@ -1,58 +1,65 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"coding-agent-k8s/internal/agent"
-	"coding-agent-k8s/internal/kubectl"
+	"coding-agent-k8s/internal/delivery"
+	"coding-agent-k8s/internal/kubernetes"
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
 	switch args[0] {
 	case "bootstrap":
-		return bootstrap(args[1:])
+		return bootstrap(ctx, args[1:])
 	case "start":
-		return start(args[1:])
+		return start(ctx, args[1:])
 	case "status":
-		return status(args[1:])
+		return status(ctx, args[1:])
 	case "logs":
-		return logs(args[1:])
+		return logs(ctx, args[1:])
 	case "task":
-		return task(args[1:])
+		return task(ctx, args[1:])
 	case "shell":
-		return shell(args[1:])
+		return shell(ctx, args[1:])
+	case "publish":
+		return publish(ctx, args[1:])
 	case "stop":
-		return scale(args[1:], 0)
+		return scale(ctx, args[1:], 0)
 	case "resume":
-		return scale(args[1:], 1)
+		return scale(ctx, args[1:], 1)
 	case "delete":
-		return deleteSession(args[1:], false)
+		return deleteSession(ctx, args[1:], false)
 	case "destroy":
-		return deleteSession(args[1:], true)
+		return deleteSession(ctx, args[1:], true)
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage())
 	}
 }
 
-func bootstrap(args []string) error {
+func bootstrap(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
-	contextName := set.String("context", "", "kubectl context")
+	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
 	authFile := set.String("auth-file", "", "Codex auth.json file")
 	apiKeyEnv := set.String("api-key-env", "", "environment variable containing a Codex API key")
@@ -71,12 +78,16 @@ func bootstrap(args []string) error {
 	if err != nil {
 		return fmt.Errorf("encode bootstrap resources: %w", err)
 	}
-	return kubectl.New(*contextName).Apply(manifest)
+	client, err := kubernetes.New(*contextName)
+	if err != nil {
+		return err
+	}
+	return client.Apply(ctx, manifest)
 }
 
-func start(args []string) error {
+func start(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("start", flag.ContinueOnError)
-	contextName := set.String("context", "", "kubectl context")
+	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	mode := set.String("mode", "", "explore, update, or long")
@@ -112,20 +123,24 @@ func start(args []string) error {
 	if err != nil {
 		return fmt.Errorf("encode session resources: %w", err)
 	}
-	return kubectl.New(*contextName).Apply(manifest)
+	client, err := kubernetes.New(*contextName)
+	if err != nil {
+		return err
+	}
+	return client.Apply(ctx, manifest)
 }
 
-func status(args []string) error {
+func status(ctx context.Context, args []string) error {
 	common, err := parseCommon("status", args)
 	if err != nil {
 		return err
 	}
-	return common.client.Run("-n", common.namespace, "get", "job,statefulset,pod,pvc", "-l", "coding-agent/session="+common.name, "-o", "wide")
+	return common.client.Status(ctx, common.namespace, common.name)
 }
 
-func logs(args []string) error {
+func logs(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("logs", flag.ContinueOnError)
-	contextName := set.String("context", "", "kubectl context")
+	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	follow := set.Bool("follow", false, "follow log output")
@@ -135,20 +150,20 @@ func logs(args []string) error {
 	if *name == "" {
 		return errors.New("--name is required")
 	}
-	pod, err := sessionPod(kubectl.New(*contextName), *namespace, *name)
+	client, err := kubernetes.New(*contextName)
 	if err != nil {
 		return err
 	}
-	command := []string{"-n", *namespace, "logs", pod, "-c", "agent"}
-	if *follow {
-		command = append(command, "-f")
+	pod, err := client.PodName(ctx, *namespace, *name)
+	if err != nil {
+		return err
 	}
-	return kubectl.New(*contextName).Run(command...)
+	return client.Logs(ctx, *namespace, pod, "agent", *follow)
 }
 
-func task(args []string) error {
+func task(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("task", flag.ContinueOnError)
-	contextName := set.String("context", "", "kubectl context")
+	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "long session name")
 	resume := set.Bool("resume-last", false, "resume the latest Codex thread")
@@ -158,32 +173,83 @@ func task(args []string) error {
 	if *name == "" || set.NArg() != 1 {
 		return errors.New("task requires --name and one prompt argument")
 	}
-	client := kubectl.New(*contextName)
-	pod, err := readySessionPod(client, *namespace, *name)
+	client, err := kubernetes.New(*contextName)
 	if err != nil {
 		return err
 	}
-	command := []string{"-n", *namespace, "exec", pod, "-c", "agent", "--", "/usr/local/bin/agent-entrypoint", "task"}
+	pod, err := client.WaitPodReady(ctx, *namespace, *name, 120*time.Second)
+	if err != nil {
+		return err
+	}
+	command := []string{"/usr/local/bin/agent-entrypoint", "task"}
 	if *resume {
 		command = append(command, "--resume-last")
 	}
 	command = append(command, set.Arg(0))
-	return client.Run(command...)
+	return client.Exec(ctx, *namespace, pod, "agent", command, false)
 }
 
-func shell(args []string) error {
+func shell(ctx context.Context, args []string) error {
 	common, err := parseCommon("shell", args)
 	if err != nil {
 		return err
 	}
-	pod, err := readySessionPod(common.client, common.namespace, common.name)
+	pod, err := common.client.WaitPodReady(ctx, common.namespace, common.name, 120*time.Second)
 	if err != nil {
 		return err
 	}
-	return common.client.Run("-n", common.namespace, "exec", "-it", pod, "-c", "agent", "--", "bash")
+	return common.client.Exec(ctx, common.namespace, pod, "agent", []string{"bash"}, true)
 }
 
-func scale(args []string, replicas int) error {
+func publish(ctx context.Context, args []string) error {
+	set := flag.NewFlagSet("publish", flag.ContinueOnError)
+	contextName := set.String("context", "", "Kubernetes context")
+	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	name := set.String("name", "", "completed or stopped session name")
+	branch := set.String("branch", "", "new remote branch name")
+	base := set.String("base", "", "pull request base branch; defaults to the session ref")
+	commitMessage := set.String("commit-message", "", "commit message")
+	title := set.String("title", "", "pull request title; defaults to the commit message")
+	bodyFile := set.String("body-file", "", "pull request body file")
+	ready := set.Bool("ready", false, "create a ready-for-review pull request instead of a draft")
+	timeout := set.Duration("timeout", 10*time.Minute, "publisher Job deadline")
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*title) == "" {
+		*title = *commitMessage
+	}
+	body, err := readPullRequestBody(*bodyFile)
+	if err != nil {
+		return err
+	}
+	request := delivery.Request{
+		Namespace:     *namespace,
+		Session:       *name,
+		Branch:        *branch,
+		Base:          *base,
+		CommitMessage: *commitMessage,
+		Title:         *title,
+		Body:          body,
+		Draft:         !*ready,
+		Timeout:       *timeout,
+	}
+	if err := delivery.Validate(request); err != nil {
+		return err
+	}
+	cluster, err := kubernetes.New(*contextName)
+	if err != nil {
+		return err
+	}
+	result, err := delivery.Publish(ctx, cluster, request)
+	if err != nil {
+		return err
+	}
+	printDelivery(result)
+	return nil
+}
+
+func scale(ctx context.Context, args []string, replicas int32) error {
 	command := "stop"
 	if replicas == 1 {
 		command = "resume"
@@ -192,10 +258,10 @@ func scale(args []string, replicas int) error {
 	if err != nil {
 		return err
 	}
-	return common.client.Run("-n", common.namespace, "scale", "statefulset/"+common.name, "--replicas", strconv.Itoa(replicas))
+	return common.client.ScaleStatefulSet(ctx, common.namespace, common.name, replicas)
 }
 
-func deleteSession(args []string, storage bool) error {
+func deleteSession(ctx context.Context, args []string, storage bool) error {
 	command := "delete"
 	if storage {
 		command = "destroy"
@@ -204,38 +270,18 @@ func deleteSession(args []string, storage bool) error {
 	if err != nil {
 		return err
 	}
-	if err := common.client.Run(
-		"-n", common.namespace,
-		"delete",
-		"job/"+common.name,
-		"statefulset/"+common.name,
-		"service/"+common.name,
-		"--ignore-not-found",
-	); err != nil {
-		return err
-	}
-	if !storage {
-		return nil
-	}
-	return common.client.Run(
-		"-n", common.namespace,
-		"delete",
-		"pvc/workspace-"+common.name,
-		"pvc/home-"+common.name,
-		"pvc/codex-"+common.name,
-		"--ignore-not-found",
-	)
+	return common.client.DeleteSession(ctx, common.namespace, common.name, storage)
 }
 
 type commonOptions struct {
-	client    kubectl.Client
+	client    *kubernetes.Client
 	namespace string
 	name      string
 }
 
 func parseCommon(command string, args []string) (commonOptions, error) {
 	set := flag.NewFlagSet(command, flag.ContinueOnError)
-	contextName := set.String("context", "", "kubectl context")
+	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	if err := set.Parse(args); err != nil {
@@ -244,26 +290,11 @@ func parseCommon(command string, args []string) (commonOptions, error) {
 	if *name == "" {
 		return commonOptions{}, errors.New("--name is required")
 	}
-	return commonOptions{client: kubectl.New(*contextName), namespace: *namespace, name: *name}, nil
-}
-
-func readySessionPod(client kubectl.Client, namespace string, name string) (string, error) {
-	if err := client.Run("-n", namespace, "wait", "pod", "-l", "coding-agent/session="+name, "--for=condition=Ready", "--timeout=120s"); err != nil {
-		return "", err
-	}
-	return sessionPod(client, namespace, name)
-}
-
-func sessionPod(client kubectl.Client, namespace string, name string) (string, error) {
-	pod, err := client.Output("-n", namespace, "get", "pod", "-l", "coding-agent/session="+name, "-o", "jsonpath={.items[0].metadata.name}")
+	client, err := kubernetes.New(*contextName)
 	if err != nil {
-		return "", err
+		return commonOptions{}, err
 	}
-	pod = strings.TrimSpace(pod)
-	if pod == "" {
-		return "", fmt.Errorf("session %s has no Pod", name)
-	}
-	return pod, nil
+	return commonOptions{client: client, namespace: *namespace, name: *name}, nil
 }
 
 func usageError() error {
@@ -271,5 +302,27 @@ func usageError() error {
 }
 
 func usage() string {
-	return "usage: agentctl <bootstrap|start|status|logs|task|shell|stop|resume|delete|destroy> [options]"
+	return "usage: agentctl <bootstrap|start|status|logs|task|shell|publish|stop|resume|delete|destroy> [options]"
+}
+
+func readPullRequestBody(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read pull request body: %w", err)
+	}
+	if len(contents) > 64*1024 {
+		return "", errors.New("pull request body cannot exceed 64 KiB")
+	}
+	return string(contents), nil
+}
+
+func printDelivery(result delivery.Result) {
+	fmt.Printf("pull request #%d: %s\n", result.PullRequestNumber, result.PullRequestURL)
+	fmt.Printf("branch: %s\n", result.Branch)
+	if result.Commit != "" {
+		fmt.Printf("commit: %s\n", result.Commit)
+	}
 }
