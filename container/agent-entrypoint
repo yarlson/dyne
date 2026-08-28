@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="${MISE_DATA_DIR:-/home/agent/.local/share/mise}/shims:/home/agent/.local/bin:${PATH}"
+
+seed_auth() {
+  mkdir -p "${CODEX_HOME}"
+  if [[ ! -f "${CODEX_HOME}/auth.json" && -f /var/run/agent-auth/auth.json ]]; then
+    install -m 600 /var/run/agent-auth/auth.json "${CODEX_HOME}/auth.json"
+  fi
+}
+
+load_api_key() {
+  if [[ -f /var/run/agent-auth/CODEX_API_KEY ]]; then
+    CODEX_API_KEY="$(< /var/run/agent-auth/CODEX_API_KEY)"
+    export CODEX_API_KEY
+  fi
+}
+
+initialize_workspace() {
+  mkdir -p /workspace "${HOME}/.cache/npm" "${MISE_DATA_DIR}" "${MISE_CACHE_DIR}"
+  if ! git config --global --get-all safe.directory | grep -Fxq /workspace; then
+    git config --global --add safe.directory /workspace
+  fi
+  if [[ -n "${AGENT_SETUP:-}" ]]; then
+    cd /workspace
+    bash -lc "${AGENT_SETUP}"
+  fi
+}
+
+clone_workspace() {
+  if [[ -d /workspace/.git ]]; then
+    return
+  fi
+  if find /workspace -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    printf 'workspace is not empty and is not a Git repository\n' >&2
+    exit 1
+  fi
+  if [[ -z "${AGENT_REPOSITORY:-}" ]]; then
+    git init /workspace
+    return
+  fi
+  local -a clone_args=(clone --branch "${AGENT_REF}")
+  if [[ "${AGENT_CLONE_DEPTH:-0}" -gt 0 ]]; then
+    clone_args+=(--depth "${AGENT_CLONE_DEPTH}" --single-branch)
+  fi
+  clone_args+=(-- "${AGENT_REPOSITORY}" /workspace)
+  if [[ -f /var/run/git-auth/token ]]; then
+    GIT_ASKPASS=/usr/local/bin/git-askpass GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}"
+    return
+  fi
+  GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}"
+}
+
+run_task() {
+  load_api_key
+  local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
+  if [[ "${AGENT_MODE:-}" == "explore" ]]; then
+    args+=(--ephemeral)
+  fi
+  exec codex "${args[@]}" "${AGENT_TASK}"
+}
+
+interactive_task() {
+  load_api_key
+  exec 9>"${CODEX_HOME}/task.lock"
+  if ! flock -n 9; then
+    printf 'another task is already running for this session\n' >&2
+    exit 1
+  fi
+  local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
+  if [[ "${1:-}" == "--resume-last" ]]; then
+    shift
+    args+=(resume --last)
+  fi
+  exec codex "${args[@]}" "$1"
+}
+
+case "${1:-}" in
+  clone)
+    clone_workspace
+    ;;
+  init)
+    initialize_workspace
+    ;;
+  auth)
+    seed_auth
+    ;;
+  run)
+    run_task
+    ;;
+  idle)
+    exec sleep infinity
+    ;;
+  task)
+    shift
+    interactive_task "$@"
+    ;;
+  *)
+    printf 'usage: agent-entrypoint <clone|init|auth|run|idle|task>\n' >&2
+    exit 2
+    ;;
+esac
