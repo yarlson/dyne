@@ -45,13 +45,13 @@ func run(ctx context.Context, args []string) error {
 	case "publish":
 		return publishPullRequest(ctx, args[1:])
 	case "stop":
-		return scale(ctx, args[1:], 0)
+		return stopSession(ctx, args[1:])
 	case "resume":
-		return scale(ctx, args[1:], 1)
+		return resumeSession(ctx, args[1:])
 	case "delete":
-		return deleteSession(ctx, args[1:], false)
+		return deleteSession(ctx, args[1:])
 	case "destroy":
-		return deleteSession(ctx, args[1:], true)
+		return destroySession(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage())
 	}
@@ -70,7 +70,7 @@ func bootstrap(ctx context.Context, args []string) error {
 	if *authFile != "" && *apiKeyEnv != "" {
 		return errors.New("use either --auth-file or --api-key-env")
 	}
-	manifest, err := agent.Bootstrap(*namespace, *authFile, *apiKeyEnv, *githubTokenEnv)
+	manifest, err := agent.BootstrapManifest(*namespace, *authFile, *apiKeyEnv, *githubTokenEnv)
 	if err != nil {
 		return err
 	}
@@ -99,18 +99,18 @@ func start(ctx context.Context, args []string) error {
 		return err
 	}
 	seconds := int64(timeout.Seconds())
-	manifest, err := agent.Manifest(agent.Session{
-		Name:        *name,
-		Namespace:   *namespace,
-		Image:       *image,
-		Mode:        agent.Mode(*mode),
-		Repository:  *repository,
-		Ref:         *ref,
-		Setup:       *setupCommand,
-		Prompt:      *prompt,
-		CloneDepth:  *cloneDepth,
-		StorageSize: *storageSize,
-		Timeout:     seconds,
+	manifest, err := agent.SessionManifest(agent.Session{
+		Name:           *name,
+		Namespace:      *namespace,
+		Image:          *image,
+		Mode:           agent.Mode(*mode),
+		Repository:     *repository,
+		InitialRef:     *ref,
+		SetupCommand:   *setupCommand,
+		Prompt:         *prompt,
+		CloneDepth:     *cloneDepth,
+		StorageSize:    *storageSize,
+		TimeoutSeconds: seconds,
 	})
 	if err != nil {
 		return err
@@ -123,11 +123,11 @@ func start(ctx context.Context, args []string) error {
 }
 
 func status(ctx context.Context, args []string) error {
-	target, err := parseSessionTarget("status", args)
+	target, err := sessionTargetFromFlags("status", args)
 	if err != nil {
 		return err
 	}
-	return target.client.Status(ctx, target.namespace, target.name)
+	return target.cluster.WriteSessionStatus(ctx, target.namespace, target.name)
 }
 
 func logs(ctx context.Context, args []string) error {
@@ -146,11 +146,11 @@ func logs(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	pod, err := client.PodName(ctx, *namespace, *name)
+	pod, err := client.NewestPodName(ctx, *namespace, *name)
 	if err != nil {
 		return err
 	}
-	return client.Logs(ctx, *namespace, pod, "agent", *follow)
+	return client.StreamPodLogs(ctx, *namespace, pod, "agent", *follow)
 }
 
 func task(ctx context.Context, args []string) error {
@@ -169,7 +169,7 @@ func task(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	pod, err := client.WaitPodReady(ctx, *namespace, *name, 120*time.Second)
+	pod, err := client.WaitForReadyPod(ctx, *namespace, *name, 120*time.Second)
 	if err != nil {
 		return err
 	}
@@ -178,19 +178,19 @@ func task(ctx context.Context, args []string) error {
 		command = append(command, "--resume-last")
 	}
 	command = append(command, set.Arg(0))
-	return client.Exec(ctx, *namespace, pod, "agent", command, false)
+	return client.ExecPod(ctx, *namespace, pod, "agent", command, false)
 }
 
 func shell(ctx context.Context, args []string) error {
-	target, err := parseSessionTarget("shell", args)
+	target, err := sessionTargetFromFlags("shell", args)
 	if err != nil {
 		return err
 	}
-	pod, err := target.client.WaitPodReady(ctx, target.namespace, target.name, 120*time.Second)
+	pod, err := target.cluster.WaitForReadyPod(ctx, target.namespace, target.name, 120*time.Second)
 	if err != nil {
 		return err
 	}
-	return target.client.Exec(ctx, target.namespace, pod, "agent", []string{"bash"}, true)
+	return target.cluster.ExecPod(ctx, target.namespace, pod, "agent", []string{"bash"}, true)
 }
 
 func publishPullRequest(ctx context.Context, args []string) error {
@@ -219,7 +219,7 @@ func publishPullRequest(ctx context.Context, args []string) error {
 		Namespace:     *namespace,
 		Session:       *name,
 		Branch:        *branch,
-		Base:          *base,
+		BaseBranch:    *base,
 		CommitMessage: *commitMessage,
 		Title:         *title,
 		Body:          body,
@@ -241,40 +241,45 @@ func publishPullRequest(ctx context.Context, args []string) error {
 	return nil
 }
 
-func scale(ctx context.Context, args []string, replicas int32) error {
-	command := "stop"
-	if replicas == 1 {
-		command = "resume"
-	}
-	target, err := parseSessionTarget(command, args)
+func stopSession(ctx context.Context, args []string) error {
+	target, err := sessionTargetFromFlags("stop", args)
 	if err != nil {
 		return err
 	}
-	if replicas == 0 {
-		return target.client.StopSession(ctx, target.namespace, target.name)
-	}
-	return target.client.ResumeSession(ctx, target.namespace, target.name)
+	return target.cluster.StopSession(ctx, target.namespace, target.name)
 }
 
-func deleteSession(ctx context.Context, args []string, deleteStorage bool) error {
-	command := "delete"
-	if deleteStorage {
-		command = "destroy"
-	}
-	target, err := parseSessionTarget(command, args)
+func resumeSession(ctx context.Context, args []string) error {
+	target, err := sessionTargetFromFlags("resume", args)
 	if err != nil {
 		return err
 	}
-	return target.client.DeleteSession(ctx, target.namespace, target.name, deleteStorage)
+	return target.cluster.ResumeSession(ctx, target.namespace, target.name)
+}
+
+func deleteSession(ctx context.Context, args []string) error {
+	target, err := sessionTargetFromFlags("delete", args)
+	if err != nil {
+		return err
+	}
+	return target.cluster.DeleteSession(ctx, target.namespace, target.name)
+}
+
+func destroySession(ctx context.Context, args []string) error {
+	target, err := sessionTargetFromFlags("destroy", args)
+	if err != nil {
+		return err
+	}
+	return target.cluster.DestroySession(ctx, target.namespace, target.name)
 }
 
 type sessionTarget struct {
-	client    *kubernetes.Client
+	cluster   *kubernetes.Client
 	namespace string
 	name      string
 }
 
-func parseSessionTarget(command string, args []string) (sessionTarget, error) {
+func sessionTargetFromFlags(command string, args []string) (sessionTarget, error) {
 	set := flag.NewFlagSet(command, flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
 	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
@@ -289,7 +294,7 @@ func parseSessionTarget(command string, args []string) (sessionTarget, error) {
 	if err != nil {
 		return sessionTarget{}, err
 	}
-	return sessionTarget{client: client, namespace: *namespace, name: *name}, nil
+	return sessionTarget{cluster: client, namespace: *namespace, name: *name}, nil
 }
 
 func usageError() error {
@@ -317,7 +322,7 @@ func readPullRequestBody(path string) (string, error) {
 func printPublishResult(result publish.Result) {
 	fmt.Printf("pull request #%d: %s\n", result.PullRequestNumber, result.PullRequestURL)
 	fmt.Printf("branch: %s\n", result.Branch)
-	if result.Commit != "" {
-		fmt.Printf("commit: %s\n", result.Commit)
+	if result.CommitSHA != "" {
+		fmt.Printf("commit: %s\n", result.CommitSHA)
 	}
 }

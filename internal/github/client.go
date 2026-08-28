@@ -13,7 +13,7 @@ import (
 	gh "github.com/google/go-github/v83/github"
 )
 
-const maxResponseBodySize = 1 << 20
+const maxResponseBodyBytes = 1 << 20
 
 // Repository identifies a parsed GitHub repository.
 type Repository struct {
@@ -72,7 +72,7 @@ func ParseRepository(rawURL string) (Repository, error) {
 	return Repository{owner: parts[0], name: name}, nil
 }
 
-// CommitAuthor returns the authenticated user's name and GitHub noreply email address.
+// CommitAuthor returns the authenticated user's login as the author name and a GitHub noreply email address.
 func (c *Client) CommitAuthor(ctx context.Context) (string, string, error) {
 	result, _, err := c.api.Users.Get(ctx, "")
 	if err != nil {
@@ -86,8 +86,8 @@ func (c *Client) CommitAuthor(ctx context.Context) (string, string, error) {
 	return login, fmt.Sprintf("%d+%s@users.noreply.github.com", id, login), nil
 }
 
-// BranchCommit returns a branch's commit SHA and whether the branch exists.
-func (c *Client) BranchCommit(ctx context.Context, repository Repository, branch string) (string, bool, error) {
+// BranchCommitSHA returns a branch's commit SHA and whether the branch exists.
+func (c *Client) BranchCommitSHA(ctx context.Context, repository Repository, branch string) (string, bool, error) {
 	result, _, err := c.api.Git.GetRef(ctx, repository.owner, repository.name, "heads/"+branch)
 	if isNotFound(err) {
 		return "", false, nil
@@ -102,20 +102,20 @@ func (c *Client) BranchCommit(ctx context.Context, repository Repository, branch
 	return commit, true, nil
 }
 
-// WaitBranchCommit waits for a branch to appear and verifies that it points to the expected commit.
-func (c *Client) WaitBranchCommit(ctx context.Context, repository Repository, branch, expected string, timeout time.Duration) error {
+// WaitForBranchCommit waits for a branch to appear and verifies that it points to the expected commit.
+func (c *Client) WaitForBranchCommit(ctx context.Context, repository Repository, branch, expectedCommitSHA string, timeout time.Duration) error {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 	for {
-		actual, exists, err := c.BranchCommit(waitCtx, repository, branch)
+		actual, exists, err := c.BranchCommitSHA(waitCtx, repository, branch)
 		if err != nil {
 			return err
 		}
 		if exists {
-			if actual != expected {
-				return fmt.Errorf("GitHub branch %s points to %s instead of %s", branch, actual, expected)
+			if actual != expectedCommitSHA {
+				return fmt.Errorf("GitHub branch %s points to %s instead of %s", branch, actual, expectedCommitSHA)
 			}
 			return nil
 		}
@@ -127,12 +127,12 @@ func (c *Client) WaitBranchCommit(ctx context.Context, repository Repository, br
 	}
 }
 
-// OpenPullRequest returns nil when none exists and rejects multiple matches.
-func (c *Client) OpenPullRequest(ctx context.Context, repository Repository, base, branch string) (*PullRequest, error) {
+// FindOpenPullRequest returns the matching open pull request, nil when none exists, and an error for multiple matches.
+func (c *Client) FindOpenPullRequest(ctx context.Context, repository Repository, baseBranch, branch string) (*PullRequest, error) {
 	pulls, _, err := c.api.PullRequests.List(ctx, repository.owner, repository.name, &gh.PullRequestListOptions{
 		State: "open",
 		Head:  repository.owner + ":" + branch,
-		Base:  base,
+		Base:  baseBranch,
 		ListOptions: gh.ListOptions{
 			PerPage: 2,
 		},
@@ -146,21 +146,21 @@ func (c *Client) OpenPullRequest(ctx context.Context, repository Repository, bas
 	if len(pulls) > 1 {
 		return nil, errors.New("more than one open pull request uses the publish branch and base")
 	}
-	pull, err := pullRequest(pulls[0])
+	pull, err := pullRequestFromAPI(pulls[0])
 	if err != nil {
 		return nil, err
 	}
 	return &pull, nil
 }
 
-// WaitOpenPullRequest waits for an open pull request and returns nil when the timeout expires.
-func (c *Client) WaitOpenPullRequest(ctx context.Context, repository Repository, base, branch string, timeout time.Duration) (*PullRequest, error) {
+// WaitForOpenPullRequest waits for an open pull request and returns nil when the timeout expires.
+func (c *Client) WaitForOpenPullRequest(ctx context.Context, repository Repository, baseBranch, branch string, timeout time.Duration) (*PullRequest, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 	for {
-		pull, err := c.OpenPullRequest(waitCtx, repository, base, branch)
+		pull, err := c.FindOpenPullRequest(waitCtx, repository, baseBranch, branch)
 		if err != nil {
 			return nil, err
 		}
@@ -175,22 +175,22 @@ func (c *Client) WaitOpenPullRequest(ctx context.Context, repository Repository,
 	}
 }
 
-// CreatePullRequest opens a pull request from branch into base.
-func (c *Client) CreatePullRequest(ctx context.Context, repository Repository, base, branch, title, body string, draft bool) (PullRequest, error) {
+// CreatePullRequest opens a pull request from branch into the base branch.
+func (c *Client) CreatePullRequest(ctx context.Context, repository Repository, baseBranch, branch, title, body string, draft bool) (PullRequest, error) {
 	result, _, err := c.api.PullRequests.Create(ctx, repository.owner, repository.name, &gh.NewPullRequest{
 		Title: &title,
 		Head:  &branch,
-		Base:  &base,
+		Base:  &baseBranch,
 		Body:  &body,
 		Draft: &draft,
 	})
 	if err != nil {
 		return PullRequest{}, fmt.Errorf("create GitHub pull request: %w", err)
 	}
-	return pullRequest(result)
+	return pullRequestFromAPI(result)
 }
 
-func pullRequest(result *gh.PullRequest) (PullRequest, error) {
+func pullRequestFromAPI(result *gh.PullRequest) (PullRequest, error) {
 	if result == nil || result.GetNumber() <= 0 || result.GetHTMLURL() == "" {
 		return PullRequest{}, errors.New("GitHub returned a pull request without a number or URL")
 	}
@@ -215,7 +215,7 @@ func (t responseBodyLimitTransport) RoundTrip(request *http.Request) (*http.Resp
 		response.Body = struct {
 			io.Reader
 			io.Closer
-		}{Reader: io.LimitReader(response.Body, maxResponseBodySize), Closer: response.Body}
+		}{Reader: io.LimitReader(response.Body, maxResponseBodyBytes), Closer: response.Body}
 	}
 	return response, nil
 }

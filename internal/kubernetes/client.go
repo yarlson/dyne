@@ -40,7 +40,7 @@ import (
 	"k8s.io/client-go/util/retry"
 )
 
-const fieldManager = "agentctl"
+const fieldManagerName = "agentctl"
 
 // Client applies and manages coding-agent resources through the Kubernetes API.
 type Client struct {
@@ -81,7 +81,7 @@ func New(contextName string) (*Client, error) {
 	}, nil
 }
 
-// Apply server-side applies every resource in a Kubernetes List manifest.
+// Apply applies every resource in a Kubernetes List manifest using server-side apply.
 func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	var list unstructured.UnstructuredList
 	if err := json.Unmarshal(manifest, &list); err != nil {
@@ -117,7 +117,7 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	}
 	force := true
 	if _, err := resourceClient.Patch(ctx, resource.GetName(), types.ApplyPatchType, contents, metav1.PatchOptions{
-		FieldManager: fieldManager,
+		FieldManager: fieldManagerName,
 		Force:        &force,
 	}); err != nil {
 		return fmt.Errorf("apply %s %s: %w", resource.GetKind(), resource.GetName(), err)
@@ -126,8 +126,8 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	return nil
 }
 
-// Status writes the workloads, Pods, and claims owned by a session to the client's output.
-func (c *Client) Status(ctx context.Context, namespace, session string) error {
+// WriteSessionStatus writes the workloads, Pods, and claims owned by a session to the client's output.
+func (c *Client) WriteSessionStatus(ctx context.Context, namespace, session string) error {
 	selector := sessionSelector(session)
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
@@ -165,8 +165,8 @@ func (c *Client) Status(ctx context.Context, namespace, session string) error {
 	return nil
 }
 
-// Logs streams logs from one container to the client's output.
-func (c *Client) Logs(ctx context.Context, namespace, pod, container string, follow bool) (result error) {
+// StreamPodLogs streams one container's logs to the client's output.
+func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container string, follow bool) (result error) {
 	stream, err := c.typed.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
 		Container: container,
 		Follow:    follow,
@@ -185,8 +185,8 @@ func (c *Client) Logs(ctx context.Context, namespace, pod, container string, fol
 	return nil
 }
 
-// Exec runs a command in a container and optionally connects the local terminal.
-func (c *Client) Exec(ctx context.Context, namespace, pod, container string, command []string, interactive bool) (result error) {
+// ExecPod runs a command in a Pod container and optionally connects the local terminal.
+func (c *Client) ExecPod(ctx context.Context, namespace, pod, container string, command []string, interactive bool) (result error) {
 	request := c.typed.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(pod).
@@ -264,12 +264,21 @@ func (c *Client) scaleSession(ctx context.Context, namespace, name string, repli
 	return nil
 }
 
-// DeleteSession removes a session's compute resources and optionally its persistent claims.
-func (c *Client) DeleteSession(ctx context.Context, namespace, name string, deleteStorage bool) error {
+// DeleteSession removes a session's compute resources and retains its persistent claims.
+func (c *Client) DeleteSession(ctx context.Context, namespace, name string) error {
+	return c.deleteSession(ctx, namespace, name, false)
+}
+
+// DestroySession removes a session's compute resources and persistent claims.
+func (c *Client) DestroySession(ctx context.Context, namespace, name string) error {
+	return c.deleteSession(ctx, namespace, name, true)
+}
+
+func (c *Client) deleteSession(ctx context.Context, namespace, name string, deleteStorage bool) error {
 	if err := c.deletePublisherJob(ctx, namespace, name); err != nil {
 		return err
 	}
-	if err := c.deleteWorkloads(ctx, namespace, name); err != nil {
+	if err := c.deleteSessionWorkloads(ctx, namespace, name); err != nil {
 		return err
 	}
 	if !deleteStorage {
@@ -290,7 +299,7 @@ func (c *Client) DeleteSession(ctx context.Context, namespace, name string, dele
 	return errors.Join(deleteErrors...)
 }
 
-func (c *Client) deleteWorkloads(ctx context.Context, namespace, name string) error {
+func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name string) error {
 	propagation := metav1.DeletePropagationBackground
 	options := metav1.DeleteOptions{PropagationPolicy: &propagation}
 	deletions := []struct {
@@ -318,11 +327,11 @@ func (c *Client) deleteWorkloads(ctx context.Context, namespace, name string) er
 	return errors.Join(deleteErrors...)
 }
 
-// WaitPodReady waits until the newest Pod for a session is ready.
-func (c *Client) WaitPodReady(ctx context.Context, namespace, session string, timeout time.Duration) (string, error) {
+// WaitForReadyPod waits until the newest Pod for a session is ready and returns its name.
+func (c *Client) WaitForReadyPod(ctx context.Context, namespace, session string, timeout time.Duration) (string, error) {
 	var podName string
 	err := wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		pod, err := c.sessionPod(ctx, namespace, session)
+		pod, err := c.newestSessionPod(ctx, namespace, session)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
@@ -344,16 +353,16 @@ func (c *Client) WaitPodReady(ctx context.Context, namespace, session string, ti
 	return podName, nil
 }
 
-// PodName returns the newest Pod owned by a session.
-func (c *Client) PodName(ctx context.Context, namespace, session string) (string, error) {
-	pod, err := c.sessionPod(ctx, namespace, session)
+// NewestPodName returns the name of the newest Pod owned by a session.
+func (c *Client) NewestPodName(ctx context.Context, namespace, session string) (string, error) {
+	pod, err := c.newestSessionPod(ctx, namespace, session)
 	if err != nil {
 		return "", err
 	}
 	return pod.Name, nil
 }
 
-func (c *Client) sessionPod(ctx context.Context, namespace, session string) (*corev1.Pod, error) {
+func (c *Client) newestSessionPod(ctx context.Context, namespace, session string) (*corev1.Pod, error) {
 	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionSelector(session)})
 	if err != nil {
 		return nil, fmt.Errorf("list session %s Pods: %w", session, err)
@@ -388,10 +397,10 @@ func writeStatefulSetStatus(output io.Writer, set *appsv1.StatefulSet) {
 	if set.Spec.Replicas != nil {
 		desired = *set.Spec.Replicas
 	}
-	fmt.Fprintf(output, "StatefulSet\t%s\t%d/%d\t%s\n", set.Name, set.Status.ReadyReplicas, desired, setStatus(set, desired))
+	fmt.Fprintf(output, "StatefulSet\t%s\t%d/%d\t%s\n", set.Name, set.Status.ReadyReplicas, desired, statefulSetStatus(set, desired))
 }
 
-func setStatus(set *appsv1.StatefulSet, desired int32) string {
+func statefulSetStatus(set *appsv1.StatefulSet, desired int32) string {
 	if desired == 0 {
 		return "Stopped"
 	}

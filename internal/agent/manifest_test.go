@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestManifestRejectsInvalidContracts(t *testing.T) {
+func TestSessionManifestRejectsInvalidContracts(t *testing.T) {
 	cases := []struct {
 		name    string
 		change  func(*Session)
@@ -20,7 +20,7 @@ func TestManifestRejectsInvalidContracts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			session := validSession()
 			test.change(&session)
-			if _, err := Manifest(session); err == nil || !strings.Contains(err.Error(), test.message) {
+			if _, err := SessionManifest(session); err == nil || !strings.Contains(err.Error(), test.message) {
 				t.Fatalf("got error %v, want message containing %q", err, test.message)
 			}
 		})
@@ -29,14 +29,14 @@ func TestManifestRejectsInvalidContracts(t *testing.T) {
 
 func validSession() Session {
 	return Session{
-		Name:        "example",
-		Namespace:   DefaultNamespace,
-		Image:       DefaultImage,
-		Mode:        ModeUpdate,
-		Ref:         "main",
-		Prompt:      "inspect the repository",
-		CloneDepth:  1,
-		StorageSize: "1Gi",
-		Timeout:     600,
+		Name:           "example",
+		Namespace:      DefaultNamespace,
+		Image:          DefaultImage,
+		Mode:           ModeUpdate,
+		InitialRef:     "main",
+		Prompt:         "inspect the repository",
+		CloneDepth:     1,
+		StorageSize:    "1Gi",
+		TimeoutSeconds: 600,
 	}
 }

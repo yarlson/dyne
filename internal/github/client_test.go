@@ -80,7 +80,7 @@ func TestCommitAuthorUsesAuthenticatedGitHubIdentity(t *testing.T) {
 	}
 }
 
-func TestBranchCommitPreservesNestedBranchName(t *testing.T) {
+func TestBranchCommitSHAPreservesNestedBranchName(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.RequestURI != "/repos/lokalise/kargo/git/ref/heads/yar/KARGO-123-description" {
 			t.Errorf("got request URI %s", request.RequestURI)
@@ -90,7 +90,7 @@ func TestBranchCommitPreservesNestedBranchName(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
-	commit, exists, err := client.BranchCommit(context.Background(), kargoRepository(t), "yar/KARGO-123-description")
+	commit, exists, err := client.BranchCommitSHA(context.Background(), kargoRepository(t), "yar/KARGO-123-description")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestBranchCommitPreservesNestedBranchName(t *testing.T) {
 	}
 }
 
-func TestBranchCommitReportsMissingBranch(t *testing.T) {
+func TestBranchCommitSHAReportsMissingBranch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		response.WriteHeader(http.StatusNotFound)
@@ -107,7 +107,7 @@ func TestBranchCommitReportsMissingBranch(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
-	commit, exists, err := client.BranchCommit(context.Background(), kargoRepository(t), "yar/missing")
+	commit, exists, err := client.BranchCommitSHA(context.Background(), kargoRepository(t), "yar/missing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestBranchCommitReportsMissingBranch(t *testing.T) {
 	}
 }
 
-func TestWaitOpenPullRequestHandlesDelayedVisibility(t *testing.T) {
+func TestWaitForOpenPullRequestHandlesDelayedVisibility(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Query().Get("state") != "open" || request.URL.Query().Get("head") != "lokalise:yar/change" || request.URL.Query().Get("base") != "main" || request.URL.Query().Get("per_page") != "2" {
@@ -132,7 +132,7 @@ func TestWaitOpenPullRequestHandlesDelayedVisibility(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL)
 	client.pollInterval = time.Millisecond
-	pull, err := client.WaitOpenPullRequest(context.Background(), kargoRepository(t), "main", "yar/change", 100*time.Millisecond)
+	pull, err := client.WaitForOpenPullRequest(context.Background(), kargoRepository(t), "main", "yar/change", 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
