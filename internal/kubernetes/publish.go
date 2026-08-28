@@ -214,7 +214,7 @@ func (c *Client) createPublisherJob(ctx context.Context, request PublisherJobReq
 	if err != nil {
 		return nil, fmt.Errorf("create publisher Job: %w", err)
 	}
-	fmt.Fprintf(c.stdout, "job/%s created\n", job.Name)
+	_, _ = fmt.Fprintf(c.stdout, "job/%s created\n", job.Name)
 	return created, nil
 }
 

@@ -4,11 +4,11 @@ This repository runs coding agents with native Kubernetes resources and a small 
 
 ## Storage and lifecycle contract
 
-| Use case | Workload | Workspace | Tool home and cache | Codex state | `/tmp` |
-|---|---|---|---|---|---|
-| Read-only exploration | Job | `emptyDir`, read-only in the agent container | `emptyDir` | `emptyDir` | Memory `emptyDir` |
-| Bounded code update | Job | PVC | PVC | PVC | Memory `emptyDir` |
-| Long or interactive session | StatefulSet | PVC | PVC | PVC | Memory `emptyDir` |
+| Use case                    | Workload    | Workspace                                    | Tool home and cache | Codex state | `/tmp`            |
+| --------------------------- | ----------- | -------------------------------------------- | ------------------- | ----------- | ----------------- |
+| Read-only exploration       | Job         | `emptyDir`, read-only in the agent container | `emptyDir`          | `emptyDir`  | Memory `emptyDir` |
+| Bounded code update         | Job         | PVC                                          | PVC                 | PVC         | Memory `emptyDir` |
+| Long or interactive session | StatefulSet | PVC                                          | PVC                 | PVC         | Memory `emptyDir` |
 
 The setup init container writes the initial checkout and can run commands such as `mise install` and `npm ci`. It cannot mount the Codex credential or session volume. A separate init container seeds credentials after repository setup finishes. Setup can run again after Pod replacement, so it must be idempotent. Stable tools are built into the image. Uncommitted changes, `node_modules`, Codex session files, mise installs, and npm cache survive only for modes backed by PVCs.
 
@@ -161,6 +161,42 @@ Codex's nested OS sandbox is bypassed because the tested Colima security stack b
 Agent Jobs use `backoffLimit: 0` and do not push code automatically. Only the explicit `publish` command creates a publisher Job, and that Job pushes one new branch without force. Kubernetes can still create a replacement Pod after infrastructure loss, so setup and task effects outside the workspace must be idempotent. A timeout or lost response can leave outcome unknown; inspect the PVC and Git state before retrying. `ReadWriteOnce` is a node-level constraint, not an exclusive-Pod lock. The session-name workload prevents normal concurrent starts, but a production control plane should enforce exclusive ownership with `ReadWriteOncePod` on a supporting CSI driver or an explicit lease.
 
 Colima's local-path storage survives Pod replacement and VM restart, but it is tied to the single VM. Deleting the PVC, its PV, or the Colima profile can delete the data. Back up or push valuable work before destroying storage.
+
+## Live conformance proof
+
+The ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. The live conformance package is disabled unless `AGENTCTL_PROOF=1` is set. A full core run builds `agentctl` and a uniquely tagged image from one clean Git commit, creates two independently owned namespaces in sequence, and proves exploration, bounded updates, long-session continuation, setup, storage, cleanup, and Colima restart behavior.
+
+Run the core proof only against a dedicated Colima profile. The restart phase refuses a profile that contains non-system workloads outside the proof namespace.
+
+```bash
+AGENTCTL_PROOF=1 \
+AGENTCTL_PROOF_CONTEXT=colima-codex-proof \
+AGENTCTL_PROOF_COLIMA_PROFILE=codex-proof \
+AGENTCTL_PROOF_AUTH_FILE="$HOME/.codex/auth.json" \
+AGENTCTL_PROOF_ALLOW_VM_RESTART=1 \
+go test -v -count=1 -timeout=90m ./internal/conformance
+```
+
+Each run writes a sanitized verdict and Kubernetes status snapshots under `.proof/<run-id>/`. Generated evidence is ignored by Git. Set `AGENTCTL_PROOF_KEEP_FAILED=1` only when the failed namespace must remain for local diagnosis.
+
+Pull request publishing is a separate proof. It runs only when an approved disposable repository and the name of a populated token environment variable are supplied:
+
+```bash
+export AGENTCTL_PROOF_GITHUB_TOKEN="$(gh auth token)"
+
+AGENTCTL_PROOF=1 \
+AGENTCTL_PROOF_CONTEXT=colima-codex-proof \
+AGENTCTL_PROOF_COLIMA_PROFILE=codex-proof \
+AGENTCTL_PROOF_AUTH_FILE="$HOME/.codex/auth.json" \
+AGENTCTL_PROOF_ALLOW_VM_RESTART=1 \
+AGENTCTL_PROOF_GITHUB_REPOSITORY=https://github.com/example/coding-agent-proof.git \
+AGENTCTL_PROOF_GITHUB_TOKEN_ENV=AGENTCTL_PROOF_GITHUB_TOKEN \
+go test -v -count=1 -timeout=90m ./internal/conformance
+
+unset AGENTCTL_PROOF_GITHUB_TOKEN
+```
+
+The publishing proof uses only branches prefixed with `codex-proof/<run-id>/`, closes the pull requests it creates, deletes its branches, and fails when external cleanup is incomplete. It never defaults to the repository used by a coding session.
 
 ## Checks
 

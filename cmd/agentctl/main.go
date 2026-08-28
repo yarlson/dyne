@@ -99,11 +99,12 @@ func start(ctx context.Context, args []string) error {
 		return err
 	}
 	seconds := int64(timeout.Seconds())
+	sessionMode := agent.Mode(*mode)
 	manifest, err := agent.SessionManifest(agent.Session{
 		Name:           *name,
 		Namespace:      *namespace,
 		Image:          *image,
-		Mode:           agent.Mode(*mode),
+		Mode:           sessionMode,
 		Repository:     *repository,
 		InitialRef:     *ref,
 		SetupCommand:   *setupCommand,
@@ -117,6 +118,9 @@ func start(ctx context.Context, args []string) error {
 	}
 	client, err := kubernetes.New(*contextName)
 	if err != nil {
+		return err
+	}
+	if err := client.CheckSessionModeAvailable(ctx, *namespace, *name, sessionMode); err != nil {
 		return err
 	}
 	return client.Apply(ctx, manifest)

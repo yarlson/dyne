@@ -95,6 +95,31 @@ func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	return nil
 }
 
+// CheckSessionModeAvailable returns an error when another workload kind already owns the session name.
+func (c *Client) CheckSessionModeAvailable(ctx context.Context, namespace, name string, mode agent.Mode) error {
+	switch mode {
+	case agent.ModeLong:
+		_, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			return fmt.Errorf("job %s already exists; delete it before starting a long session", name)
+		}
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("check session Job %s: %w", name, err)
+		}
+	case agent.ModeExplore, agent.ModeUpdate:
+		_, err := c.typed.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			return fmt.Errorf("StatefulSet %s already exists; delete it before starting a bounded session", name)
+		}
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("check session StatefulSet %s: %w", name, err)
+		}
+	default:
+		return fmt.Errorf("unsupported session mode %q", mode)
+	}
+	return nil
+}
+
 func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstructured) error {
 	if resource.GetName() == "" {
 		return fmt.Errorf("apply %s: resource name is required", resource.GroupVersionKind().String())
@@ -122,7 +147,7 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	}); err != nil {
 		return fmt.Errorf("apply %s %s: %w", resource.GetKind(), resource.GetName(), err)
 	}
-	fmt.Fprintf(c.stdout, "%s/%s applied\n", strings.ToLower(resource.GetKind()), resource.GetName())
+	_, _ = fmt.Fprintf(c.stdout, "%s/%s applied\n", strings.ToLower(resource.GetKind()), resource.GetName())
 	return nil
 }
 
@@ -146,7 +171,7 @@ func (c *Client) WriteSessionStatus(ctx context.Context, namespace, session stri
 		return fmt.Errorf("list PersistentVolumeClaims: %w", err)
 	}
 	output := tabwriter.NewWriter(c.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(output, "KIND\tNAME\tREADY\tSTATUS")
+	_, _ = fmt.Fprintln(output, "KIND\tNAME\tREADY\tSTATUS")
 	for i := range jobs.Items {
 		writeJobStatus(output, &jobs.Items[i])
 	}
@@ -157,7 +182,7 @@ func (c *Client) WriteSessionStatus(ctx context.Context, namespace, session stri
 		writePodStatus(output, &pods.Items[i])
 	}
 	for i := range claims.Items {
-		fmt.Fprintf(output, "PersistentVolumeClaim\t%s\t-\t%s\n", claims.Items[i].Name, claims.Items[i].Status.Phase)
+		_, _ = fmt.Fprintf(output, "PersistentVolumeClaim\t%s\t-\t%s\n", claims.Items[i].Name, claims.Items[i].Status.Phase)
 	}
 	if err := output.Flush(); err != nil {
 		return fmt.Errorf("write status: %w", err)
@@ -260,7 +285,7 @@ func (c *Client) scaleSession(ctx context.Context, namespace, name string, repli
 	if err != nil {
 		return fmt.Errorf("scale StatefulSet %s: %w", name, err)
 	}
-	fmt.Fprintf(c.stdout, "statefulset/%s scaled to %d\n", name, replicas)
+	_, _ = fmt.Fprintf(c.stdout, "statefulset/%s scaled to %d\n", name, replicas)
 	return nil
 }
 
@@ -294,7 +319,7 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 			deleteErrors = append(deleteErrors, fmt.Errorf("delete PersistentVolumeClaim %s: %w", claim, err))
 			continue
 		}
-		fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
+		_, _ = fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
 	}
 	return errors.Join(deleteErrors...)
 }
@@ -322,7 +347,7 @@ func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name str
 			deleteErrors = append(deleteErrors, fmt.Errorf("delete %s %s: %w", deletion.kind, name, err))
 			continue
 		}
-		fmt.Fprintf(c.stdout, "%s/%s deleted\n", deletion.kind, name)
+		_, _ = fmt.Fprintf(c.stdout, "%s/%s deleted\n", deletion.kind, name)
 	}
 	return errors.Join(deleteErrors...)
 }
@@ -389,7 +414,7 @@ func writeJobStatus(output io.Writer, job *batchv1.Job) {
 	} else if job.Status.Active == 0 {
 		status = "Pending"
 	}
-	fmt.Fprintf(output, "Job\t%s\t%d/1\t%s\n", job.Name, job.Status.Succeeded, status)
+	_, _ = fmt.Fprintf(output, "Job\t%s\t%d/1\t%s\n", job.Name, job.Status.Succeeded, status)
 }
 
 func writeStatefulSetStatus(output io.Writer, set *appsv1.StatefulSet) {
@@ -397,7 +422,7 @@ func writeStatefulSetStatus(output io.Writer, set *appsv1.StatefulSet) {
 	if set.Spec.Replicas != nil {
 		desired = *set.Spec.Replicas
 	}
-	fmt.Fprintf(output, "StatefulSet\t%s\t%d/%d\t%s\n", set.Name, set.Status.ReadyReplicas, desired, statefulSetStatus(set, desired))
+	_, _ = fmt.Fprintf(output, "StatefulSet\t%s\t%d/%d\t%s\n", set.Name, set.Status.ReadyReplicas, desired, statefulSetStatus(set, desired))
 }
 
 func statefulSetStatus(set *appsv1.StatefulSet, desired int32) string {
@@ -415,7 +440,7 @@ func writePodStatus(output io.Writer, pod *corev1.Pod) {
 	if podReady(pod) {
 		ready = "1/1"
 	}
-	fmt.Fprintf(output, "Pod\t%s\t%s\t%s\n", pod.Name, ready, pod.Status.Phase)
+	_, _ = fmt.Fprintf(output, "Pod\t%s\t%s\t%s\n", pod.Name, ready, pod.Status.Phase)
 }
 
 func podReady(pod *corev1.Pod) bool {
