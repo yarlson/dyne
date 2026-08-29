@@ -3,10 +3,11 @@ package kubernetes
 import (
 	"context"
 	"io"
-	"slices"
-	"strings"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,18 +41,14 @@ func TestSessionStatusDescribesOwnedResources(t *testing.T) {
 	}
 	client := &Client{typed: fake.NewClientset(job, pod, claim)}
 	got, err := client.SessionStatus(context.Background(), "coding-agents", "example")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	want := []ResourceStatus{
 		{Kind: "Job", Name: "example", Ready: "1/1", State: "Complete"},
 		{Kind: "Pod", Name: "example-pod", Ready: "1/1", State: "Running"},
 		{Kind: "PersistentVolumeClaim", Name: "workspace-example", Ready: "-", State: "Bound"},
 	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("got status %#v, want %#v", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestSessionStatusReportsStoppedLongSession(t *testing.T) {
@@ -66,14 +63,10 @@ func TestSessionStatusReportsStoppedLongSession(t *testing.T) {
 	}
 	client := &Client{typed: fake.NewClientset(set)}
 	got, err := client.SessionStatus(context.Background(), "coding-agents", "long-example")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	want := []ResourceStatus{{Kind: "StatefulSet", Name: "long-example", Ready: "0/0", State: "Stopped"}}
-	if !slices.Equal(got, want) {
-		t.Fatalf("got status %#v, want %#v", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestCheckSessionModeAvailableRejectsConflictingWorkloadKind(t *testing.T) {
@@ -100,42 +93,91 @@ func TestCheckSessionModeAvailableRejectsConflictingWorkloadKind(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client := &Client{typed: fake.NewClientset(test.workload), stdout: io.Discard}
 			err := client.CheckSessionModeAvailable(context.Background(), "coding-agents", "example", test.mode)
-			if err == nil || !strings.Contains(err.Error(), test.message) {
-				t.Fatalf("got error %v, want message containing %q", err, test.message)
-			}
+			require.ErrorContains(t, err, test.message)
 		})
 	}
+}
+
+func TestCheckSessionModeAvailableAllowsExistingWorkloadOfSameKind(t *testing.T) {
+	tests := []struct {
+		name     string
+		mode     sessionmanifest.Mode
+		workload runtime.Object
+	}{
+		{
+			name:     "long session",
+			mode:     sessionmanifest.ModeLong,
+			workload: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "coding-agents"}},
+		},
+		{
+			name:     "bounded update",
+			mode:     sessionmanifest.ModeUpdate,
+			workload: &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "coding-agents"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{typed: fake.NewClientset(test.workload), stdout: io.Discard}
+			require.NoError(t, client.CheckSessionModeAvailable(context.Background(), "coding-agents", "example", test.mode))
+		})
+	}
+}
+
+func TestWaitForReadyPodReturnsNewestReadyAttempt(t *testing.T) {
+	labels := map[string]string{"coding-agent/session": "example"}
+	old := readyPod("example-old", labels, time.Date(2026, time.August, 29, 8, 0, 0, 0, time.UTC))
+	newest := readyPod("example-new", labels, time.Date(2026, time.August, 29, 9, 0, 0, 0, time.UTC))
+	unowned := readyPod("another-session", map[string]string{"coding-agent/session": "another"}, time.Date(2026, time.August, 29, 10, 0, 0, 0, time.UTC))
+	client := &Client{typed: fake.NewClientset(old, newest, unowned)}
+	name, err := client.WaitForReadyPod(context.Background(), "coding-agents", "example", time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, "example-new", name)
+}
+
+func TestWaitForReadyPodReportsNewestFailedAttempt(t *testing.T) {
+	failed := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "example-failed",
+			Namespace:         "coding-agents",
+			Labels:            map[string]string{"coding-agent/session": "example"},
+			CreationTimestamp: metav1.NewTime(time.Date(2026, time.August, 29, 9, 0, 0, 0, time.UTC)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	client := &Client{typed: fake.NewClientset(failed)}
+	_, err := client.WaitForReadyPod(context.Background(), "coding-agents", "example", time.Second)
+	require.ErrorContains(t, err, "pod example-failed failed")
+}
+
+func TestNewestPodNameReportsMissingSession(t *testing.T) {
+	client := &Client{typed: fake.NewClientset()}
+	_, err := client.NewestPodName(context.Background(), "coding-agents", "missing")
+	require.True(t, apierrors.IsNotFound(err), "got error %v, want missing Pod", err)
 }
 
 func TestDeleteSessionRemovesComputeAndRetainsPersistentState(t *testing.T) {
 	claimNames := []string{"workspace-example", "home-example", "codex-example"}
 	client, clientset := sessionClientWithPersistentState(claimNames)
-	if err := client.DeleteSession(context.Background(), "coding-agents", "example"); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, client.DeleteSession(context.Background(), "coding-agents", "example"))
 
 	assertSessionComputeRemoved(t, clientset)
 
 	for _, name := range claimNames {
-		if _, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
-			t.Fatalf("persistent state %s was not retained: %v", name, err)
-		}
+		_, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{})
+		assert.NoError(t, err, "persistent state %s was not retained", name)
 	}
 }
 
 func TestDestroySessionRemovesComputeAndPersistentState(t *testing.T) {
 	claimNames := []string{"workspace-example", "home-example", "codex-example"}
 	client, clientset := sessionClientWithPersistentState(claimNames)
-	if err := client.DestroySession(context.Background(), "coding-agents", "example"); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, client.DestroySession(context.Background(), "coding-agents", "example"))
 
 	assertSessionComputeRemoved(t, clientset)
 
 	for _, name := range claimNames {
-		if _, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-			t.Fatalf("got PersistentVolumeClaim %s lookup error %v, want deleted claim", name, err)
-		}
+		_, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{})
+		assert.True(t, apierrors.IsNotFound(err), "got PersistentVolumeClaim %s lookup error %v, want deleted claim", name, err)
 	}
 }
 
@@ -158,15 +200,30 @@ func sessionClientWithPersistentState(claimNames []string) (*Client, *fake.Clien
 
 func assertSessionComputeRemoved(t *testing.T, clientset *fake.Clientset) {
 	t.Helper()
-	if _, err := clientset.BatchV1().Jobs("coding-agents").Get(context.Background(), "example", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("got Job lookup error %v, want deleted Job", err)
-	}
+	_, err := clientset.BatchV1().Jobs("coding-agents").Get(context.Background(), "example", metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "got Job lookup error %v, want deleted Job", err)
 
-	if _, err := clientset.AppsV1().StatefulSets("coding-agents").Get(context.Background(), "example", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("got StatefulSet lookup error %v, want deleted StatefulSet", err)
-	}
+	_, err = clientset.AppsV1().StatefulSets("coding-agents").Get(context.Background(), "example", metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "got StatefulSet lookup error %v, want deleted StatefulSet", err)
 
-	if _, err := clientset.CoreV1().Services("coding-agents").Get(context.Background(), "example", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("got Service lookup error %v, want deleted Service", err)
+	_, err = clientset.CoreV1().Services("coding-agents").Get(context.Background(), "example", metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "got Service lookup error %v, want deleted Service", err)
+}
+
+func readyPod(name string, labels map[string]string, created time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "coding-agents",
+			Labels:            labels,
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
 	}
 }

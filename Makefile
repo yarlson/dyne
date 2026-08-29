@@ -26,6 +26,11 @@ test: ## Run all Go tests
 test-race: ## Run all Go tests with the race detector
 	go test -race ./...
 
+.PHONY: integration-test
+integration-test: ## Run live Kubernetes tests with KUBERNETES_INTEGRATION_CONTEXT
+	@test -n "$(KUBERNETES_INTEGRATION_CONTEXT)" || { printf 'KUBERNETES_INTEGRATION_CONTEXT is required\n'; exit 1; }
+	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" go test -cover -tags=integration -count=1 ./internal/kubernetes
+
 .PHONY: coverage
 coverage: ## Write coverage.out
 	go test -race -coverprofile=coverage.out ./...

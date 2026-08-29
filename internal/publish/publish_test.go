@@ -3,9 +3,11 @@ package publish
 import (
 	"context"
 	"errors"
-	"slices"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"coding-agent-k8s/internal/github"
 	"coding-agent-k8s/internal/kubernetes"
@@ -21,57 +23,48 @@ func TestPublishSessionRecoversExistingPullRequestAndCleansPublisher(t *testing.
 	}
 	cluster.waitPublisher = func(_ context.Context, namespace, session, intentID string, timeout time.Duration) (kubernetes.PublisherJobResult, error) {
 		operations = append(operations, "wait for publisher")
-		if namespace != "coding-agents" || session != "review" || intentID != wantIntentID || timeout != time.Minute {
-			t.Fatalf("waited namespace=%q session=%q intent=%q timeout=%s", namespace, session, intentID, timeout)
-		}
+		assert.Equal(t, "coding-agents", namespace)
+		assert.Equal(t, "review", session)
+		assert.Equal(t, wantIntentID, intentID)
+		assert.Equal(t, time.Minute, timeout)
 
 		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: "9a4484441215661904e02a807adf5034d13f5bbe"}, nil
 	}
 	cluster.deletePublisher = func(_ context.Context, namespace, session string) error {
 		operations = append(operations, "delete publisher")
-		if namespace != "coding-agents" || session != "review" {
-			t.Fatalf("deleted publisher for %s/%s", namespace, session)
-		}
+		assert.Equal(t, "coding-agents", namespace)
+		assert.Equal(t, "review", session)
 
 		return nil
 	}
 	client := githubClientStub{
 		findPull: func(_ context.Context, _ github.Repository, baseBranch, branch string) (*github.PullRequest, error) {
 			operations = append(operations, "find pull request")
-			if baseBranch != "main" || branch != "yar/review" {
-				t.Fatalf("searched base=%q branch=%q", baseBranch, branch)
-			}
+			assert.Equal(t, "main", baseBranch)
+			assert.Equal(t, "yar/review", branch)
 
 			return &github.PullRequest{Number: 17, URL: "https://github.com/lokalise/kargo/pull/17"}, nil
 		},
 	}
 	result, err := publishSession(context.Background(), cluster, request, githubClientFactory(t, client))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	wantResult := Result{
 		PullRequestNumber: 17,
 		PullRequestURL:    "https://github.com/lokalise/kargo/pull/17",
 		Branch:            "yar/review",
 	}
-	if result != wantResult {
-		t.Fatalf("got result %#v, want %#v", result, wantResult)
-	}
+	assert.Equal(t, wantResult, result)
 
 	wantOperations := []string{"find pull request", "wait for publisher", "delete publisher"}
-	if !slices.Equal(operations, wantOperations) {
-		t.Fatalf("got operations %q, want %q", operations, wantOperations)
-	}
+	assert.Equal(t, wantOperations, operations)
 }
 
 func TestSessionRejectsInvalidRequestBeforeUsingCluster(t *testing.T) {
 	request := validPublishRequest()
 	request.Branch = " yar/review"
 	_, err := Session(context.Background(), nil, request)
-	if err == nil || err.Error() != "--branch must not start or end with whitespace" {
-		t.Fatalf("got error %v", err)
-	}
+	require.EqualError(t, err, "--branch must not start or end with whitespace")
 }
 
 func TestPublishSessionRejectsExistingBranchWithoutPublisherOwnership(t *testing.T) {
@@ -86,9 +79,7 @@ func TestPublishSessionRejectsExistingBranchWithoutPublisherOwnership(t *testing
 		},
 	}
 	_, err := publishSession(context.Background(), cluster, request, githubClientFactory(t, client))
-	if err == nil || err.Error() != "remote branch yar/review already exists and is not owned by this publish request" {
-		t.Fatalf("got error %v", err)
-	}
+	require.EqualError(t, err, "remote branch yar/review already exists and is not owned by this publish request")
 }
 
 func TestPublishSessionCleansFailedPublisherWhenBranchWasNotCreated(t *testing.T) {
@@ -119,14 +110,10 @@ func TestPublishSessionCleansFailedPublisherWhenBranchWasNotCreated(t *testing.T
 		},
 	}
 	_, err := publishSession(context.Background(), cluster, validPublishRequest(), githubClientFactory(t, client))
-	if !errors.Is(err, publisherFailure) {
-		t.Fatalf("got error %v, want publisher failure", err)
-	}
+	require.ErrorIs(t, err, publisherFailure)
 
 	wantOperations := []string{"check branch", "publish branch", "check branch", "delete publisher"}
-	if !slices.Equal(operations, wantOperations) {
-		t.Fatalf("got operations %q, want %q", operations, wantOperations)
-	}
+	assert.Equal(t, wantOperations, operations)
 }
 
 func TestPublishSessionStopsAfterCancellation(t *testing.T) {
@@ -135,13 +122,11 @@ func TestPublishSessionStopsAfterCancellation(t *testing.T) {
 		return kubernetes.PublishSource{}, context.Canceled
 	}
 	_, err := publishSession(context.Background(), cluster, validPublishRequest(), func(string) (githubClient, error) {
-		t.Fatal("created a GitHub client after cancellation")
+		require.FailNow(t, "created a GitHub client after cancellation")
 
 		return nil, nil
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("got error %v, want cancellation", err)
-	}
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing.T) {
@@ -152,25 +137,25 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 	cluster := publishClusterForRequest(t)
 	cluster.runPublisher = func(_ context.Context, job kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error) {
 		operations = append(operations, "publish branch")
-		if job.Namespace != "coding-agents" || job.Session != "review" || job.Repository != "https://github.com/lokalise/kargo.git" || job.BaseRef != "main" || job.Branch != "yar/review" {
-			t.Fatalf("got publisher destination %#v", job)
-		}
-
-		if job.CommitMessage != "Review changes" || job.AuthorName != "yar" || job.AuthorEmail != "12345+yar@users.noreply.github.com" {
-			t.Fatalf("got publisher commit %#v", job)
-		}
-
-		if job.Image != "coding-agent:test" || job.WorkspaceClaim != "workspace-review" || job.Timeout != time.Minute || job.IntentID == "" {
-			t.Fatalf("got publisher runtime %#v", job)
-		}
+		assert.Equal(t, "coding-agents", job.Namespace)
+		assert.Equal(t, "review", job.Session)
+		assert.Equal(t, "https://github.com/lokalise/kargo.git", job.Repository)
+		assert.Equal(t, "main", job.BaseRef)
+		assert.Equal(t, "yar/review", job.Branch)
+		assert.Equal(t, "Review changes", job.CommitMessage)
+		assert.Equal(t, "yar", job.AuthorName)
+		assert.Equal(t, "12345+yar@users.noreply.github.com", job.AuthorEmail)
+		assert.Equal(t, "coding-agent:test", job.Image)
+		assert.Equal(t, "workspace-review", job.WorkspaceClaim)
+		assert.Equal(t, time.Minute, job.Timeout)
+		assert.NotEmpty(t, job.IntentID)
 
 		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: commitSHA}, nil
 	}
 	cluster.deletePublisher = func(_ context.Context, namespace, session string) error {
 		operations = append(operations, "delete publisher")
-		if namespace != "coding-agents" || session != "review" {
-			t.Fatalf("deleted publisher for %s/%s", namespace, session)
-		}
+		assert.Equal(t, "coding-agents", namespace)
+		assert.Equal(t, "review", session)
 
 		return nil
 	}
@@ -180,17 +165,15 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		},
 		branchCommit: func(_ context.Context, _ github.Repository, branch string) (string, bool, error) {
 			operations = append(operations, "find branch")
-			if branch != "yar/review" {
-				t.Fatalf("searched branch=%q", branch)
-			}
+			assert.Equal(t, "yar/review", branch)
 
 			return "", false, nil
 		},
 		waitBranch: func(_ context.Context, _ github.Repository, branch, expectedCommit string, timeout time.Duration) error {
 			operations = append(operations, "wait for branch")
-			if branch != "yar/review" || expectedCommit != commitSHA || timeout != 30*time.Second {
-				t.Fatalf("waited branch=%q commit=%q timeout=%s", branch, expectedCommit, timeout)
-			}
+			assert.Equal(t, "yar/review", branch)
+			assert.Equal(t, commitSHA, expectedCommit)
+			assert.Equal(t, 30*time.Second, timeout)
 
 			return nil
 		},
@@ -201,25 +184,25 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		},
 		createPull: func(_ context.Context, _ github.Repository, baseBranch, branch, title, body string, draft bool) (github.PullRequest, error) {
 			operations = append(operations, "create pull request")
-			if baseBranch != "main" || branch != "yar/review" || title != "Review changes" || body != "Ready for review" || !draft {
-				t.Fatalf("created base=%q branch=%q title=%q body=%q draft=%t", baseBranch, branch, title, body, draft)
-			}
+			assert.Equal(t, "main", baseBranch)
+			assert.Equal(t, "yar/review", branch)
+			assert.Equal(t, "Review changes", title)
+			assert.Equal(t, "Ready for review", body)
+			assert.True(t, draft)
 
 			return github.PullRequest{}, createFailure
 		},
 		waitPull: func(_ context.Context, _ github.Repository, baseBranch, branch string, timeout time.Duration) (*github.PullRequest, error) {
 			operations = append(operations, "recover pull request")
-			if baseBranch != "main" || branch != "yar/review" || timeout != 10*time.Second {
-				t.Fatalf("waited base=%q branch=%q timeout=%s", baseBranch, branch, timeout)
-			}
+			assert.Equal(t, "main", baseBranch)
+			assert.Equal(t, "yar/review", branch)
+			assert.Equal(t, 10*time.Second, timeout)
 
 			return &github.PullRequest{Number: 23, URL: "https://github.com/lokalise/kargo/pull/23"}, nil
 		},
 	}
 	result, err := publishSession(context.Background(), cluster, request, githubClientFactory(t, client))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	wantResult := Result{
 		PullRequestNumber: 23,
@@ -227,9 +210,7 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		Branch:            "yar/review",
 		CommitSHA:         commitSHA,
 	}
-	if result != wantResult {
-		t.Fatalf("got result %#v, want %#v", result, wantResult)
-	}
+	assert.Equal(t, wantResult, result)
 
 	wantOperations := []string{
 		"find pull request",
@@ -240,9 +221,7 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		"recover pull request",
 		"delete publisher",
 	}
-	if !slices.Equal(operations, wantOperations) {
-		t.Fatalf("got operations %q, want %q", operations, wantOperations)
-	}
+	assert.Equal(t, wantOperations, operations)
 }
 
 type publishClusterStub struct {
@@ -338,23 +317,19 @@ func publishClusterForRequest(t *testing.T) publishClusterStub {
 
 	return publishClusterStub{
 		source: func(_ context.Context, namespace, session string) (kubernetes.PublishSource, error) {
-			if namespace != "coding-agents" || session != "review" {
-				t.Fatalf("loaded source for %s/%s", namespace, session)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review", session)
 
 			return eligiblePublishSource(), nil
 		},
 		token: func(_ context.Context, namespace string) (string, error) {
-			if namespace != "coding-agents" {
-				t.Fatalf("loaded token from namespace %q", namespace)
-			}
+			assert.Equal(t, "coding-agents", namespace)
 
 			return "github-token", nil
 		},
 		intent: func(_ context.Context, namespace, session string) (string, bool, error) {
-			if namespace != "coding-agents" || session != "review" {
-				t.Fatalf("loaded publisher intent for %s/%s", namespace, session)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review", session)
 
 			return "", false, nil
 		},
@@ -365,9 +340,7 @@ func githubClientFactory(t *testing.T, client githubClient) func(string) (github
 	t.Helper()
 
 	return func(token string) (githubClient, error) {
-		if token != "github-token" {
-			t.Fatalf("created GitHub client with token %q", token)
-		}
+		assert.Equal(t, "github-token", token)
 
 		return client, nil
 	}

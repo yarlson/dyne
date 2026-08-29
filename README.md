@@ -171,8 +171,9 @@ make doctor
 make check
 make build
 make image
+make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
 ```
 
-`make tools` installs the pinned golangci-lint version. Ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. There is currently no live conformance suite; state-changing runtime verification must use an explicitly isolated Colima profile and own its cleanup.
+`make tools` installs the pinned golangci-lint version. Ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. The opt-in integration test uses the named Kubernetes context, creates a unique namespace, verifies apply, scale, delete, and destroy behavior, and removes the namespace during cleanup. Use only an explicitly isolated test cluster.
 
 Repository conventions are documented in [AGENTS.md](AGENTS.md), [docs/GO.md](docs/GO.md), [docs/TESTING.md](docs/TESTING.md), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

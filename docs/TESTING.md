@@ -28,6 +28,14 @@ Use table-driven tests when cases share setup, action, and assertions. Keep dist
 
 Ordinary tests must not contact Docker, Kubernetes, Codex, or GitHub. A live test requires explicit opt-in, isolated resources, bounded execution, and cleanup that is verified even after failure.
 
+Run the Kubernetes integration test against an isolated cluster:
+
+```bash
+make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
+```
+
+The `integration` build tag excludes live tests from ordinary checks. The test creates a unique namespace and verifies its deletion during cleanup.
+
 ## Concurrency and determinism
 
 Avoid arbitrary sleeps, shared mutable state, real credentials, and ordering dependencies. Use bounded polling only when waiting is the product contract. Do not use `t.Parallel` when a test changes process-global state.

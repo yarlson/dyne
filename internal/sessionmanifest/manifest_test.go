@@ -2,10 +2,11 @@ package sessionmanifest
 
 import (
 	"encoding/json"
-	"maps"
 	"slices"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type renderedResource struct {
@@ -102,9 +103,7 @@ func TestRenderSelectsWorkloadAndStorageForSessionLifecycle(t *testing.T) {
 			spec.Mode = test.mode
 			spec.Prompt = test.prompt
 			manifest, err := Render(spec)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 
 			resources := decodeRenderedResources(t, manifest)
 			identities := make([]string, 0, len(resources))
@@ -113,41 +112,29 @@ func TestRenderSelectsWorkloadAndStorageForSessionLifecycle(t *testing.T) {
 			}
 
 			slices.Sort(identities)
-			if !slices.Equal(identities, test.wantResources) {
-				t.Fatalf("got resources %v, want %v", identities, test.wantResources)
-			}
+			assert.Equal(t, test.wantResources, identities)
 
 			storage := renderedStorage(resources[test.workload])
-			if !maps.Equal(storage, test.wantStorage) {
-				t.Fatalf("got storage %v, want %v", storage, test.wantStorage)
-			}
+			assert.Equal(t, test.wantStorage, storage)
 		})
 	}
 }
 
 func TestRenderBootstrapIncludesRequestedCredentials(t *testing.T) {
 	manifest, err := RenderBootstrap("coding-agents", []byte(`{"token":"codex"}`), "", "github-secret")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	resources := decodeRenderedResources(t, manifest)
 	auth := resources["Secret/coding-agent-auth"].Data
-	if len(auth) != 1 || auth["auth.json"] != "eyJ0b2tlbiI6ImNvZGV4In0=" {
-		t.Fatalf("got Codex credentials %v", auth)
-	}
+	assert.Equal(t, map[string]string{"auth.json": "eyJ0b2tlbiI6ImNvZGV4In0="}, auth)
 
 	git := resources["Secret/coding-agent-git-auth"].Data
-	if len(git) != 1 || git["token"] != "Z2l0aHViLXNlY3JldA==" {
-		t.Fatalf("got GitHub credentials %v", git)
-	}
+	assert.Equal(t, map[string]string{"token": "Z2l0aHViLXNlY3JldA=="}, git)
 }
 
 func TestRenderBootstrapRejectsMultipleCodexCredentials(t *testing.T) {
 	_, err := RenderBootstrap("coding-agents", []byte(`{"token":"codex"}`), "api-key", "")
-	if err == nil || !strings.Contains(err.Error(), "either Codex auth JSON or an API key") {
-		t.Fatalf("got error %v", err)
-	}
+	require.ErrorContains(t, err, "either Codex auth JSON or an API key")
 }
 
 func TestRenderRejectsInvalidContracts(t *testing.T) {
@@ -165,9 +152,8 @@ func TestRenderRejectsInvalidContracts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			spec := validSpec()
 			test.change(&spec)
-			if _, err := Render(spec); err == nil || !strings.Contains(err.Error(), test.message) {
-				t.Fatalf("got error %v, want message containing %q", err, test.message)
-			}
+			_, err := Render(spec)
+			require.ErrorContains(t, err, test.message)
 		})
 	}
 }
@@ -191,16 +177,12 @@ func decodeRenderedResources(t *testing.T, manifest []byte) map[string]renderedR
 	var list struct {
 		Items []renderedResource `json:"items"`
 	}
-	if err := json.Unmarshal(manifest, &list); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, json.Unmarshal(manifest, &list))
 
 	resources := make(map[string]renderedResource, len(list.Items))
 	for _, item := range list.Items {
 		identity := item.Kind + "/" + item.Metadata.Name
-		if _, exists := resources[identity]; exists {
-			t.Fatalf("manifest contains duplicate resource %s", identity)
-		}
+		require.NotContains(t, resources, identity, "manifest contains duplicate resource")
 
 		resources[identity] = item
 	}

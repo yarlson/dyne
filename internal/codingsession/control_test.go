@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
-	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"coding-agent-k8s/internal/publish"
 	"coding-agent-k8s/internal/sessionmanifest"
@@ -26,9 +28,7 @@ func TestNewRejectsMissingStreamsBeforeLoadingKubeconfig(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := New("unavailable-context", test.streams)
-			if err == nil || err.Error() != "input, output, and error output streams are required" {
-				t.Fatalf("got error %v", err)
-			}
+			require.EqualError(t, err, "input, output, and error output streams are required")
 		})
 	}
 }
@@ -36,12 +36,12 @@ func TestNewRejectsMissingStreamsBeforeLoadingKubeconfig(t *testing.T) {
 func TestStartRejectsInvalidRequestWithoutChangingCluster(t *testing.T) {
 	cluster := startCluster{
 		check: func(context.Context, string, string, sessionmanifest.Mode) error {
-			t.Fatal("checked the cluster for an invalid request")
+			require.FailNow(t, "checked the cluster for an invalid request")
 
 			return nil
 		},
 		apply: func(context.Context, []byte) error {
-			t.Fatal("applied an invalid request")
+			require.FailNow(t, "applied an invalid request")
 
 			return nil
 		},
@@ -51,23 +51,21 @@ func TestStartRejectsInvalidRequestWithoutChangingCluster(t *testing.T) {
 	request.Target.Name = "missing-task"
 	request.Prompt = ""
 	err := control.Start(context.Background(), request)
-	if err == nil || !strings.Contains(err.Error(), "prompt is required for update sessions") {
-		t.Fatalf("got error %v", err)
-	}
+	require.ErrorContains(t, err, "prompt is required for update sessions")
 }
 
 func TestStartPreservesExistingSessionWhenModeConflicts(t *testing.T) {
 	conflict := errors.New("bounded session already owns this name")
 	cluster := startCluster{
 		check: func(_ context.Context, namespace, name string, mode sessionmanifest.Mode) error {
-			if namespace != "coding-agents" || name != "review" || mode != sessionmanifest.ModeLong {
-				t.Fatalf("checked %s/%s in mode %q", namespace, name, mode)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review", name)
+			assert.Equal(t, sessionmanifest.ModeLong, mode)
 
 			return conflict
 		},
 		apply: func(context.Context, []byte) error {
-			t.Fatal("applied a session after detecting a mode conflict")
+			require.FailNow(t, "applied a session after detecting a mode conflict")
 
 			return nil
 		},
@@ -77,9 +75,7 @@ func TestStartPreservesExistingSessionWhenModeConflicts(t *testing.T) {
 	request.Mode = ModeLong
 	request.Prompt = ""
 	err := control.Start(context.Background(), request)
-	if !errors.Is(err, conflict) {
-		t.Fatalf("got error %v, want mode conflict", err)
-	}
+	require.ErrorIs(t, err, conflict)
 }
 
 func TestStartChecksOwnershipBeforeApplyingSession(t *testing.T) {
@@ -87,30 +83,23 @@ func TestStartChecksOwnershipBeforeApplyingSession(t *testing.T) {
 	cluster := startCluster{
 		check: func(_ context.Context, namespace, name string, mode sessionmanifest.Mode) error {
 			operations = append(operations, "check")
-			if namespace != "coding-agents" || name != "review" || mode != sessionmanifest.ModeUpdate {
-				t.Fatalf("checked %s/%s in mode %q", namespace, name, mode)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review", name)
+			assert.Equal(t, sessionmanifest.ModeUpdate, mode)
 
 			return nil
 		},
 		apply: func(_ context.Context, manifest []byte) error {
 			operations = append(operations, "apply")
-			if len(manifest) == 0 {
-				t.Fatal("applied an empty session manifest")
-			}
+			assert.NotEmpty(t, manifest, "applied an empty session manifest")
 
 			return nil
 		},
 	}
 	control := &Control{cluster: cluster}
 	err := control.Start(context.Background(), validUpdateStartRequest())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !slices.Equal(operations, []string{"check", "apply"}) {
-		t.Fatalf("got operations %q, want ownership check before apply", operations)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, []string{"check", "apply"}, operations)
 }
 
 func TestRunTaskSelectsNewOrLatestThread(t *testing.T) {
@@ -134,17 +123,19 @@ func TestRunTaskSelectsNewOrLatestThread(t *testing.T) {
 			executed := false
 			cluster := taskCluster{
 				wait: func(_ context.Context, namespace, name string, timeout time.Duration) (string, error) {
-					if namespace != "coding-agents" || name != "review" || timeout <= 0 {
-						t.Fatalf("waited for %s/%s with timeout %s", namespace, name, timeout)
-					}
+					assert.Equal(t, "coding-agents", namespace)
+					assert.Equal(t, "review", name)
+					assert.Positive(t, timeout)
 
 					return "review-2", nil
 				},
 				exec: func(_ context.Context, namespace, pod, container string, command []string, interactive bool) error {
 					executed = true
-					if namespace != "coding-agents" || pod != "review-2" || container != "agent" || interactive || !slices.Equal(command, test.wantCommand) {
-						t.Fatalf("executed namespace=%q pod=%q container=%q command=%q interactive=%t", namespace, pod, container, command, interactive)
-					}
+					assert.Equal(t, "coding-agents", namespace)
+					assert.Equal(t, "review-2", pod)
+					assert.Equal(t, "agent", container)
+					assert.Equal(t, test.wantCommand, command)
+					assert.False(t, interactive)
 
 					return nil
 				},
@@ -155,13 +146,8 @@ func TestRunTaskSelectsNewOrLatestThread(t *testing.T) {
 				Prompt:     "review the failed checks",
 				ResumeLast: test.resumeLast,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if !executed {
-				t.Fatal("task was not executed")
-			}
+			require.NoError(t, err)
+			assert.True(t, executed, "task was not executed")
 		})
 	}
 }
@@ -173,7 +159,7 @@ func TestRunTaskDoesNotExecWhenSessionIsNotReady(t *testing.T) {
 			return "", notReady
 		},
 		exec: func(context.Context, string, string, string, []string, bool) error {
-			t.Fatal("executed a task without a ready Pod")
+			require.FailNow(t, "executed a task without a ready Pod")
 
 			return nil
 		},
@@ -183,26 +169,24 @@ func TestRunTaskDoesNotExecWhenSessionIsNotReady(t *testing.T) {
 		Target: Target{Namespace: "coding-agents", Name: "review"},
 		Prompt: "review the failed checks",
 	})
-	if !errors.Is(err, notReady) {
-		t.Fatalf("got error %v, want readiness error", err)
-	}
+	require.ErrorIs(t, err, notReady)
 }
 
 func TestStreamLogsUsesNewestSessionAttempt(t *testing.T) {
 	streamed := false
 	cluster := logCluster{
 		newest: func(_ context.Context, namespace, name string) (string, error) {
-			if namespace != "coding-agents" || name != "review" {
-				t.Fatalf("selected newest Pod for %s/%s", namespace, name)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review", name)
 
 			return "review-3", nil
 		},
 		stream: func(_ context.Context, namespace, pod, container string, follow bool) error {
 			streamed = true
-			if namespace != "coding-agents" || pod != "review-3" || container != "agent" || !follow {
-				t.Fatalf("streamed namespace=%q pod=%q container=%q follow=%t", namespace, pod, container, follow)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review-3", pod)
+			assert.Equal(t, "agent", container)
+			assert.True(t, follow)
 
 			return nil
 		},
@@ -212,13 +196,8 @@ func TestStreamLogsUsesNewestSessionAttempt(t *testing.T) {
 		Target: Target{Namespace: "coding-agents", Name: "review"},
 		Follow: true,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !streamed {
-		t.Fatal("logs were not streamed")
-	}
+	require.NoError(t, err)
+	assert.True(t, streamed, "logs were not streamed")
 }
 
 func TestStreamLogsDoesNotOpenStreamWhenNoAttemptExists(t *testing.T) {
@@ -228,7 +207,7 @@ func TestStreamLogsDoesNotOpenStreamWhenNoAttemptExists(t *testing.T) {
 			return "", noAttempt
 		},
 		stream: func(context.Context, string, string, string, bool) error {
-			t.Fatal("opened a log stream without a session attempt")
+			require.FailNow(t, "opened a log stream without a session attempt")
 
 			return nil
 		},
@@ -237,9 +216,7 @@ func TestStreamLogsDoesNotOpenStreamWhenNoAttemptExists(t *testing.T) {
 	err := control.StreamLogs(context.Background(), LogRequest{
 		Target: Target{Namespace: "coding-agents", Name: "review"},
 	})
-	if !errors.Is(err, noAttempt) {
-		t.Fatalf("got error %v, want missing-attempt error", err)
-	}
+	require.ErrorIs(t, err, noAttempt)
 }
 
 func TestOpenShellUsesInteractiveBashInReadySession(t *testing.T) {
@@ -250,28 +227,25 @@ func TestOpenShellUsesInteractiveBashInReadySession(t *testing.T) {
 		},
 		exec: func(_ context.Context, namespace, pod, container string, command []string, interactive bool) error {
 			executed = true
-			if namespace != "coding-agents" || pod != "review-4" || container != "agent" || !interactive || !slices.Equal(command, []string{"bash"}) {
-				t.Fatalf("executed namespace=%q pod=%q container=%q command=%q interactive=%t", namespace, pod, container, command, interactive)
-			}
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review-4", pod)
+			assert.Equal(t, "agent", container)
+			assert.Equal(t, []string{"bash"}, command)
+			assert.True(t, interactive)
 
 			return nil
 		},
 	}
 	control := &Control{cluster: cluster}
 	err := control.OpenShell(context.Background(), Target{Namespace: "coding-agents", Name: "review"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !executed {
-		t.Fatal("interactive shell was not opened")
-	}
+	require.NoError(t, err)
+	assert.True(t, executed, "interactive shell was not opened")
 }
 
 func TestPublishRejectsInvalidTargetWithoutStartingPublication(t *testing.T) {
 	control := &Control{
 		publishSession: func(context.Context, publish.Request) (publish.Result, error) {
-			t.Fatal("started publication with an invalid target")
+			require.FailNow(t, "started publication with an invalid target")
 
 			return publish.Result{}, nil
 		},
@@ -283,9 +257,7 @@ func TestPublishRejectsInvalidTargetWithoutStartingPublication(t *testing.T) {
 		Title:         "Review changes",
 		Timeout:       time.Minute,
 	})
-	if err == nil || err.Error() != "session name is required" {
-		t.Fatalf("got error %v, want missing session name", err)
-	}
+	require.EqualError(t, err, "session name is required")
 }
 
 type startCluster struct {
