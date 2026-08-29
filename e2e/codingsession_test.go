@@ -320,7 +320,7 @@ func (environment testEnvironment) requireJobSucceeded(t *testing.T, name string
 		}
 
 		if job.Status.Failed > 0 {
-			return false, fmt.Errorf("Job %s failed", name)
+			return false, fmt.Errorf("job %s failed", name)
 		}
 
 		return job.Status.Succeeded == 1, nil
