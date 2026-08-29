@@ -65,8 +65,9 @@ tidy: ## Update go.mod and go.sum
 	go mod tidy
 
 .PHONY: mod-check
-mod-check: ## Verify downloaded module checksums
+mod-check: ## Verify module checksums and tidy state
 	go mod verify
+	go mod tidy -diff
 
 .PHONY: check
 check: fmt-check mod-check vet lint test-race build ## Run all required local checks

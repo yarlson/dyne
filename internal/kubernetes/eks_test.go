@@ -58,13 +58,11 @@ func TestEKSTokenCacheSharesAnUnexpiredToken(t *testing.T) {
 	results := make(chan string, callers)
 	var group sync.WaitGroup
 	for range callers {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			token, err := cache.Token(context.Background())
-			require.NoError(t, err)
+			assert.NoError(t, err)
 			results <- token
-		}()
+		})
 	}
 
 	group.Wait()

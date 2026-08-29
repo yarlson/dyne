@@ -34,7 +34,6 @@ const fieldManagerName = "airlock"
 
 // Client applies and manages coding-agent resources through the Kubernetes API.
 type Client struct {
-	config  *rest.Config
 	typed   clientset.Interface
 	dynamic dynamic.Interface
 	mapper  meta.RESTMapper
@@ -57,18 +56,18 @@ type SessionDefinition struct {
 	StorageSize string
 }
 
-// New returns a client configured from the standard kubeconfig loading rules and the supplied streams.
-func New(contextName string, stdin io.Reader, stdout, stderr io.Writer) (*Client, error) {
+// New returns a client configured from the standard kubeconfig loading rules.
+func New(contextName string, stdout io.Writer) (*Client, error) {
 	config, err := loadKubeconfig("", contextName)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewForConfig(config, stdin, stdout, stderr)
+	return NewForConfig(config, stdout)
 }
 
 // NewForConfig returns a client that uses server-owned Kubernetes credentials.
-func NewForConfig(config *rest.Config, stdin io.Reader, stdout, stderr io.Writer) (*Client, error) {
+func NewForConfig(config *rest.Config, stdout io.Writer) (*Client, error) {
 	if config == nil {
 		return nil, errors.New("kubernetes configuration is required")
 	}
@@ -86,7 +85,6 @@ func NewForConfig(config *rest.Config, stdin io.Reader, stdout, stderr io.Writer
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(typed.Discovery()))
 
 	return &Client{
-		config:  config,
 		typed:   typed,
 		dynamic: dynamicClient,
 		mapper:  mapper,
@@ -246,10 +244,9 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 		return fmt.Errorf("encode %s %s: %w", resource.GetKind(), resource.GetName(), err)
 	}
 
-	force := true
 	if _, err := resourceClient.Patch(ctx, resource.GetName(), types.ApplyPatchType, contents, metav1.PatchOptions{
 		FieldManager: fieldManagerName,
-		Force:        &force,
+		Force:        new(true),
 	}); err != nil {
 		return fmt.Errorf("apply %s %s: %w", resource.GetKind(), resource.GetName(), err)
 	}
@@ -363,28 +360,22 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 		return nil
 	}
 
-	var deleteErrors []error
-	for _, claim := range []string{sessionmanifest.SessionClaimName(name)} {
-		err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{})
+	claim := sessionmanifest.SessionClaimName(name)
+	if err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{}); err != nil {
 		if apierrors.IsNotFound(err) {
-			continue
+			return nil
 		}
 
-		if err != nil {
-			deleteErrors = append(deleteErrors, fmt.Errorf("delete PersistentVolumeClaim %s: %w", claim, err))
-
-			continue
-		}
-
-		_, _ = fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
+		return fmt.Errorf("delete PersistentVolumeClaim %s: %w", claim, err)
 	}
 
-	return errors.Join(deleteErrors...)
+	_, _ = fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
+
+	return nil
 }
 
 func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name string) error {
-	propagation := metav1.DeletePropagationBackground
-	options := metav1.DeleteOptions{PropagationPolicy: &propagation}
+	options := metav1.DeleteOptions{PropagationPolicy: new(metav1.DeletePropagationBackground)}
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionSelector(name)})
 	if err != nil {
 		return fmt.Errorf("list session Jobs for deletion: %w", err)
@@ -440,7 +431,7 @@ func (c *Client) SessionArtifacts(ctx context.Context, namespace, session string
 
 func parseTaskArtifacts(message string) (TaskArtifacts, error) {
 	var result TaskArtifacts
-	for _, line := range strings.Split(message, "\n") {
+	for line := range strings.SplitSeq(message, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			continue

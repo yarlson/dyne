@@ -86,7 +86,7 @@ func New(contextName string, streams Streams) (*Control, error) {
 		return nil, errors.New("input, output, and error output streams are required")
 	}
 
-	cluster, err := kubernetes.New(contextName, streams.Input, streams.Output, streams.ErrorOutput)
+	cluster, err := kubernetes.New(contextName, streams.Output)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func Connect(ctx context.Context, connection Connection, streams Streams, reposi
 		return nil, err
 	}
 
-	cluster, err := kubernetes.NewForConfig(config, streams.Input, streams.Output, streams.ErrorOutput)
+	cluster, err := kubernetes.NewForConfig(config, streams.Output)
 	if err != nil {
 		return nil, err
 	}

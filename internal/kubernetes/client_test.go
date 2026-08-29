@@ -2,6 +2,7 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/yarlson/airlock/internal/sessionmanifest"
 )
@@ -153,6 +155,27 @@ func TestDestroySessionRemovesComputeAndPersistentState(t *testing.T) {
 		_, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{})
 		assert.True(t, apierrors.IsNotFound(err), "got PersistentVolumeClaim %s lookup error %v, want deleted claim", name, err)
 	}
+}
+
+func TestDestroySessionIgnoresMissingPersistentState(t *testing.T) {
+	client := &Client{typed: fake.NewClientset(), stdout: io.Discard}
+
+	require.NoError(t, client.DestroySession(context.Background(), "coding-agents", "example"))
+}
+
+func TestDestroySessionReturnsPersistentStorageDeletionFailure(t *testing.T) {
+	deleteFailure := errors.New("storage unavailable")
+	client, clientset := sessionClientWithPersistentState([]string{"session-example"})
+	clientset.PrependReactor("delete", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, deleteFailure
+	})
+
+	err := client.DestroySession(context.Background(), "coding-agents", "example")
+	require.ErrorIs(t, err, deleteFailure)
+	assert.ErrorContains(t, err, "delete PersistentVolumeClaim session-example")
+
+	_, err = clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), "session-example", metav1.GetOptions{})
+	require.NoError(t, err)
 }
 
 func sessionClientWithPersistentState(claimNames []string) (*Client, *fake.Clientset) {

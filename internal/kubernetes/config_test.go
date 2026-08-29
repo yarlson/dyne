@@ -139,11 +139,11 @@ func TestLoadConnectionConfigReturnsUnexpectedInClusterFailure(t *testing.T) {
 }
 
 func TestNewForConfigRequiresServerOwnedConfiguration(t *testing.T) {
-	_, err := NewForConfig(nil, nil, io.Discard, io.Discard)
+	_, err := NewForConfig(nil, io.Discard)
 	require.EqualError(t, err, "kubernetes configuration is required")
 
 	config := &rest.Config{Host: "https://cluster.example"}
-	client, err := NewForConfig(config, nil, io.Discard, io.Discard)
+	client, err := NewForConfig(config, io.Discard)
 	require.NoError(t, err)
-	assert.Equal(t, "https://cluster.example", client.config.Host)
+	assert.NotNil(t, client)
 }

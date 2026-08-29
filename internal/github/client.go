@@ -220,9 +220,9 @@ func pullRequestFromAPI(result *gh.PullRequest) (PullRequest, error) {
 }
 
 func isNotFound(err error) bool {
-	var responseErr *gh.ErrorResponse
+	responseErr, ok := errors.AsType[*gh.ErrorResponse](err)
 
-	return errors.As(err, &responseErr) && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound
+	return ok && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound
 }
 
 type responseBodyLimitTransport struct {

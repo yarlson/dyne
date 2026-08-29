@@ -341,8 +341,9 @@ func (c *Client) publisherJobPod(ctx context.Context, namespace, jobName string)
 }
 
 func (c *Client) deletePublisherJob(ctx context.Context, namespace, session string) error {
-	propagation := metav1.DeletePropagationBackground
-	err := c.typed.BatchV1().Jobs(namespace).Delete(ctx, publisherJobName(session), metav1.DeleteOptions{PropagationPolicy: &propagation})
+	err := c.typed.BatchV1().Jobs(namespace).Delete(ctx, publisherJobName(session), metav1.DeleteOptions{
+		PropagationPolicy: new(metav1.DeletePropagationBackground),
+	})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -370,8 +371,6 @@ func (c *Client) deletePublisherJob(ctx context.Context, namespace, session stri
 }
 
 func publisherJob(request PublisherJobRequest) *batchv1.Job {
-	backoffLimit := int32(0)
-	deadline := int64(request.Timeout.Seconds())
 	labels := map[string]string{
 		"app.kubernetes.io/name":       "coding-agent",
 		"app.kubernetes.io/managed-by": "airlock",
@@ -387,18 +386,18 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 			Annotations: map[string]string{publishIntentAnnotationKey: request.IntentID},
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:          &backoffLimit,
-			ActiveDeadlineSeconds: &deadline,
+			BackoffLimit:          new(int32(0)),
+			ActiveDeadlineSeconds: new(int64(request.Timeout.Seconds())),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					AutomountServiceAccountToken: boolPointer(false),
+					AutomountServiceAccountToken: new(false),
 					RestartPolicy:                corev1.RestartPolicyNever,
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: boolPointer(true),
-						RunAsUser:    int64Pointer(1000),
-						RunAsGroup:   int64Pointer(1000),
-						FSGroup:      int64Pointer(1000),
+						RunAsNonRoot: new(true),
+						RunAsUser:    new(int64(1000)),
+						RunAsGroup:   new(int64(1000)),
+						FSGroup:      new(int64(1000)),
 						SeccompProfile: &corev1.SeccompProfile{
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},
@@ -419,13 +418,13 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 								ReadOnly:  true,
 							}},
 						},
-						{Name: "publish", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: resourceQuantityPointer("4Gi")}}},
-						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: resourceQuantityPointer("1Gi")}}},
+						{Name: "publish", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resourceQuantity("4Gi"))}}},
+						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: new(resourceQuantity("1Gi"))}}},
 						{
 							Name: "git-auth",
 							VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 								SecretName:  sessionmanifest.GitHubTokenSecretName,
-								DefaultMode: int32Pointer(0o440),
+								DefaultMode: new(int32(0o440)),
 							}},
 						},
 					},
@@ -451,8 +450,8 @@ func publisherContainer(request PublisherJobRequest) corev1.Container {
 			{Name: "PUBLISH_AUTHOR_EMAIL", Value: request.AuthorEmail},
 		},
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: boolPointer(false),
-			ReadOnlyRootFilesystem:   boolPointer(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(true),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 		Resources: corev1.ResourceRequirements{
@@ -522,7 +521,7 @@ func jobFailed(job *batchv1.Job) bool {
 
 func parsePublisherJobResult(message string) PublisherJobResult {
 	var result PublisherJobResult
-	for _, line := range strings.Split(message, "\n") {
+	for line := range strings.SplitSeq(message, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
@@ -549,24 +548,6 @@ func parsePublisherJobResult(message string) PublisherJobResult {
 	return result
 }
 
-func boolPointer(value bool) *bool {
-	return &value
-}
-
-func int32Pointer(value int32) *int32 {
-	return &value
-}
-
-func int64Pointer(value int64) *int64 {
-	return &value
-}
-
 func resourceQuantity(value string) resource.Quantity {
 	return resource.MustParse(value)
-}
-
-func resourceQuantityPointer(value string) *resource.Quantity {
-	quantity := resourceQuantity(value)
-
-	return &quantity
 }

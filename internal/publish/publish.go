@@ -154,18 +154,9 @@ func publishSession(ctx context.Context, cluster publishCluster, request Request
 		remoteCommit = publisherResult.CommitSHA
 	}
 
-	pull, err := client.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, publisherResult.Title, publisherResult.Body, request.Draft)
+	pull, err := createOrRecoverPullRequest(ctx, client, repository, request, publisherResult)
 	if err != nil {
-		existingPull, findErr := client.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
-		if findErr != nil {
-			return Result{}, errors.Join(err, findErr)
-		}
-
-		if existingPull == nil {
-			return Result{}, err
-		}
-
-		pull = *existingPull
+		return Result{}, err
 	}
 
 	if err := cluster.DeletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
@@ -229,6 +220,24 @@ func publishBranch(ctx context.Context, cluster publishCluster, client githubCli
 	}
 
 	return result, nil
+}
+
+func createOrRecoverPullRequest(ctx context.Context, client githubClient, repository github.Repository, request Request, result kubernetes.PublisherJobResult) (github.PullRequest, error) {
+	pull, err := client.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, result.Title, result.Body, request.Draft)
+	if err == nil {
+		return pull, nil
+	}
+
+	existingPull, findErr := client.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
+	if findErr != nil {
+		return github.PullRequest{}, errors.Join(err, findErr)
+	}
+
+	if existingPull == nil {
+		return github.PullRequest{}, err
+	}
+
+	return *existingPull, nil
 }
 
 func publishIntentID(request Request, repository string) (string, error) {

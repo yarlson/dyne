@@ -6,6 +6,7 @@ linters:
     - bodyclose
     - goprintffuncname
     - misspell
+    - modernize
     - nlreturn
     - noctx
     - nolintlint
