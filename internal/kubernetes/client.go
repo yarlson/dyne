@@ -56,8 +56,6 @@ type SessionDefinition struct {
 	Skills []sessionmanifest.AgentSkill
 	// CloneDepth is the Git history depth used for the initial clone.
 	CloneDepth int
-	// StorageSize is the size of the retained session claim.
-	StorageSize string
 }
 
 // New returns a client configured from the standard kubeconfig loading rules.
@@ -190,7 +188,7 @@ func (c *Client) PersistentSessionDefinition(ctx context.Context, namespace, nam
 	}
 
 	publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
-	if err == nil && !jobComplete(publisher) && !jobFailed(publisher) {
+	if err == nil && !jobConditionTrue(publisher, batchv1.JobComplete) && !jobConditionTrue(publisher, batchv1.JobFailed) {
 		return SessionDefinition{}, fmt.Errorf("session %s has an active publisher", name)
 	}
 
@@ -240,7 +238,6 @@ func (c *Client) PersistentSessionDefinition(ctx context.Context, namespace, nam
 		AgentName:    agentName,
 		Skills:       skills,
 		CloneDepth:   cloneDepth,
-		StorageSize:  claim.Spec.Resources.Requests.Storage().String(),
 	}, nil
 }
 

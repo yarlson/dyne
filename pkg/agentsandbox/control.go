@@ -55,7 +55,6 @@ func (c *Control) Continue(ctx context.Context, request ContinueRequest) error {
 		AgentName:      definition.AgentName,
 		Skills:         definition.Skills,
 		CloneDepth:     definition.CloneDepth,
-		StorageSize:    definition.StorageSize,
 		TimeoutSeconds: int64(request.Timeout.Seconds()),
 		Resume:         true,
 	})
@@ -310,7 +309,7 @@ func (request PublishRequest) Validate() error {
 }
 
 func (request StartRequest) manifest() ([]byte, error) {
-	manifest, err := sessionmanifest.Render(sessionmanifest.Spec{
+	return sessionmanifest.Render(sessionmanifest.Spec{
 		Name:           request.Target.Name,
 		Namespace:      request.Target.Namespace,
 		Image:          request.Image,
@@ -326,8 +325,6 @@ func (request StartRequest) manifest() ([]byte, error) {
 		StorageSize:    request.StorageSize,
 		TimeoutSeconds: int64(request.Timeout.Seconds()),
 	})
-
-	return manifest, err
 }
 
 func manifestSkills(skills []AgentSkill) []sessionmanifest.AgentSkill {

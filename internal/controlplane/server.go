@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/yarlson/airlock/internal/agentconfig"
@@ -297,7 +296,7 @@ func randomTaskID() (string, error) {
 		return "", err
 	}
 
-	return strings.ToLower(hex.EncodeToString(contents)), nil
+	return hex.EncodeToString(contents), nil
 }
 
 func sandboxSkills(skills []agentconfig.Skill) []agentsandbox.AgentSkill {

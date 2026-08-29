@@ -114,7 +114,6 @@ func TestPersistentSessionDefinitionSurvivesWorkloadDeletion(t *testing.T) {
 		InitialRef:   "main",
 		SetupCommand: "make tools",
 		CloneDepth:   1,
-		StorageSize:  "10Gi",
 	}, definition)
 }
 

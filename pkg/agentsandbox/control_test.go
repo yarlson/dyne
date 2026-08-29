@@ -111,7 +111,6 @@ func TestContinueCreatesResumableJobAgainstPersistentSession(t *testing.T) {
 				Repository:   "https://github.com/lokalise/kargo.git",
 				InitialRef:   "main",
 				CloneDepth:   1,
-				StorageSize:  "10Gi",
 				SetupCommand: "make tools",
 				Skills: []sessionmanifest.AgentSkill{{
 					Name: "code-review", Contents: "retained skill",

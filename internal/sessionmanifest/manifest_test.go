@@ -119,6 +119,7 @@ func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 func TestRenderContinuationReusesPersistentStorage(t *testing.T) {
 	spec := validSpec()
 	spec.TaskName = "example-continue-abc123"
+	spec.StorageSize = ""
 	spec.Resume = true
 	manifest, err := RenderContinuation(spec)
 	require.NoError(t, err)

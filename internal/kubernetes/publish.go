@@ -193,7 +193,7 @@ func (c *Client) RunPublisherJob(ctx context.Context, request PublisherJobReques
 		return PublisherJobResult{}, err
 	}
 
-	if jobFailed(job) {
+	if jobConditionTrue(job, batchv1.JobFailed) {
 		if err := c.deletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
 			return PublisherJobResult{}, err
 		}
@@ -261,11 +261,11 @@ func (c *Client) waitForPublisherJob(ctx context.Context, namespace, session, in
 			return false, errors.New("publisher Job intent changed while waiting")
 		}
 
-		if jobFailed(job) {
+		if jobConditionTrue(job, batchv1.JobFailed) {
 			return false, c.publisherJobFailure(ctx, namespace, job.Name)
 		}
 
-		if !jobComplete(job) {
+		if !jobConditionTrue(job, batchv1.JobComplete) {
 			return false, nil
 		}
 
@@ -499,19 +499,9 @@ func publisherJobName(session string) string {
 	return session + "-publish"
 }
 
-func jobComplete(job *batchv1.Job) bool {
+func jobConditionTrue(job *batchv1.Job, conditionType batchv1.JobConditionType) bool {
 	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-
-	return false
-}
-
-func jobFailed(job *batchv1.Job) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+		if condition.Type == conditionType && condition.Status == corev1.ConditionTrue {
 			return true
 		}
 	}

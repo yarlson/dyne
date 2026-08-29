@@ -105,7 +105,7 @@ func (s Spec) validate(initial bool) error {
 		return errors.New("ref is required")
 	}
 
-	if s.StorageSize == "" {
+	if initial && s.StorageSize == "" {
 		return errors.New("storage size is required")
 	}
 
