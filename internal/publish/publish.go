@@ -47,8 +47,32 @@ type Result struct {
 	CommitSHA string
 }
 
+type publishCluster interface {
+	SessionPublishSource(context.Context, string, string) (kubernetes.PublishSource, error)
+	GitHubToken(context.Context, string) (string, error)
+	PublisherJobIntent(context.Context, string, string) (string, bool, error)
+	RunPublisherJob(context.Context, kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error)
+	WaitForPublisherJob(context.Context, string, string, string, time.Duration) (kubernetes.PublisherJobResult, error)
+	DeletePublisherJob(context.Context, string, string) error
+}
+
+type githubClient interface {
+	CommitAuthor(context.Context) (string, string, error)
+	BranchCommitSHA(context.Context, github.Repository, string) (string, bool, error)
+	WaitForBranchCommit(context.Context, github.Repository, string, string, time.Duration) error
+	FindOpenPullRequest(context.Context, github.Repository, string, string) (*github.PullRequest, error)
+	WaitForOpenPullRequest(context.Context, github.Repository, string, string, time.Duration) (*github.PullRequest, error)
+	CreatePullRequest(context.Context, github.Repository, string, string, string, string, bool) (github.PullRequest, error)
+}
+
 // Session publishes an eligible session workspace and opens or recovers its pull request.
 func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (Result, error) {
+	return publishSession(ctx, cluster, request, func(token string) (githubClient, error) {
+		return github.New(token)
+	})
+}
+
+func publishSession(ctx context.Context, cluster publishCluster, request Request, newGitHubClient func(string) (githubClient, error)) (Result, error) {
 	if err := request.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -72,7 +96,7 @@ func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (
 		return Result{}, err
 	}
 
-	githubClient, err := github.New(token)
+	client, err := newGitHubClient(token)
 	if err != nil {
 		return Result{}, err
 	}
@@ -91,7 +115,7 @@ func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (
 		return Result{}, errors.New("publisher Job belongs to a different publish request")
 	}
 
-	existingPull, err := githubClient.FindOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch)
+	existingPull, err := client.FindOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch)
 	if err != nil {
 		return Result{}, err
 	}
@@ -106,7 +130,7 @@ func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (
 		return pullRequestResult(*existingPull, request.Branch, ""), nil
 	}
 
-	remoteCommit, branchExists, err := githubClient.BranchCommitSHA(ctx, repository, request.Branch)
+	remoteCommit, branchExists, err := client.BranchCommitSHA(ctx, repository, request.Branch)
 	if err != nil {
 		return Result{}, err
 	}
@@ -125,15 +149,15 @@ func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (
 			return Result{}, fmt.Errorf("publisher result %s at %s does not match remote branch %s at %s", result.Branch, result.CommitSHA, request.Branch, remoteCommit)
 		}
 	} else {
-		remoteCommit, err = publishBranch(ctx, cluster, githubClient, repository, source, request, intentID)
+		remoteCommit, err = publishBranch(ctx, cluster, client, repository, source, request, intentID)
 		if err != nil {
 			return Result{}, err
 		}
 	}
 
-	pull, err := githubClient.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, request.Title, request.Body, request.Draft)
+	pull, err := client.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, request.Title, request.Body, request.Draft)
 	if err != nil {
-		existingPull, findErr := githubClient.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
+		existingPull, findErr := client.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
 		if findErr != nil {
 			return Result{}, errors.Join(err, findErr)
 		}
@@ -152,7 +176,7 @@ func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (
 	return pullRequestResult(pull, request.Branch, remoteCommit), nil
 }
 
-func removePublisherJobAfterCompletion(ctx context.Context, cluster *kubernetes.Client, request Request, intentID, pullRequestURL string) error {
+func removePublisherJobAfterCompletion(ctx context.Context, cluster publishCluster, request Request, intentID, pullRequestURL string) error {
 	if _, err := cluster.WaitForPublisherJob(ctx, request.Namespace, request.Session, intentID, request.Timeout); err != nil {
 		return fmt.Errorf("pull request already exists at %s; wait for publisher Job: %w", pullRequestURL, err)
 	}
@@ -164,8 +188,8 @@ func removePublisherJobAfterCompletion(ctx context.Context, cluster *kubernetes.
 	return nil
 }
 
-func publishBranch(ctx context.Context, cluster *kubernetes.Client, githubClient *github.Client, repository github.Repository, source kubernetes.PublishSource, request Request, intentID string) (string, error) {
-	authorName, authorEmail, err := githubClient.CommitAuthor(ctx)
+func publishBranch(ctx context.Context, cluster publishCluster, client githubClient, repository github.Repository, source kubernetes.PublishSource, request Request, intentID string) (string, error) {
+	authorName, authorEmail, err := client.CommitAuthor(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -185,7 +209,7 @@ func publishBranch(ctx context.Context, cluster *kubernetes.Client, githubClient
 		Timeout:        request.Timeout,
 	})
 	if err != nil {
-		_, branchExists, branchErr := githubClient.BranchCommitSHA(ctx, repository, request.Branch)
+		_, branchExists, branchErr := client.BranchCommitSHA(ctx, repository, request.Branch)
 		if branchErr != nil {
 			return "", errors.Join(err, branchErr)
 		}
@@ -201,7 +225,7 @@ func publishBranch(ctx context.Context, cluster *kubernetes.Client, githubClient
 		return "", fmt.Errorf("publisher reported branch %s, want %s", result.Branch, request.Branch)
 	}
 
-	if err := githubClient.WaitForBranchCommit(ctx, repository, request.Branch, result.CommitSHA, 30*time.Second); err != nil {
+	if err := client.WaitForBranchCommit(ctx, repository, request.Branch, result.CommitSHA, 30*time.Second); err != nil {
 		return "", err
 	}
 

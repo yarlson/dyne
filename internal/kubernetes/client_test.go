@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -103,5 +104,69 @@ func TestCheckSessionModeAvailableRejectsConflictingWorkloadKind(t *testing.T) {
 				t.Fatalf("got error %v, want message containing %q", err, test.message)
 			}
 		})
+	}
+}
+
+func TestDeleteSessionRemovesComputeAndRetainsPersistentState(t *testing.T) {
+	claimNames := []string{"workspace-example", "home-example", "codex-example"}
+	client, clientset := sessionClientWithPersistentState(claimNames)
+	if err := client.DeleteSession(context.Background(), "coding-agents", "example"); err != nil {
+		t.Fatal(err)
+	}
+
+	assertSessionComputeRemoved(t, clientset)
+
+	for _, name := range claimNames {
+		if _, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("persistent state %s was not retained: %v", name, err)
+		}
+	}
+}
+
+func TestDestroySessionRemovesComputeAndPersistentState(t *testing.T) {
+	claimNames := []string{"workspace-example", "home-example", "codex-example"}
+	client, clientset := sessionClientWithPersistentState(claimNames)
+	if err := client.DestroySession(context.Background(), "coding-agents", "example"); err != nil {
+		t.Fatal(err)
+	}
+
+	assertSessionComputeRemoved(t, clientset)
+
+	for _, name := range claimNames {
+		if _, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("got PersistentVolumeClaim %s lookup error %v, want deleted claim", name, err)
+		}
+	}
+}
+
+func sessionClientWithPersistentState(claimNames []string) (*Client, *fake.Clientset) {
+	objects := []runtime.Object{
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "coding-agents"}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "coding-agents"}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "coding-agents"}},
+	}
+	for _, name := range claimNames {
+		objects = append(objects, &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "coding-agents"},
+		})
+	}
+
+	clientset := fake.NewClientset(objects...)
+
+	return &Client{typed: clientset, stdout: io.Discard}, clientset
+}
+
+func assertSessionComputeRemoved(t *testing.T, clientset *fake.Clientset) {
+	t.Helper()
+	if _, err := clientset.BatchV1().Jobs("coding-agents").Get(context.Background(), "example", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("got Job lookup error %v, want deleted Job", err)
+	}
+
+	if _, err := clientset.AppsV1().StatefulSets("coding-agents").Get(context.Background(), "example", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("got StatefulSet lookup error %v, want deleted StatefulSet", err)
+	}
+
+	if _, err := clientset.CoreV1().Services("coding-agents").Get(context.Background(), "example", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("got Service lookup error %v, want deleted Service", err)
 	}
 }

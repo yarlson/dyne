@@ -12,9 +12,26 @@ import (
 
 const sessionReadyTimeout = 2 * time.Minute
 
+type sessionCluster interface {
+	Apply(context.Context, []byte) error
+	CheckSessionModeAvailable(context.Context, string, string, sessionmanifest.Mode) error
+	SessionStatus(context.Context, string, string) ([]kubernetes.ResourceStatus, error)
+	StreamPodLogs(context.Context, string, string, string, bool) error
+	ExecPod(context.Context, string, string, string, []string, bool) error
+	StopSession(context.Context, string, string) error
+	ResumeSession(context.Context, string, string) error
+	DeleteSession(context.Context, string, string) error
+	DestroySession(context.Context, string, string) error
+	WaitForReadyPod(context.Context, string, string, time.Duration) (string, error)
+	NewestPodName(context.Context, string, string) (string, error)
+}
+
+type sessionPublisher func(context.Context, publish.Request) (publish.Result, error)
+
 // Control performs complete coding-session operations.
 type Control struct {
-	cluster *kubernetes.Client
+	cluster        sessionCluster
+	publishSession sessionPublisher
 }
 
 // New returns coding-session control for one Kubernetes context.
@@ -28,7 +45,12 @@ func New(contextName string, streams Streams) (*Control, error) {
 		return nil, err
 	}
 
-	return &Control{cluster: cluster}, nil
+	return &Control{
+		cluster: cluster,
+		publishSession: func(ctx context.Context, request publish.Request) (publish.Result, error) {
+			return publish.Session(ctx, cluster, request)
+		},
+	}, nil
 }
 
 // Bootstrap prepares a namespace and its requested credentials for coding sessions.
@@ -170,7 +192,7 @@ func (c *Control) Publish(ctx context.Context, request PublishRequest) (PublishR
 		return PublishResult{}, err
 	}
 
-	result, err := publish.Session(ctx, c.cluster, request.publishRequest())
+	result, err := c.publishSession(ctx, request.publishRequest())
 	if err != nil {
 		return PublishResult{}, err
 	}
