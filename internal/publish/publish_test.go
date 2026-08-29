@@ -9,13 +9,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"coding-agent-k8s/internal/github"
-	"coding-agent-k8s/internal/kubernetes"
+	"github.com/yarlson/airlock/internal/github"
+	"github.com/yarlson/airlock/internal/kubernetes"
 )
 
 func TestPublishSessionRecoversExistingPullRequestAndCleansPublisher(t *testing.T) {
 	request := validPublishRequest()
-	wantIntentID := "fcb5bce47798f08a35e945dd9d21559f587cd4711b85263d1c86711b521d2ffb"
+	wantIntentID := "34205b65a7344f406dd8d5802ceb811d7216f535751324a35dadac24bd776d92"
 	var operations []string
 	cluster := publishClusterForRequest(t)
 	cluster.intent = func(context.Context, string, string) (string, bool, error) {
@@ -28,7 +28,7 @@ func TestPublishSessionRecoversExistingPullRequestAndCleansPublisher(t *testing.
 		assert.Equal(t, wantIntentID, intentID)
 		assert.Equal(t, time.Minute, timeout)
 
-		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: "9a4484441215661904e02a807adf5034d13f5bbe"}, nil
+		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: "9a4484441215661904e02a807adf5034d13f5bbe", Title: "Review changes", Body: "Ready for review"}, nil
 	}
 	cluster.deletePublisher = func(_ context.Context, namespace, session string) error {
 		operations = append(operations, "delete publisher")
@@ -150,7 +150,7 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		assert.Equal(t, time.Minute, job.Timeout)
 		assert.NotEmpty(t, job.IntentID)
 
-		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: commitSHA}, nil
+		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: commitSHA, Title: "Review changes", Body: "Ready for review"}, nil
 	}
 	cluster.deletePublisher = func(_ context.Context, namespace, session string) error {
 		operations = append(operations, "delete publisher")
@@ -296,8 +296,6 @@ func validPublishRequest() Request {
 		Session:       "review",
 		Branch:        "yar/review",
 		CommitMessage: "Review changes",
-		Title:         "Review changes",
-		Body:          "Ready for review",
 		Draft:         true,
 		Timeout:       time.Minute,
 	}

@@ -1,7 +1,6 @@
 package sessionmanifest
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,16 +18,14 @@ const (
 	codexAuthSecretName   = "coding-agent-auth"
 )
 
-// Mode controls the workload lifecycle and storage used by a session.
-type Mode string
+// Storage controls whether a session retains state after its task Pod is removed.
+type Storage string
 
 const (
-	// ModeExplore runs a bounded task with an ephemeral, read-only workspace.
-	ModeExplore Mode = "explore"
-	// ModeUpdate runs a bounded task and retains its workspace on persistent storage.
-	ModeUpdate Mode = "update"
-	// ModeLong runs a resumable interactive session on persistent storage.
-	ModeLong Mode = "long"
+	// StorageEphemeral uses Pod-owned temporary storage for one disposable task.
+	StorageEphemeral Storage = "ephemeral"
+	// StoragePersistent retains workspace, tool, and agent state on one claim.
+	StoragePersistent Storage = "persistent"
 )
 
 // Spec defines one coding-session workload.
@@ -39,8 +36,12 @@ type Spec struct {
 	Namespace string
 	// Image is the container image that runs setup and agent commands.
 	Image string
-	// Mode selects the session lifecycle and storage behavior.
-	Mode Mode
+	// Storage selects whether session state is temporary or persistent.
+	Storage Storage
+	// TaskName identifies the Job; an empty value uses the session name.
+	TaskName string
+	// Resume continues the retained agent thread for a persistent session.
+	Resume bool
 	// Repository is the Git repository cloned into the workspace; an empty value initializes a new repository.
 	Repository string
 	// InitialRef is the Git branch or tag cloned for the session.
@@ -76,6 +77,10 @@ func (s Spec) validate() error {
 		return errors.New("namespace must be a lowercase DNS label no longer than 63 characters")
 	}
 
+	if s.TaskName != "" && (!dnsLabelPattern.MatchString(s.TaskName) || len(s.TaskName) > 63) {
+		return errors.New("task name must be a lowercase DNS label no longer than 63 characters")
+	}
+
 	if strings.TrimSpace(s.Image) == "" {
 		return errors.New("image is required")
 	}
@@ -96,66 +101,50 @@ func (s Spec) validate() error {
 		return errors.New("timeout must be greater than zero")
 	}
 
-	switch s.Mode {
-	case ModeExplore, ModeUpdate:
-		if strings.TrimSpace(s.Prompt) == "" {
-			return fmt.Errorf("prompt is required for %s sessions", s.Mode)
-		}
-	case ModeLong:
-		if s.Prompt != "" {
-			return errors.New("long sessions accept tasks through the task command")
-		}
+	if strings.TrimSpace(s.Prompt) == "" {
+		return errors.New("prompt is required")
+	}
+
+	switch s.Storage {
+	case StorageEphemeral, StoragePersistent:
 	default:
-		return fmt.Errorf("unsupported mode %q", s.Mode)
+		return fmt.Errorf("unsupported storage %q", s.Storage)
 	}
 
 	return nil
 }
 
-// RenderBootstrap returns the shared namespace, network policy, and requested credentials as a Kubernetes manifest.
-func RenderBootstrap(namespace string, authJSON []byte, apiKey, githubToken string) ([]byte, error) {
-	if !dnsLabelPattern.MatchString(namespace) || len(namespace) > 63 {
-		return nil, errors.New("namespace must be a lowercase DNS label no longer than 63 characters")
-	}
-
-	if authJSON != nil && apiKey != "" {
-		return nil, errors.New("use either Codex auth JSON or an API key")
-	}
-
-	items := []resource{namespaceResource(namespace), denyIngressPolicy(namespace)}
-	secret := codexAuthSecret(namespace, authJSON, apiKey)
-	if secret != nil {
-		items = append(items, secret)
-	}
-
-	gitSecret := githubTokenSecret(namespace, githubToken)
-	if gitSecret != nil {
-		items = append(items, gitSecret)
-	}
-
-	return encodeResourceList(items)
-}
-
 // Render validates a session and returns the Kubernetes resources that run it.
 func Render(s Spec) ([]byte, error) {
+	return render(s, true)
+}
+
+// RenderContinuation returns a Job that reuses an existing persistent session claim.
+func RenderContinuation(s Spec) ([]byte, error) {
+	if s.Storage != StoragePersistent {
+		return nil, errors.New("continuation requires persistent storage")
+	}
+
+	if s.TaskName == "" {
+		return nil, errors.New("continuation task name is required")
+	}
+
+	return render(s, false)
+}
+
+func render(s Spec, createClaim bool) ([]byte, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
 
-	items := []resource{namespaceResource(s.Namespace), denyIngressPolicy(s.Namespace)}
-	if s.Mode != ModeExplore {
+	items := []resource{denyIngressPolicy(s.Namespace)}
+	if createClaim && s.Storage == StoragePersistent {
 		items = append(items,
-			persistentVolumeClaim(s.Namespace, WorkspaceClaimName(s.Name), s.Name, s.StorageSize),
-			persistentVolumeClaim(s.Namespace, HomeClaimName(s.Name), s.Name, s.StorageSize),
-			persistentVolumeClaim(s.Namespace, CodexClaimName(s.Name), s.Name, "1Gi"),
+			persistentVolumeClaim(s),
 		)
 	}
 
-	if s.Mode == ModeLong {
-		items = append(items, headlessService(s), sessionStatefulSet(s))
-	} else {
-		items = append(items, sessionJob(s))
-	}
+	items = append(items, sessionJob(s))
 
 	return encodeResourceList(items)
 }
@@ -164,34 +153,9 @@ func encodeResourceList(items []resource) ([]byte, error) {
 	return json.MarshalIndent(resourceList{APIVersion: "v1", Kind: "List", Items: items}, "", "  ")
 }
 
-// WorkspaceClaimName returns the persistent workspace claim owned by a session.
-func WorkspaceClaimName(name string) string {
-	return "workspace-" + name
-}
-
-// HomeClaimName returns the persistent tool-home claim owned by a session.
-func HomeClaimName(name string) string {
-	return "home-" + name
-}
-
-// CodexClaimName returns the persistent Codex-state claim owned by a session.
-func CodexClaimName(name string) string {
-	return "codex-" + name
-}
-
-func namespaceResource(namespace string) resource {
-	return resource{
-		"apiVersion": "v1",
-		"kind":       "Namespace",
-		"metadata": map[string]any{
-			"name": namespace,
-			"labels": map[string]any{
-				"pod-security.kubernetes.io/enforce": "restricted",
-				"pod-security.kubernetes.io/audit":   "restricted",
-				"pod-security.kubernetes.io/warn":    "restricted",
-			},
-		},
-	}
+// SessionClaimName returns the persistent claim that owns all retained session state.
+func SessionClaimName(name string) string {
+	return "session-" + name
 }
 
 func denyIngressPolicy(namespace string) resource {
@@ -209,134 +173,60 @@ func denyIngressPolicy(namespace string) resource {
 	}
 }
 
-func codexAuthSecret(namespace string, authJSON []byte, apiKey string) resource {
-	data := map[string]any{}
-	if authJSON != nil {
-		data["auth.json"] = base64.StdEncoding.EncodeToString(authJSON)
-	}
-
-	if apiKey != "" {
-		data["CODEX_API_KEY"] = base64.StdEncoding.EncodeToString([]byte(apiKey))
-	}
-
-	if len(data) == 0 {
-		return nil
-	}
-
-	return resource{
-		"apiVersion": "v1",
-		"kind":       "Secret",
-		"metadata": map[string]any{
-			"name":      codexAuthSecretName,
-			"namespace": namespace,
-		},
-		"type": "Opaque",
-		"data": data,
-	}
-}
-
-func githubTokenSecret(namespace, token string) resource {
-	if token == "" {
-		return nil
-	}
-
-	return resource{
-		"apiVersion": "v1",
-		"kind":       "Secret",
-		"metadata": map[string]any{
-			"name":      GitHubTokenSecretName,
-			"namespace": namespace,
-		},
-		"type": "Opaque",
-		"data": map[string]any{
-			"token": base64.StdEncoding.EncodeToString([]byte(token)),
-		},
-	}
-}
-
-func persistentVolumeClaim(namespace, name, session, size string) resource {
+func persistentVolumeClaim(s Spec) resource {
 	return resource{
 		"apiVersion": "v1",
 		"kind":       "PersistentVolumeClaim",
 		"metadata": map[string]any{
-			"name":      name,
-			"namespace": namespace,
-			"labels":    sessionLabels(session),
+			"name":      SessionClaimName(s.Name),
+			"namespace": s.Namespace,
+			"labels":    sessionLabels(s.Name),
+			"annotations": map[string]any{
+				"airlock.yarlson.dev/image":       s.Image,
+				"airlock.yarlson.dev/repository":  s.Repository,
+				"airlock.yarlson.dev/initial-ref": s.InitialRef,
+				"airlock.yarlson.dev/setup":       s.SetupCommand,
+				"airlock.yarlson.dev/clone-depth": fmt.Sprintf("%d", s.CloneDepth),
+			},
 		},
 		"spec": map[string]any{
 			"accessModes": []any{"ReadWriteOnce"},
 			"resources": map[string]any{
-				"requests": map[string]any{"storage": size},
+				"requests": map[string]any{"storage": s.StorageSize},
 			},
-		},
-	}
-}
-
-func headlessService(s Spec) resource {
-	return resource{
-		"apiVersion": "v1",
-		"kind":       "Service",
-		"metadata": map[string]any{
-			"name":      s.Name,
-			"namespace": s.Namespace,
-			"labels":    sessionLabels(s.Name),
-		},
-		"spec": map[string]any{
-			"clusterIP": "None",
-			"selector":  sessionLabels(s.Name),
 		},
 	}
 }
 
 func sessionJob(s Spec) resource {
+	name := taskName(s)
+	labels := sessionLabels(s.Name)
+	labels["coding-agent/task"] = name
+
 	return resource{
 		"apiVersion": "batch/v1",
 		"kind":       "Job",
 		"metadata": map[string]any{
-			"name":      s.Name,
+			"name":      name,
 			"namespace": s.Namespace,
-			"labels":    sessionLabels(s.Name),
+			"labels":    labels,
 		},
 		"spec": map[string]any{
-			"backoffLimit":          0,
+			"backoffLimit":          1,
 			"activeDeadlineSeconds": s.TimeoutSeconds,
-			"template":              sessionPodTemplate(s, false),
+			"template":              sessionPodTemplate(s),
 		},
 	}
 }
 
-func sessionStatefulSet(s Spec) resource {
-	return resource{
-		"apiVersion": "apps/v1",
-		"kind":       "StatefulSet",
-		"metadata": map[string]any{
-			"name":      s.Name,
-			"namespace": s.Namespace,
-			"labels":    sessionLabels(s.Name),
-		},
-		"spec": map[string]any{
-			"serviceName": s.Name,
-			"replicas":    1,
-			"selector": map[string]any{
-				"matchLabels": sessionLabels(s.Name),
-			},
-			"template": sessionPodTemplate(s, true),
-		},
-	}
-}
-
-func sessionPodTemplate(s Spec, long bool) map[string]any {
-	workspaceReadOnly := s.Mode == ModeExplore
-	mainArgs := []any{"run"}
-	if long {
-		mainArgs = []any{"idle"}
-	}
+func sessionPodTemplate(s Spec) map[string]any {
+	workspaceReadOnly := s.Storage == StorageEphemeral
 
 	return map[string]any{
-		"metadata": map[string]any{"labels": sessionLabels(s.Name)},
+		"metadata": map[string]any{"labels": taskLabels(s)},
 		"spec": map[string]any{
 			"automountServiceAccountToken":  false,
-			"restartPolicy":                 restartPolicy(long),
+			"restartPolicy":                 "Never",
 			"terminationGracePeriodSeconds": 30,
 			"securityContext": map[string]any{
 				"runAsNonRoot": true,
@@ -348,22 +238,15 @@ func sessionPodTemplate(s Spec, long bool) map[string]any {
 				},
 			},
 			"initContainers": []any{
+				sessionDirectoryContainer(s),
 				sessionContainer(s, "repo-init", []any{"clone"}, false, mountAccess{workspace: true, gitAuth: true}),
 				sessionContainer(s, "workspace-init", []any{"init"}, false, mountAccess{workspace: true, home: true, tmp: true}),
 				sessionContainer(s, "auth-init", []any{"auth"}, false, mountAccess{codex: true}),
 			},
-			"containers": []any{sessionContainer(s, "agent", mainArgs, workspaceReadOnly, mountAccess{workspace: true, home: true, tmp: true, codex: true})},
+			"containers": []any{sessionContainer(s, "agent", []any{"run"}, workspaceReadOnly, mountAccess{workspace: true, home: true, tmp: true, codex: true, artifacts: true, logs: true})},
 			"volumes":    sessionVolumes(s),
 		},
 	}
-}
-
-func restartPolicy(long bool) string {
-	if long {
-		return "Always"
-	}
-
-	return "Never"
 }
 
 type mountAccess struct {
@@ -371,17 +254,19 @@ type mountAccess struct {
 	home      bool
 	tmp       bool
 	codex     bool
+	artifacts bool
+	logs      bool
 	gitAuth   bool
 }
 
 func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, access mountAccess) map[string]any {
 	volumeMounts := make([]any, 0, 5)
 	if access.workspace {
-		volumeMounts = append(volumeMounts, map[string]any{"name": "workspace", "mountPath": "/workspace", "readOnly": workspaceReadOnly})
+		volumeMounts = append(volumeMounts, map[string]any{"name": "session", "mountPath": "/workspace", "subPath": "workspace", "readOnly": workspaceReadOnly})
 	}
 
 	if access.home {
-		volumeMounts = append(volumeMounts, map[string]any{"name": "home", "mountPath": "/home/agent"})
+		volumeMounts = append(volumeMounts, map[string]any{"name": "session", "mountPath": "/home/agent", "subPath": "home"})
 	}
 
 	if access.tmp {
@@ -390,9 +275,17 @@ func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, a
 
 	if access.codex {
 		volumeMounts = append(volumeMounts,
-			map[string]any{"name": "codex", "mountPath": "/codex"},
+			map[string]any{"name": "session", "mountPath": "/codex", "subPath": "agent"},
 			map[string]any{"name": "auth", "mountPath": "/var/run/agent-auth", "readOnly": true},
 		)
+	}
+
+	if access.artifacts {
+		volumeMounts = append(volumeMounts, map[string]any{"name": "session", "mountPath": "/artifacts", "subPath": "artifacts"})
+	}
+
+	if access.logs {
+		volumeMounts = append(volumeMounts, map[string]any{"name": "session", "mountPath": "/logs", "subPath": "logs"})
 	}
 
 	if access.gitAuth {
@@ -406,11 +299,13 @@ func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, a
 		"args":            args,
 		"workingDir":      "/workspace",
 		"env": []any{
-			map[string]any{"name": "AGENT_MODE", "value": string(s.Mode)},
+			map[string]any{"name": "AGENT_STORAGE", "value": string(s.Storage)},
 			map[string]any{"name": "AGENT_REPOSITORY", "value": s.Repository},
 			map[string]any{"name": "AGENT_REF", "value": s.InitialRef},
 			map[string]any{"name": "AGENT_SETUP", "value": s.SetupCommand},
 			map[string]any{"name": "AGENT_TASK", "value": s.Prompt},
+			map[string]any{"name": "AGENT_TASK_ID", "value": taskName(s)},
+			map[string]any{"name": "AGENT_RESUME", "value": fmt.Sprintf("%t", s.Resume)},
 			map[string]any{"name": "AGENT_CLONE_DEPTH", "value": fmt.Sprintf("%d", s.CloneDepth)},
 			map[string]any{"name": "HOME", "value": "/home/agent"},
 			map[string]any{"name": "CODEX_HOME", "value": "/codex"},
@@ -441,24 +336,40 @@ func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, a
 	}
 }
 
+func taskLabels(s Spec) map[string]any {
+	labels := sessionLabels(s.Name)
+	labels["coding-agent/task"] = taskName(s)
+
+	return labels
+}
+
+func taskName(s Spec) string {
+	if s.TaskName != "" {
+		return s.TaskName
+	}
+
+	return s.Name
+}
+
+func sessionDirectoryContainer(s Spec) map[string]any {
+	container := sessionContainer(s, "session-init", nil, false, mountAccess{})
+	container["command"] = []any{"mkdir"}
+	container["args"] = []any{"-p", "/session/workspace", "/session/home", "/session/agent", "/session/logs", "/session/artifacts", "/session/state"}
+	container["volumeMounts"] = []any{map[string]any{"name": "session", "mountPath": "/session"}}
+
+	return container
+}
+
 func sessionVolumes(s Spec) []any {
-	workspace := map[string]any{"name": "workspace"}
-	home := map[string]any{"name": "home"}
-	codex := map[string]any{"name": "codex"}
-	if s.Mode == ModeExplore {
-		workspace["emptyDir"] = map[string]any{"sizeLimit": "4Gi"}
-		home["emptyDir"] = map[string]any{"sizeLimit": "2Gi"}
-		codex["emptyDir"] = map[string]any{"sizeLimit": "1Gi"}
+	session := map[string]any{"name": "session"}
+	if s.Storage == StorageEphemeral {
+		session["emptyDir"] = map[string]any{"sizeLimit": "7Gi"}
 	} else {
-		workspace["persistentVolumeClaim"] = map[string]any{"claimName": WorkspaceClaimName(s.Name)}
-		home["persistentVolumeClaim"] = map[string]any{"claimName": HomeClaimName(s.Name)}
-		codex["persistentVolumeClaim"] = map[string]any{"claimName": CodexClaimName(s.Name)}
+		session["persistentVolumeClaim"] = map[string]any{"claimName": SessionClaimName(s.Name)}
 	}
 
 	return []any{
-		workspace,
-		home,
-		codex,
+		session,
 		map[string]any{"name": "tmp", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": "1Gi"}},
 		map[string]any{
 			"name": "auth",
@@ -482,7 +393,7 @@ func sessionVolumes(s Spec) []any {
 func sessionLabels(session string) map[string]any {
 	return map[string]any{
 		"app.kubernetes.io/name":       "coding-agent",
-		"app.kubernetes.io/managed-by": "agentctl",
+		"app.kubernetes.io/managed-by": "airlock",
 		"coding-agent/session":         session,
 	}
 }

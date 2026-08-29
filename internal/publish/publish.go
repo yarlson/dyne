@@ -9,15 +9,15 @@ import (
 	"strings"
 	"time"
 
-	"coding-agent-k8s/internal/github"
-	"coding-agent-k8s/internal/kubernetes"
+	"github.com/yarlson/airlock/internal/github"
+	"github.com/yarlson/airlock/internal/kubernetes"
 )
 
 // Request defines one idempotent workspace publish operation.
 type Request struct {
 	// Namespace owns the source session.
 	Namespace string
-	// Session identifies the completed or stopped source session.
+	// Session identifies the completed persistent source session.
 	Session string
 	// Branch is the new remote branch that will contain the changes.
 	Branch string
@@ -25,10 +25,6 @@ type Request struct {
 	BaseBranch string
 	// CommitMessage is the message used for the workspace commit.
 	CommitMessage string
-	// Title is the pull request title.
-	Title string
-	// Body is the pull request description.
-	Body string
 	// Draft controls whether GitHub creates a draft pull request.
 	Draft bool
 	// Timeout bounds the publisher Job and the wait for its result.
@@ -139,23 +135,26 @@ func publishSession(ctx context.Context, cluster publishCluster, request Request
 		return Result{}, fmt.Errorf("remote branch %s already exists and is not owned by this publish request", request.Branch)
 	}
 
+	var publisherResult kubernetes.PublisherJobResult
 	if branchExists {
-		result, err := cluster.WaitForPublisherJob(ctx, request.Namespace, request.Session, intentID, request.Timeout)
+		publisherResult, err = cluster.WaitForPublisherJob(ctx, request.Namespace, request.Session, intentID, request.Timeout)
 		if err != nil {
 			return Result{}, err
 		}
 
-		if result.Branch != request.Branch || result.CommitSHA != remoteCommit {
-			return Result{}, fmt.Errorf("publisher result %s at %s does not match remote branch %s at %s", result.Branch, result.CommitSHA, request.Branch, remoteCommit)
+		if publisherResult.Branch != request.Branch || publisherResult.CommitSHA != remoteCommit {
+			return Result{}, fmt.Errorf("publisher result %s at %s does not match remote branch %s at %s", publisherResult.Branch, publisherResult.CommitSHA, request.Branch, remoteCommit)
 		}
 	} else {
-		remoteCommit, err = publishBranch(ctx, cluster, client, repository, source, request, intentID)
+		publisherResult, err = publishBranch(ctx, cluster, client, repository, source, request, intentID)
 		if err != nil {
 			return Result{}, err
 		}
+
+		remoteCommit = publisherResult.CommitSHA
 	}
 
-	pull, err := client.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, request.Title, request.Body, request.Draft)
+	pull, err := client.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, publisherResult.Title, publisherResult.Body, request.Draft)
 	if err != nil {
 		existingPull, findErr := client.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
 		if findErr != nil {
@@ -188,10 +187,10 @@ func removePublisherJobAfterCompletion(ctx context.Context, cluster publishClust
 	return nil
 }
 
-func publishBranch(ctx context.Context, cluster publishCluster, client githubClient, repository github.Repository, source kubernetes.PublishSource, request Request, intentID string) (string, error) {
+func publishBranch(ctx context.Context, cluster publishCluster, client githubClient, repository github.Repository, source kubernetes.PublishSource, request Request, intentID string) (kubernetes.PublisherJobResult, error) {
 	authorName, authorEmail, err := client.CommitAuthor(ctx)
 	if err != nil {
-		return "", err
+		return kubernetes.PublisherJobResult{}, err
 	}
 
 	result, err := cluster.RunPublisherJob(ctx, kubernetes.PublisherJobRequest{
@@ -211,25 +210,25 @@ func publishBranch(ctx context.Context, cluster publishCluster, client githubCli
 	if err != nil {
 		_, branchExists, branchErr := client.BranchCommitSHA(ctx, repository, request.Branch)
 		if branchErr != nil {
-			return "", errors.Join(err, branchErr)
+			return kubernetes.PublisherJobResult{}, errors.Join(err, branchErr)
 		}
 
 		if branchExists {
-			return "", err
+			return kubernetes.PublisherJobResult{}, err
 		}
 
-		return "", errors.Join(err, cluster.DeletePublisherJob(ctx, request.Namespace, request.Session))
+		return kubernetes.PublisherJobResult{}, errors.Join(err, cluster.DeletePublisherJob(ctx, request.Namespace, request.Session))
 	}
 
 	if result.Branch != request.Branch {
-		return "", fmt.Errorf("publisher reported branch %s, want %s", result.Branch, request.Branch)
+		return kubernetes.PublisherJobResult{}, fmt.Errorf("publisher reported branch %s, want %s", result.Branch, request.Branch)
 	}
 
 	if err := client.WaitForBranchCommit(ctx, repository, request.Branch, result.CommitSHA, 30*time.Second); err != nil {
-		return "", err
+		return kubernetes.PublisherJobResult{}, err
 	}
 
-	return result.CommitSHA, nil
+	return result, nil
 }
 
 func publishIntentID(request Request, repository string) (string, error) {
@@ -240,8 +239,6 @@ func publishIntentID(request Request, repository string) (string, error) {
 		BaseBranch    string `json:"base"`
 		Branch        string `json:"branch"`
 		CommitMessage string `json:"commitMessage"`
-		Title         string `json:"title"`
-		Body          string `json:"body"`
 		Draft         bool   `json:"draft"`
 	}{
 		Namespace:     request.Namespace,
@@ -250,8 +247,6 @@ func publishIntentID(request Request, repository string) (string, error) {
 		BaseBranch:    request.BaseBranch,
 		Branch:        request.Branch,
 		CommitMessage: request.CommitMessage,
-		Title:         request.Title,
-		Body:          request.Body,
 		Draft:         request.Draft,
 	})
 	if err != nil {
@@ -282,10 +277,6 @@ func (request Request) Validate() error {
 
 	if request.Branch != strings.TrimSpace(request.Branch) {
 		return errors.New("--branch must not start or end with whitespace")
-	}
-
-	if strings.TrimSpace(request.Title) == "" {
-		return errors.New("--title must not be empty")
 	}
 
 	if request.Timeout < time.Second {

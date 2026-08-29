@@ -1,182 +1,127 @@
-# Kubernetes coding-agent sessions
+# Airlock
 
-This repository runs coding agents with native Kubernetes resources and a small Go client. Bounded work uses Jobs. Resumable work uses a singleton StatefulSet. Persistent volumes own durable state; Pods own only compute.
+Airlock is a small HTTP control plane for coding-agent Jobs on Kubernetes. One server owns one cluster connection and one existing namespace. The CLI talks only to that server; it never loads kubeconfig, AWS credentials, a GitHub App key, or a GitHub token.
 
-## Storage and lifecycle contract
+## Runtime model
 
-| Use case                    | Workload    | Workspace                                    | Tool home and cache | Codex state | `/tmp`            |
-| --------------------------- | ----------- | -------------------------------------------- | ------------------- | ----------- | ----------------- |
-| Read-only exploration       | Job         | `emptyDir`, read-only in the agent container | `emptyDir`          | `emptyDir`  | Memory `emptyDir` |
-| Bounded code update         | Job         | PVC                                          | PVC                 | PVC         | Memory `emptyDir` |
-| Long or interactive session | StatefulSet | PVC                                          | PVC                 | PVC         | Memory `emptyDir` |
+Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, artifacts, and session definition. A continuation is another Job mounted to the same PVC.
 
-The setup init container writes the initial checkout and can run commands such as `mise install` and `npm ci`. It cannot mount the Codex credential or session volume. A separate init container seeds credentials after repository setup finishes. Setup can run again after Pod replacement, so it must be idempotent. Stable tools are built into the image. Uncommitted changes, `node_modules`, Codex session files, mise installs, and npm cache survive only for modes backed by PVCs.
+This keeps recovery simple:
 
-Stopping a long session scales its StatefulSet to zero and retains its three claims. Resuming recreates the Pod against the same claims. Deleting a workload keeps storage. Destroying it also deletes the claims.
+- Kubernetes replaces a failed task Pod. Persistent work written before the failure remains on the PVC.
+- A new `airlock task` continues the retained Codex thread and workspace after a task completes or fails.
+- The PVC stores the immutable session definition, so continuation still works after the old Jobs are deleted or the Airlock server restarts.
+- `airlock delete` removes Jobs and keeps the PVC. `airlock delete --storage` also deletes the PVC.
 
-## Build for Colima
+The namespace must already exist and enforce the security policy appropriate for the cluster. Codex credentials must already exist in a Secret named `coding-agent-auth`. The Secret can contain `auth.json` or `CODEX_API_KEY`. Repository credentials are not stored there.
 
-The tested local target is Colima 0.10.1 with k3s v1.35.0. Build into that profile's Docker daemon so k3s can use the local image:
+## Security boundary
+
+The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations.
+
+Agent Pods run as UID/GID 1000 with a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, no privilege escalation, bounded resources, and denied ingress. The agent can still access the network and its Codex credential. Airlock is intended for trusted repositories in a private cluster, not hostile multi-tenant execution.
+
+The HTTP API has no application authentication. It listens on `127.0.0.1:8080` by default. If it runs in Kubernetes, expose it only as a private `ClusterIP` service and rely on the cluster or private-network access boundary.
+
+## Start the server
+
+Build without overwriting a local file named `airlock` by choosing an explicit output path when needed:
 
 ```bash
-go build -o agentctl ./cmd/agentctl
-env -u DOCKER_HOST docker --context colima-codex-k8s build -f container/Dockerfile -t coding-agent:local .
+go build -o ./bin/airlock ./cmd/airlock
 ```
 
-`agentctl` uses `client-go` with the standard kubeconfig loading rules. `--context` selects a kubeconfig context; the `kubectl` executable is not required.
+The server uses the following Kubernetes authentication order:
 
-The image pins Node 24.14.1, Codex 0.150.1, and mise 2026.8.14. It also includes Git, OpenSSH, ripgrep, and build tools.
+1. `--eks-cluster`, using the AWS SDK default configuration and optional `--aws-role-arn`;
+2. explicit `--kubeconfig` and optional `--context`;
+3. in-cluster service-account credentials;
+4. standard kubeconfig loading when it is not running in a cluster.
 
-## Authentication
-
-For an API key used only by this private local cluster:
+Example with kubeconfig:
 
 ```bash
-export CODEX_API_KEY='...'
-./agentctl bootstrap --context colima-codex-k8s --api-key-env CODEX_API_KEY
-unset CODEX_API_KEY
+./bin/airlock server \
+  --context colima-codex-proof \
+  --namespace coding-agents \
+  --github-app-id 123 \
+  --github-installation-id 456 \
+  --github-private-key-file /secure/airlock-app.pem
 ```
 
-To seed an existing Codex CLI login instead:
+Example with EKS and an assumed role:
 
 ```bash
-./agentctl bootstrap --context colima-codex-k8s --auth-file "$HOME/.codex/auth.json"
+./bin/airlock server \
+  --eks-cluster coding-agents \
+  --aws-region eu-west-1 \
+  --aws-role-arn arn:aws:iam::123456789012:role/airlock-control-plane \
+  --namespace coding-agents \
+  --github-app-id 123 \
+  --github-installation-id 456 \
+  --github-private-key-file /secure/airlock-app.pem
 ```
 
-For private GitHub repositories, pass the current `gh` token directly to bootstrap without printing it or putting it in a repository URL:
+## Run and continue sessions
+
+Client commands use `--server` or `AIRLOCK_SERVER`; the default is `http://127.0.0.1:8080`.
 
 ```bash
-GITHUB_TOKEN="$(gh auth token)" \
-./agentctl bootstrap \
-  --context colima-codex-k8s \
-  --auth-file "$HOME/.codex/auth.json" \
-  --github-token-env GITHUB_TOKEN
-```
-
-The GitHub Secret is mounted only by the clone init container. Repository setup and Codex cannot mount it. Clones fetch one branch at depth `1` by default; use `--clone-depth 0` only when the task genuinely needs full history.
-
-The Codex Secret is mounted only by the credential init container and the agent container. Repository setup cannot access it. `auth.json` is copied into the separate Codex-state volume only when that volume has no credentials, which lets Codex persist token rotation for a retained session. Treat both the Kubernetes Secret and the Codex-state PVC as credentials.
-
-Codex and the commands it launches run as the same user. Those commands can read the active credential and use outbound network access. Run only repositories and prompts you trust. Do not place secrets in `--prompt` or `--setup`; both values are stored in the Pod specification and are visible to principals that can read Pods.
-
-API keys are the general automation default in the [official Codex non-interactive guidance](https://learn.chatgpt.com/docs/non-interactive-mode). For an eligible managed workspace, prefer [workload identity federation](https://learn.chatgpt.com/docs/enterprise/workload-identity) so the Pod receives a rotating identity token instead of a stored key. This baseline intentionally does not automate federation because it depends on organization-side configuration.
-
-## Short exploration
-
-```bash
-./agentctl start \
-  --context colima-codex-k8s \
-  --name inspect-example \
-  --mode explore \
-  --repo https://github.com/example/project.git \
-  --setup 'mise install && npm ci' \
-  --prompt 'Explain the request path and identify correctness risks.'
-
-./agentctl logs --context colima-codex-k8s --name inspect-example --follow
-```
-
-The init container can install dependencies, but the agent receives the checked-out workspace read-only. Codex runs with `--ephemeral`, so its rollout files are not retained.
-
-## Bounded code update
-
-```bash
-./agentctl start \
-  --context colima-codex-k8s \
+airlock start \
   --name update-example \
-  --mode update \
+  --storage persistent \
   --repo https://github.com/example/project.git \
   --setup 'mise install && npm ci' \
   --prompt 'Implement the requested change and run focused tests.'
 
-./agentctl logs --context colima-codex-k8s --name update-example --follow
-./agentctl status --context colima-codex-k8s --name update-example
+airlock status --name update-example
+airlock logs --name update-example --follow
+airlock artifacts --name update-example
+
+airlock task --name update-example 'Address the remaining failed test.'
 ```
 
-The completed Job leaves its workspace, tool-home, and Codex-state PVCs in place. To inspect or continue that exact workspace, delete only the completed workload and start a long session with the same name:
+Use `--storage ephemeral` for disposable exploration. Ephemeral sessions cannot continue or publish.
+
+## Outcomes, artifacts, and publishing
+
+A task can finish as completed, blocked, or failed. A blocked result is valid and must identify the blocker; Airlock does not turn missing information or a sandbox limitation into false success.
+
+The agent writes `outcome.json` for every successful invocation. Completed work also writes `pull-request.json` with a title and description. The harness validates these files and asks the same Codex thread to recreate invalid files once. The files remain on persistent storage, and their bounded API representation is available through `airlock artifacts`.
+
+Publishing is explicit:
 
 ```bash
-./agentctl delete --context colima-codex-k8s --name update-example
-./agentctl start \
-  --context colima-codex-k8s \
-  --name update-example \
-  --mode long \
-  --repo https://github.com/example/project.git \
-  --setup 'mise install && npm ci'
-./agentctl shell --context colima-codex-k8s --name update-example
-```
-
-The init container sees the existing Git checkout and does not clone over it. Each distinct session name owns separate claims.
-
-## Publish a pull request
-
-A completed update session or stopped long session can be published through an explicit delivery command:
-
-```bash
-./agentctl publish \
-  --context colima-codex-k8s \
+airlock publish \
   --name update-example \
   --branch yar/KARGO-123-description \
-  --commit-message 'KARGO-123: implement description' \
-  --title 'KARGO-123: implement description' \
-  --body-file pr.md
+  --commit-message 'KARGO-123: implement description'
 ```
 
-The pull request is a draft by default. Add `--ready` only when it should be ready for review immediately. `--base` defaults to the ref used to start the session.
+The publisher mounts the retained workspace and artifacts read-only, makes a clean clone, copies changed files without `.git`, creates and verifies a new non-force-pushed branch, then opens a draft pull request using the agent-authored title and description. Add `--ready` only when the pull request should not be a draft. Retrying the same publish intent recovers the existing branch or pull request instead of duplicating it.
 
-Publishing refuses exploration sessions, active or unsuccessful sessions, existing branches not owned by the same publish attempt, empty changes, and concurrent publish intents. It never force-pushes. Retrying the same command reuses an existing matching branch or pull request instead of creating duplicates.
+## HTTP API
 
-The coding agent never receives the GitHub token. A bounded publisher Job mounts the source workspace read-only and clones the trusted base into a separate temporary volume. It copies the workspace snapshot into that clean clone, disables Git hooks and external Git configuration, creates the commit using the authenticated GitHub user's noreply identity, pushes the new branch, and verifies the remote commit. `agentctl` then creates the pull request through the GitHub API and removes the publisher Job.
+The CLI uses these endpoints:
 
-## Long session
+- `POST /v1/sessions`
+- `GET /v1/sessions/{name}`
+- `POST /v1/sessions/{name}/tasks`
+- `GET /v1/sessions/{name}/logs`
+- `GET /v1/sessions/{name}/artifacts`
+- `POST /v1/sessions/{name}/publish`
+- `DELETE /v1/sessions/{name}?storage=delete`
 
-```bash
-./agentctl start \
-  --context colima-codex-k8s \
-  --name long-example \
-  --mode long \
-  --repo https://github.com/example/project.git \
-  --setup 'mise install && npm ci'
-
-./agentctl task --context colima-codex-k8s --name long-example 'Investigate the failing tests.'
-./agentctl task --context colima-codex-k8s --name long-example --resume-last 'Apply the smallest safe fix.'
-./agentctl shell --context colima-codex-k8s --name long-example
-./agentctl stop --context colima-codex-k8s --name long-example
-./agentctl resume --context colima-codex-k8s --name long-example
-```
-
-`stop` and `resume` preserve storage. `delete` removes compute and keeps storage. `destroy` removes compute and all three PVCs:
-
-```bash
-./agentctl destroy --context colima-codex-k8s --name long-example
-```
-
-Only one `task` command can run in a long session at a time. A second call fails immediately instead of writing the same workspace concurrently.
-
-## Security and failure boundaries
-
-The namespace enforces Kubernetes Restricted Pod Security. Agent Pods run as UID/GID 1000, drop all capabilities, use `RuntimeDefault` seccomp, disable privilege escalation and service-account token mounting, and use a read-only root filesystem. The namespace denies ingress. CPU, memory, ephemeral storage, duration, and tmpfs size are bounded.
-
-Codex's nested OS sandbox is bypassed because the tested Colima security stack blocks the required nested namespace operations. The Kubernetes Pod is therefore the command boundary. This is appropriate for a private, isolated cluster that runs trusted repositories. It is not enough for hostile multi-tenant workloads. Production use should add a stronger runtime such as gVisor or Kata, domain-aware egress controls, workload identity, per-tenant namespaces and quotas, and external result export.
-
-Agent Jobs use `backoffLimit: 0` and do not push code automatically. Only the explicit `publish` command creates a publisher Job, and that Job pushes one new branch without force. Kubernetes can still create a replacement Pod after infrastructure loss, so setup and task effects outside the workspace must be idempotent. A timeout or lost response can leave outcome unknown; inspect the PVC and Git state before retrying. `ReadWriteOnce` is a node-level constraint, not an exclusive-Pod lock. The session-name workload prevents normal concurrent starts, but a production control plane should enforce exclusive ownership with `ReadWriteOncePod` on a supporting CSI driver or an explicit lease.
-
-Colima's local-path storage survives Pod replacement and VM restart, but it is tied to the single VM. Deleting the PVC, its PV, or the Colima profile can delete the data. Back up or push valuable work before destroying storage.
+Session creation and continuation return `202 Accepted` after Kubernetes accepts the resources. Coding continues asynchronously.
 
 ## Development
 
-The repository adopts the same developer entrypoint locally and in CI:
-
 ```bash
 make doctor
-make check
-make build
+make check BINARY=./bin/airlock
 make image
 make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
 make e2e-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof DOCKER_CONTEXT=colima-codex-proof
 ```
 
-`make tools` installs the pinned golangci-lint version. Ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. The opt-in integration test uses the named Kubernetes context, creates a unique namespace, verifies apply, scale, delete, and destroy behavior, and removes the namespace during cleanup. Use only an explicitly isolated test cluster.
-
-The opt-in E2E suite builds the current coding-agent image and runs exploration and persistent-session journeys through the top-level coding-session boundary. It clones a fixed repository from an in-cluster Git server, runs `mise install` and npm setup, and uses a deterministic Codex substitute installed by setup. The suite verifies workspace permissions, retained workspace, tool-home and Codex state, temporary `/tmp` state, stop and resume, delete and destroy, and namespace cleanup. It does not use Codex credentials or create GitHub branches or pull requests.
-
-Repository conventions are documented in [AGENTS.md](AGENTS.md).
+Ordinary tests do not contact Kubernetes, Docker, GitHub, AWS, or Codex. Live tests require explicit contexts and clean up their namespaces.

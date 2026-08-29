@@ -1,10 +1,12 @@
-package codingsession
+package agentsandbox
 
 import (
+	"context"
+	"encoding/json"
 	"io"
 	"time"
 
-	"coding-agent-k8s/internal/sessionmanifest"
+	"github.com/yarlson/airlock/internal/sessionmanifest"
 )
 
 const (
@@ -14,16 +16,14 @@ const (
 	DefaultImage = sessionmanifest.DefaultImage
 )
 
-// Mode controls a session's execution and storage lifecycle.
-type Mode string
+// Storage controls whether a session retains state after a task finishes.
+type Storage string
 
 const (
-	// ModeExplore runs one bounded task without retaining its workspace.
-	ModeExplore Mode = "explore"
-	// ModeUpdate runs one bounded task and retains its workspace.
-	ModeUpdate Mode = "update"
-	// ModeLong runs a resumable session that accepts tasks separately.
-	ModeLong Mode = "long"
+	// StorageEphemeral runs one disposable task with Pod-owned storage.
+	StorageEphemeral Storage = "ephemeral"
+	// StoragePersistent retains session state on one claim.
+	StoragePersistent Storage = "persistent"
 )
 
 // Streams connects session output and interactive commands to a caller.
@@ -36,6 +36,25 @@ type Streams struct {
 	ErrorOutput io.Writer
 }
 
+// Connection selects how the control plane authenticates to its Kubernetes cluster.
+type Connection struct {
+	// KubeconfigPath selects an explicit kubeconfig file.
+	KubeconfigPath string
+	// ContextName selects a context from kubeconfig.
+	ContextName string
+	// EKSCluster selects an Amazon EKS cluster by name.
+	EKSCluster string
+	// AWSRegion overrides the AWS SDK region for EKS discovery.
+	AWSRegion string
+	// AWSRoleARN is assumed before EKS discovery and authentication.
+	AWSRoleARN string
+}
+
+// RepositoryTokenProvider returns short-lived credentials for clone and publish workloads.
+type RepositoryTokenProvider interface {
+	InstallationToken(context.Context) (string, error)
+}
+
 // Target identifies one coding session.
 type Target struct {
 	// Namespace owns the session.
@@ -44,26 +63,14 @@ type Target struct {
 	Name string
 }
 
-// BootstrapRequest defines the shared environment and credentials for coding sessions.
-type BootstrapRequest struct {
-	// Namespace is the namespace prepared for coding sessions.
-	Namespace string
-	// CodexAuthJSON contains an existing Codex CLI login; nil omits the login.
-	CodexAuthJSON []byte
-	// CodexAPIKey contains the API key used by Codex.
-	CodexAPIKey string
-	// GitHubToken contains the token used to clone private repositories and publish changes.
-	GitHubToken string
-}
-
 // StartRequest defines a new coding session.
 type StartRequest struct {
 	// Target identifies the session.
 	Target Target
 	// Image runs setup and coding-agent commands.
 	Image string
-	// Mode selects the session lifecycle and storage behavior.
-	Mode Mode
+	// Storage selects whether the session state is temporary or persistent.
+	Storage Storage
 	// Repository is cloned into the workspace; an empty value initializes a repository.
 	Repository string
 	// InitialRef is the Git branch or tag cloned for the session.
@@ -80,22 +87,42 @@ type StartRequest struct {
 	Timeout time.Duration
 }
 
+// ContinueRequest defines one Job against a retained session.
+type ContinueRequest struct {
+	// Target identifies the persistent session.
+	Target Target
+	// TaskID distinguishes this task from earlier session Jobs.
+	TaskID string
+	// Prompt is the next task given to the coding agent.
+	Prompt string
+	// Timeout bounds the task Job.
+	Timeout time.Duration
+}
+
 // Status describes the resources owned by one coding session.
 type Status struct {
 	// Resources lists session resources in display order.
 	Resources []ResourceStatus
 }
 
+// Artifacts contains the latest task's validated result files.
+type Artifacts struct {
+	// Outcome is the task's completed, blocked, or failed result.
+	Outcome json.RawMessage `json:"outcome"`
+	// PullRequest is the proposed pull request metadata when work completed.
+	PullRequest json.RawMessage `json:"pull_request,omitempty"`
+}
+
 // ResourceStatus describes the readiness and state of one session resource.
 type ResourceStatus struct {
 	// Kind identifies the resource type.
-	Kind string
+	Kind string `json:"kind"`
 	// Name identifies the resource.
-	Name string
+	Name string `json:"name"`
 	// Ready reports current readiness against the desired count.
-	Ready string
+	Ready string `json:"ready"`
 	// State reports the resource lifecycle state.
-	State string
+	State string `json:"state"`
 }
 
 // LogRequest selects the session logs to stream.
@@ -104,16 +131,6 @@ type LogRequest struct {
 	Target Target
 	// Follow keeps the log stream open for new output.
 	Follow bool
-}
-
-// TaskRequest defines one task submitted to an existing session.
-type TaskRequest struct {
-	// Target identifies the session.
-	Target Target
-	// Prompt is the task given to the coding agent.
-	Prompt string
-	// ResumeLast continues the most recent Codex thread.
-	ResumeLast bool
 }
 
 // PublishRequest defines one idempotent session publication.
@@ -126,10 +143,6 @@ type PublishRequest struct {
 	BaseBranch string
 	// CommitMessage is the message used for the workspace commit.
 	CommitMessage string
-	// Title is the pull request title.
-	Title string
-	// Body is the pull request description.
-	Body string
 	// Draft controls whether GitHub creates a draft pull request.
 	Draft bool
 	// Timeout bounds the publishing operation.
@@ -139,11 +152,11 @@ type PublishRequest struct {
 // PublishResult identifies the branch, commit, and pull request created by publishing.
 type PublishResult struct {
 	// PullRequestNumber is the repository-local pull request number.
-	PullRequestNumber int
+	PullRequestNumber int `json:"pull_request_number"`
 	// PullRequestURL is the pull request's GitHub web URL.
-	PullRequestURL string
+	PullRequestURL string `json:"pull_request_url"`
 	// Branch is the remote branch containing the published changes.
-	Branch string
+	Branch string `json:"branch"`
 	// CommitSHA is the published commit, or empty when an existing pull request is recovered.
-	CommitSHA string
+	CommitSHA string `json:"commit_sha"`
 }

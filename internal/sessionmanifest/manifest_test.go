@@ -2,6 +2,7 @@ package sessionmanifest
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 	"testing"
 
@@ -30,78 +31,46 @@ type renderedResource struct {
 	} `json:"spec"`
 }
 
-func TestRenderSelectsWorkloadAndStorageForSessionLifecycle(t *testing.T) {
+func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 	tests := []struct {
 		name          string
-		mode          Mode
-		prompt        string
+		storage       Storage
 		workload      string
 		wantResources []string
 		wantStorage   map[string]string
 	}{
 		{
-			name:     "bounded exploration uses ephemeral storage",
-			mode:     ModeExplore,
-			prompt:   "inspect the repository",
+			name:     "ephemeral session uses emptyDir",
+			storage:  StorageEphemeral,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
-				"Namespace/coding-agents",
 				"NetworkPolicy/deny-all-ingress",
 			},
 			wantStorage: map[string]string{
-				"codex":     "ephemeral",
-				"home":      "ephemeral",
-				"tmp":       "memory",
-				"workspace": "ephemeral",
+				"session": "ephemeral",
+				"tmp":     "memory",
 			},
 		},
 		{
-			name:     "bounded update retains repository and tool state",
-			mode:     ModeUpdate,
-			prompt:   "update the repository",
+			name:     "persistent session uses one claim",
+			storage:  StoragePersistent,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
-				"Namespace/coding-agents",
 				"NetworkPolicy/deny-all-ingress",
-				"PersistentVolumeClaim/codex-example",
-				"PersistentVolumeClaim/home-example",
-				"PersistentVolumeClaim/workspace-example",
+				"PersistentVolumeClaim/session-example",
 			},
 			wantStorage: map[string]string{
-				"codex":     "codex-example",
-				"home":      "home-example",
-				"tmp":       "memory",
-				"workspace": "workspace-example",
-			},
-		},
-		{
-			name:     "long session is resumable and retains state",
-			mode:     ModeLong,
-			workload: "StatefulSet/example",
-			wantResources: []string{
-				"Namespace/coding-agents",
-				"NetworkPolicy/deny-all-ingress",
-				"PersistentVolumeClaim/codex-example",
-				"PersistentVolumeClaim/home-example",
-				"PersistentVolumeClaim/workspace-example",
-				"Service/example",
-				"StatefulSet/example",
-			},
-			wantStorage: map[string]string{
-				"codex":     "codex-example",
-				"home":      "home-example",
-				"tmp":       "memory",
-				"workspace": "workspace-example",
+				"session": "session-example",
+				"tmp":     "memory",
 			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			spec := validSpec()
-			spec.Mode = test.mode
-			spec.Prompt = test.prompt
+			spec.Storage = test.storage
 			manifest, err := Render(spec)
 			require.NoError(t, err)
 
@@ -120,21 +89,20 @@ func TestRenderSelectsWorkloadAndStorageForSessionLifecycle(t *testing.T) {
 	}
 }
 
-func TestRenderBootstrapIncludesRequestedCredentials(t *testing.T) {
-	manifest, err := RenderBootstrap("coding-agents", []byte(`{"token":"codex"}`), "", "github-secret")
+func TestRenderContinuationReusesPersistentStorage(t *testing.T) {
+	spec := validSpec()
+	spec.TaskName = "example-continue-abc123"
+	spec.Resume = true
+	manifest, err := RenderContinuation(spec)
 	require.NoError(t, err)
 
 	resources := decodeRenderedResources(t, manifest)
-	auth := resources["Secret/coding-agent-auth"].Data
-	assert.Equal(t, map[string]string{"auth.json": "eyJ0b2tlbiI6ImNvZGV4In0="}, auth)
-
-	git := resources["Secret/coding-agent-git-auth"].Data
-	assert.Equal(t, map[string]string{"token": "Z2l0aHViLXNlY3JldA=="}, git)
-}
-
-func TestRenderBootstrapRejectsMultipleCodexCredentials(t *testing.T) {
-	_, err := RenderBootstrap("coding-agents", []byte(`{"token":"codex"}`), "api-key", "")
-	require.ErrorContains(t, err, "either Codex auth JSON or an API key")
+	assert.ElementsMatch(t, []string{
+		"Job/example-continue-abc123",
+		"NetworkPolicy/deny-all-ingress",
+	}, slices.Collect(maps.Keys(resources)))
+	job := resources["Job/example-continue-abc123"]
+	assert.Equal(t, "session-example", renderedStorage(job)["session"])
 }
 
 func TestRenderRejectsInvalidContracts(t *testing.T) {
@@ -145,7 +113,7 @@ func TestRenderRejectsInvalidContracts(t *testing.T) {
 	}{
 		{name: "unsafe name", change: func(s *Spec) { s.Name = "Not Safe" }, message: "name"},
 		{name: "missing prompt", change: func(s *Spec) { s.Prompt = "" }, message: "prompt"},
-		{name: "unknown mode", change: func(s *Spec) { s.Mode = "daemon" }, message: "unsupported"},
+		{name: "unknown storage", change: func(s *Spec) { s.Storage = "remote" }, message: "unsupported"},
 		{name: "negative clone depth", change: func(s *Spec) { s.CloneDepth = -1 }, message: "clone depth"},
 	}
 	for _, test := range cases {
@@ -163,7 +131,7 @@ func validSpec() Spec {
 		Name:           "example",
 		Namespace:      DefaultNamespace,
 		Image:          DefaultImage,
-		Mode:           ModeUpdate,
+		Storage:        StoragePersistent,
 		InitialRef:     "main",
 		Prompt:         "inspect the repository",
 		CloneDepth:     1,

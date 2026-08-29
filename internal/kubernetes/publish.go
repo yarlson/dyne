@@ -2,6 +2,8 @@ package kubernetes
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -16,7 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"coding-agent-k8s/internal/sessionmanifest"
+	"github.com/yarlson/airlock/internal/sessionmanifest"
 )
 
 const publishIntentAnnotationKey = "coding-agent/publish-intent"
@@ -69,77 +71,78 @@ type PublisherJobResult struct {
 	Branch string
 	// CommitSHA is the commit verified on the remote branch.
 	CommitSHA string
+	// Title is the validated pull request title written by the coding session.
+	Title string
+	// Body is the validated pull request description written by the coding session.
+	Body string
 }
 
-// SessionPublishSource returns publishing inputs for a completed update session or a stopped long session.
+// SessionPublishSource returns publishing inputs for a completed persistent session.
 func (c *Client) SessionPublishSource(ctx context.Context, namespace, session string) (PublishSource, error) {
-	job, jobErr := c.typed.BatchV1().Jobs(namespace).Get(ctx, session, metav1.GetOptions{})
-	set, setErr := c.typed.AppsV1().StatefulSets(namespace).Get(ctx, session, metav1.GetOptions{})
-	jobFound := jobErr == nil
-	setFound := setErr == nil
-	if jobErr != nil && !apierrors.IsNotFound(jobErr) {
-		return PublishSource{}, fmt.Errorf("get session Job: %w", jobErr)
+	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(session)})
+	if err != nil {
+		return PublishSource{}, fmt.Errorf("list session Jobs: %w", err)
 	}
 
-	if setErr != nil && !apierrors.IsNotFound(setErr) {
-		return PublishSource{}, fmt.Errorf("get session StatefulSet: %w", setErr)
-	}
-
-	if jobFound == setFound {
-		if jobFound {
-			return PublishSource{}, errors.New("session has both a Job and StatefulSet")
-		}
-
+	if len(jobs.Items) == 0 {
 		return PublishSource{}, fmt.Errorf("session %s does not exist", session)
 	}
 
-	var podSpec corev1.PodSpec
-	if jobFound {
-		if job.Status.Succeeded == 0 || job.Status.Active != 0 {
-			return PublishSource{}, errors.New("update session must complete successfully before publishing")
+	var latest *batchv1.Job
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if job.Status.Active != 0 {
+			return PublishSource{}, errors.New("session has an active task")
 		}
 
-		podSpec = job.Spec.Template.Spec
-	} else {
-		desired := int32(1)
-		if set.Spec.Replicas != nil {
-			desired = *set.Spec.Replicas
+		if latest == nil || job.CreationTimestamp.After(latest.CreationTimestamp.Time) ||
+			(job.CreationTimestamp.Equal(&latest.CreationTimestamp) && job.Name > latest.Name) {
+			latest = job
 		}
-
-		if desired != 0 || set.Status.Replicas != 0 {
-			return PublishSource{}, errors.New("long session must be stopped before publishing")
-		}
-
-		podSpec = set.Spec.Template.Spec
 	}
 
-	agentContainer, err := namedContainer(podSpec.Containers, "agent")
+	if latest.Status.Succeeded == 0 {
+		return PublishSource{}, errors.New("latest session task must complete successfully before publishing")
+	}
+
+	artifacts, err := c.SessionArtifacts(ctx, namespace, session)
+	if err != nil {
+		return PublishSource{}, err
+	}
+
+	var outcome struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(artifacts.Outcome, &outcome); err != nil {
+		return PublishSource{}, fmt.Errorf("decode session outcome: %w", err)
+	}
+
+	if outcome.Status != "completed" {
+		return PublishSource{}, fmt.Errorf("session outcome is %q, want completed", outcome.Status)
+	}
+
+	agentContainer, err := namedContainer(latest.Spec.Template.Spec.Containers, "agent")
 	if err != nil {
 		return PublishSource{}, err
 	}
 
 	environment := literalContainerEnvironment(agentContainer)
-	mode := environment["AGENT_MODE"]
-	if jobFound && mode != "update" {
-		return PublishSource{}, fmt.Errorf("%s sessions cannot be published", mode)
-	}
-
-	if !jobFound && mode != "long" {
-		return PublishSource{}, fmt.Errorf("unexpected StatefulSet session mode %q", mode)
+	if environment["AGENT_STORAGE"] != "persistent" {
+		return PublishSource{}, errors.New("ephemeral sessions cannot be published")
 	}
 
 	if environment["AGENT_REPOSITORY"] == "" || environment["AGENT_REF"] == "" {
 		return PublishSource{}, errors.New("session repository and base ref are required for publishing")
 	}
 
-	workspaceClaim := sessionmanifest.WorkspaceClaimName(session)
+	workspaceClaim := sessionmanifest.SessionClaimName(session)
 	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, workspaceClaim, metav1.GetOptions{})
 	if err != nil {
-		return PublishSource{}, fmt.Errorf("get workspace PersistentVolumeClaim: %w", err)
+		return PublishSource{}, fmt.Errorf("get session PersistentVolumeClaim: %w", err)
 	}
 
 	if claim.Status.Phase != corev1.ClaimBound {
-		return PublishSource{}, fmt.Errorf("workspace PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
+		return PublishSource{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
 	}
 
 	return PublishSource{
@@ -289,8 +292,8 @@ func (c *Client) publisherJobResult(ctx context.Context, namespace, jobName stri
 		}
 
 		result := parsePublisherJobResult(status.State.Terminated.Message)
-		if result.Branch == "" || !commitSHAPattern.MatchString(result.CommitSHA) {
-			return PublisherJobResult{}, errors.New("publisher did not report a valid branch and commit")
+		if result.Branch == "" || !commitSHAPattern.MatchString(result.CommitSHA) || result.Title == "" || result.Body == "" {
+			return PublisherJobResult{}, errors.New("publisher did not report a valid branch, commit, and pull request artifact")
 		}
 
 		return result, nil
@@ -371,7 +374,7 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 	deadline := int64(request.Timeout.Seconds())
 	labels := map[string]string{
 		"app.kubernetes.io/name":       "coding-agent",
-		"app.kubernetes.io/managed-by": "agentctl",
+		"app.kubernetes.io/managed-by": "airlock",
 		"coding-agent/session":         request.Session,
 		"coding-agent/component":       "publisher",
 	}
@@ -404,6 +407,13 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 					Volumes: []corev1.Volume{
 						{
 							Name: "workspace",
+							VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: request.WorkspaceClaim,
+								ReadOnly:  true,
+							}},
+						},
+						{
+							Name: "artifacts",
 							VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 								ClaimName: request.WorkspaceClaim,
 								ReadOnly:  true,
@@ -458,7 +468,8 @@ func publisherContainer(request PublisherJobRequest) corev1.Container {
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "workspace", MountPath: "/workspace", ReadOnly: true},
+			{Name: "workspace", MountPath: "/workspace", SubPath: "workspace", ReadOnly: true},
+			{Name: "artifacts", MountPath: "/artifacts", SubPath: "artifacts", ReadOnly: true},
 			{Name: "publish", MountPath: "/publish"},
 			{Name: "tmp", MountPath: "/tmp"},
 			{Name: "git-auth", MountPath: "/var/run/git-auth", ReadOnly: true},
@@ -522,6 +533,16 @@ func parsePublisherJobResult(message string) PublisherJobResult {
 			result.Branch = value
 		case "commit":
 			result.CommitSHA = value
+		case "title":
+			decoded, err := base64.StdEncoding.DecodeString(value)
+			if err == nil {
+				result.Title = string(decoded)
+			}
+		case "body":
+			decoded, err := base64.StdEncoding.DecodeString(value)
+			if err == nil {
+				result.Body = string(decoded)
+			}
 		}
 	}
 

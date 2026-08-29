@@ -39,11 +39,11 @@ formatters:
     generated: lax
   settings:
     gofumpt:
-      module-path: coding-agent-k8s
+      module-path: github.com/yarlson/airlock
       extra-rules: true
     goimports:
       local-prefixes:
-        - coding-agent-k8s
+        - github.com/yarlson/airlock
     gci:
       sections:
         - standard

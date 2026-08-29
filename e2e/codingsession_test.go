@@ -24,7 +24,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"coding-agent-k8s/internal/codingsession"
+	codingsession "github.com/yarlson/airlock/pkg/agentsandbox"
 )
 
 const (
@@ -54,6 +54,7 @@ cat > "${HOME}/.local/bin/codex" <<'CODEX'
 #!/usr/bin/env bash
 set -euo pipefail
 prompt="${!#}"
+prompt="${prompt%%$'\n'*}"
 case "${prompt}" in
   explore-repository)
     test "$(cat /workspace/README.md)" = "fixture repository"
@@ -101,6 +102,9 @@ case "${prompt}" in
     exit 64
     ;;
 esac
+mkdir -p /artifacts
+printf '{"status":"completed","summary":"E2E task completed","blocker":""}\n' > /artifacts/outcome.json
+printf '{"title":"E2E change","body":"E2E verification"}\n' > /artifacts/pull-request.json
 CODEX
 chmod 0755 "${HOME}/.local/bin/codex"`
 
@@ -108,14 +112,14 @@ func TestExplorationClonesAndPreparesAReadOnlyTemporaryWorkspace(t *testing.T) {
 	environment := newTestEnvironment(t)
 	target := codingsession.Target{Namespace: environment.sessionNamespace, Name: "exploration"}
 
-	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.ModeExplore, "explore-repository")))
+	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.StorageEphemeral, "explore-repository")))
 	environment.requireJobSucceeded(t, target.Name)
 
 	status, err := environment.control.Status(environment.context, target)
 	require.NoError(t, err)
 	assert.Empty(t, resourceNames(status, "PersistentVolumeClaim"))
 
-	require.NoError(t, environment.control.StreamLogs(environment.context, codingsession.LogRequest{Target: target}))
+	require.NoError(t, environment.control.WriteLogs(environment.context, codingsession.LogRequest{Target: target}, environment.output))
 	assert.Contains(t, environment.output.String(), "exploration completed with a read-only workspace")
 
 	require.NoError(t, environment.control.Destroy(environment.context, target))
@@ -126,29 +130,19 @@ func TestPersistentSessionRetainsStateAndReplacesTemporaryStorage(t *testing.T) 
 	environment := newTestEnvironment(t)
 	target := codingsession.Target{Namespace: environment.sessionNamespace, Name: "persistent"}
 
-	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.ModeUpdate, "apply-update")))
+	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.StoragePersistent, "apply-update")))
 	environment.requireJobSucceeded(t, target.Name)
 	environment.requirePersistentClaims(t, target)
 
-	require.NoError(t, environment.control.Delete(environment.context, target))
-	environment.requireOnlyPersistentClaims(t, target)
-
-	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.ModeLong, "")))
-	require.NoError(t, environment.control.RunTask(environment.context, codingsession.TaskRequest{Target: target, Prompt: "verify-update-state"}))
-
-	require.NoError(t, environment.control.Stop(environment.context, target))
-	environment.requireStopped(t, target)
-	require.NoError(t, environment.control.Resume(environment.context, target))
-	require.NoError(t, environment.control.RunTask(environment.context, codingsession.TaskRequest{
-		Target:     target,
-		Prompt:     "verify-stop-resume",
-		ResumeLast: true,
-	}))
+	require.NoError(t, environment.control.Continue(environment.context, codingsession.ContinueRequest{Target: target, TaskID: "verify-update", Prompt: "verify-update-state", Timeout: 5 * time.Minute}))
+	environment.requireJobSucceeded(t, "persistent-verify-update")
+	require.NoError(t, environment.control.Continue(environment.context, codingsession.ContinueRequest{Target: target, TaskID: "verify-resume", Prompt: "verify-stop-resume", Timeout: 5 * time.Minute}))
+	environment.requireJobSucceeded(t, "persistent-verify-resume")
 
 	require.NoError(t, environment.control.Delete(environment.context, target))
 	environment.requireOnlyPersistentClaims(t, target)
-	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.ModeLong, "")))
-	require.NoError(t, environment.control.RunTask(environment.context, codingsession.TaskRequest{Target: target, Prompt: "verify-delete-recreate"}))
+	require.NoError(t, environment.control.Continue(environment.context, codingsession.ContinueRequest{Target: target, TaskID: "verify-delete", Prompt: "verify-delete-recreate", Timeout: 5 * time.Minute}))
+	environment.requireJobSucceeded(t, "persistent-verify-delete")
 
 	require.NoError(t, environment.control.Destroy(environment.context, target))
 	environment.requireSessionAbsent(t, target)
@@ -180,9 +174,18 @@ func newTestEnvironment(t *testing.T) testEnvironment {
 	t.Cleanup(cancel)
 	client := newKubernetesClient(t, contextName)
 	suffix := randomSuffix(t)
-	sessionNamespace := "agentctl-e2e-" + suffix
-	fixtureNamespace := "agentctl-git-" + suffix
+	sessionNamespace := "airlock-e2e-" + suffix
+	fixtureNamespace := "airlock-git-" + suffix
 	registerNamespaceCleanup(t, client, sessionNamespace, fixtureNamespace)
+	_, err := client.CoreV1().Namespaces().Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: sessionNamespace,
+		Labels: map[string]string{
+			"pod-security.kubernetes.io/enforce": "restricted",
+			"pod-security.kubernetes.io/audit":   "restricted",
+			"pod-security.kubernetes.io/warn":    "restricted",
+		},
+	}}, metav1.CreateOptions{})
+	require.NoError(t, err)
 	repository := createGitFixture(t, testContext, client, fixtureNamespace, image)
 
 	output := &bytes.Buffer{}
@@ -192,8 +195,6 @@ func newTestEnvironment(t *testing.T) testEnvironment {
 		ErrorOutput: output,
 	})
 	require.NoError(t, err)
-	require.NoError(t, control.Bootstrap(testContext, codingsession.BootstrapRequest{Namespace: sessionNamespace}))
-
 	return testEnvironment{
 		context:          testContext,
 		control:          control,
@@ -292,11 +293,11 @@ func createGitFixture(t *testing.T, ctx context.Context, client clientset.Interf
 	return fmt.Sprintf("git://git.%s.svc.cluster.local/project.git", namespace)
 }
 
-func startRequest(environment testEnvironment, target codingsession.Target, mode codingsession.Mode, prompt string) codingsession.StartRequest {
+func startRequest(environment testEnvironment, target codingsession.Target, storage codingsession.Storage, prompt string) codingsession.StartRequest {
 	return codingsession.StartRequest{
 		Target:       target,
 		Image:        environment.image,
-		Mode:         mode,
+		Storage:      storage,
 		Repository:   environment.repository,
 		InitialRef:   "main",
 		SetupCommand: setupCommand,
@@ -337,7 +338,7 @@ func (environment testEnvironment) requirePersistentClaims(t *testing.T, target 
 	require.Eventually(t, func() bool {
 		status, err := environment.control.Status(environment.context, target)
 
-		return err == nil && resourceNamesEqual(status, "PersistentVolumeClaim", []string{"codex-persistent", "home-persistent", "workspace-persistent"})
+		return err == nil && resourceNamesEqual(status, "PersistentVolumeClaim", []string{"session-persistent"})
 	}, 2*time.Minute, waitInterval)
 }
 
@@ -349,19 +350,7 @@ func (environment testEnvironment) requireOnlyPersistentClaims(t *testing.T, tar
 			return false
 		}
 
-		return len(status.Resources) == 3 && resourceNamesEqual(status, "PersistentVolumeClaim", []string{"codex-persistent", "home-persistent", "workspace-persistent"})
-	}, 2*time.Minute, waitInterval)
-}
-
-func (environment testEnvironment) requireStopped(t *testing.T, target codingsession.Target) {
-	t.Helper()
-	require.Eventually(t, func() bool {
-		status, err := environment.control.Status(environment.context, target)
-		if err != nil {
-			return false
-		}
-
-		return resourceReady(status, "StatefulSet", target.Name) == "0/0" && len(resourceNames(status, "Pod")) == 0
+		return len(status.Resources) == 1 && resourceNamesEqual(status, "PersistentVolumeClaim", []string{"session-persistent"})
 	}, 2*time.Minute, waitInterval)
 }
 
@@ -390,16 +379,6 @@ func resourceNamesEqual(status codingsession.Status, kind string, expected []str
 	slices.Sort(names)
 
 	return slices.Equal(names, expected)
-}
-
-func resourceReady(status codingsession.Status, kind, name string) string {
-	for _, resource := range status.Resources {
-		if resource.Kind == kind && resource.Name == name {
-			return resource.Ready
-		}
-	}
-
-	return ""
 }
 
 func podReady(pod *corev1.Pod) bool {

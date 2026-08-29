@@ -63,6 +63,7 @@ publish_workspace() {
     printf 'GitHub token is required\n' >&2
     exit 1
   fi
+  validate_pull_request_artifact
   git check-ref-format --branch "${PUBLISH_BRANCH}" >/dev/null
   if find /publish -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
     printf 'publish workspace is not empty\n' >&2
@@ -95,7 +96,17 @@ publish_workspace() {
     printf 'remote branch points to %s instead of %s\n' "${remote_sha:-nothing}" "${commit_sha}" >&2
     exit 1
   fi
-  printf 'branch=%s\ncommit=%s\n' "${PUBLISH_BRANCH}" "${commit_sha}" > /dev/termination-log
+  local pull_title pull_body
+  pull_title="$(node -e 'process.stdout.write(Buffer.from(JSON.parse(require("fs").readFileSync("/artifacts/pull-request.json", "utf8")).title).toString("base64"))')"
+  pull_body="$(node -e 'process.stdout.write(Buffer.from(JSON.parse(require("fs").readFileSync("/artifacts/pull-request.json", "utf8")).body).toString("base64"))')"
+  printf 'branch=%s\ncommit=%s\ntitle=%s\nbody=%s\n' "${PUBLISH_BRANCH}" "${commit_sha}" "${pull_title}" "${pull_body}" > /dev/termination-log
+}
+
+validate_pull_request_artifact() {
+  node -e '
+const pull = JSON.parse(require("fs").readFileSync("/artifacts/pull-request.json", "utf8"));
+if (typeof pull.title !== "string" || !pull.title.trim() || pull.title.includes("\n") || pull.title.length > 256 || typeof pull.body !== "string" || !pull.body.trim() || pull.body.length > 2000) process.exit(1);
+' 2>/dev/null
 }
 
 git_publish() {
@@ -108,26 +119,59 @@ git_publish() {
 
 run_task() {
   load_api_key
+  rm -f /artifacts/outcome.json /artifacts/pull-request.json
   local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
-  if [[ "${AGENT_MODE:-}" == "explore" ]]; then
+  if [[ "${AGENT_STORAGE:-}" == "ephemeral" ]]; then
     args+=(--ephemeral)
   fi
-  exec codex "${args[@]}" "${AGENT_TASK}"
-}
-
-interactive_task() {
-  load_api_key
-  exec 9>"${CODEX_HOME}/task.lock"
-  if ! flock -n 9; then
-    printf 'another task is already running for this session\n' >&2
-    exit 1
-  fi
-  local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
-  if [[ "${1:-}" == "--resume-last" ]]; then
-    shift
+  if [[ "${AGENT_RESUME:-false}" == "true" ]]; then
     args+=(resume --last)
   fi
-  exec codex "${args[@]}" "$1"
+
+  local contract task_status
+  contract=$'\n\nBefore you finish, write /artifacts/outcome.json as JSON with status (completed or blocked), summary, and blocker. Use an empty blocker when completed. For completed work, also write /artifacts/pull-request.json as JSON with non-empty title and body strings. Do not claim completion when a sandbox limit, missing information, or another blocker prevents the task.'
+  set +e
+  codex "${args[@]}" "${AGENT_TASK}${contract}" 2>&1 | tee -a "/logs/${AGENT_TASK_ID}.ndjson"
+  task_status=${PIPESTATUS[0]}
+  set -e
+  if [[ ${task_status} -ne 0 ]]; then
+    node -e 'const fs=require("fs"); fs.writeFileSync("/artifacts/outcome.json", JSON.stringify({status:"failed",summary:"coding agent exited unsuccessfully",blocker:"agent process exited with status "+process.argv[1]})+"\n")' "${task_status}"
+    report_task_artifacts
+    return "${task_status}"
+  fi
+
+  if validate_task_artifacts; then
+    report_task_artifacts
+    return
+  fi
+
+  codex exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace resume --last $'The task result artifacts are missing or invalid. Recreate /artifacts/outcome.json. It must contain status (completed or blocked), summary, and blocker strings. If status is completed, recreate /artifacts/pull-request.json with non-empty title and body strings. Preserve an honest blocked result when work cannot be completed.' 2>&1 | tee -a "/logs/${AGENT_TASK_ID}.ndjson"
+  validate_task_artifacts
+  report_task_artifacts
+}
+
+validate_task_artifacts() {
+  node -e '
+const fs = require("fs");
+const read = path => JSON.parse(fs.readFileSync(path, "utf8"));
+const outcome = read("/artifacts/outcome.json");
+if (!["completed", "blocked"].includes(outcome.status) || typeof outcome.summary !== "string" || !outcome.summary.trim() || outcome.summary.length > 512 || typeof outcome.blocker !== "string" || outcome.blocker.length > 512) process.exit(1);
+if (outcome.status === "blocked") {
+  if (!outcome.blocker.trim()) process.exit(1);
+  process.exit(0);
+}
+const pull = read("/artifacts/pull-request.json");
+if (typeof pull.title !== "string" || !pull.title.trim() || pull.title.includes("\n") || pull.title.length > 256 || typeof pull.body !== "string" || !pull.body.trim() || pull.body.length > 2000) process.exit(1);
+' 2>/dev/null
+}
+
+report_task_artifacts() {
+  node -e '
+const fs = require("fs");
+const lines = ["outcome=" + fs.readFileSync("/artifacts/outcome.json").toString("base64")];
+if (fs.existsSync("/artifacts/pull-request.json")) lines.push("pull-request=" + fs.readFileSync("/artifacts/pull-request.json").toString("base64"));
+fs.writeFileSync("/dev/termination-log", lines.join("\n") + "\n");
+'
 }
 
 case "${1:-}" in
@@ -149,12 +193,8 @@ case "${1:-}" in
   idle)
     exec sleep infinity
     ;;
-  task)
-    shift
-    interactive_task "$@"
-    ;;
   *)
-    printf 'usage: agent-entrypoint <clone|init|auth|publish|run|idle|task>\n' >&2
+    printf 'usage: agent-entrypoint <clone|init|auth|publish|run|idle>\n' >&2
     exit 2
     ;;
 esac

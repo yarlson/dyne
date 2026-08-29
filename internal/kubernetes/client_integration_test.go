@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestClientAppliesScalesAndRemovesSessionResources(t *testing.T) {
+func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 	contextName := os.Getenv("KUBERNETES_INTEGRATION_CONTEXT")
 	if contextName == "" {
 		t.Skip("KUBERNETES_INTEGRATION_CONTEXT is required")
@@ -42,40 +42,17 @@ func TestClientAppliesScalesAndRemovesSessionResources(t *testing.T) {
 	defer cancel()
 	require.NoError(t, client.Apply(testContext, integrationManifest(namespace)))
 
-	set, err := client.typed.AppsV1().StatefulSets(namespace).Get(testContext, "session", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.NotNil(t, set.Spec.Replicas)
-	assert.Zero(t, *set.Spec.Replicas)
-
-	require.NoError(t, client.ResumeSession(testContext, namespace, "session"))
-	require.Eventually(t, func() bool {
-		set, err := client.typed.AppsV1().StatefulSets(namespace).Get(testContext, "session", metav1.GetOptions{})
-
-		return err == nil && set.Spec.Replicas != nil && *set.Spec.Replicas == 1
-	}, 30*time.Second, 100*time.Millisecond, "session was not resumed")
-
-	require.NoError(t, client.StopSession(testContext, namespace, "session"))
-	require.Eventually(t, func() bool {
-		set, err := client.typed.AppsV1().StatefulSets(namespace).Get(testContext, "session", metav1.GetOptions{})
-
-		return err == nil && set.Spec.Replicas != nil && *set.Spec.Replicas == 0
-	}, 30*time.Second, 100*time.Millisecond, "session was not stopped")
-
 	require.NoError(t, client.DeleteSession(testContext, namespace, "session"))
 	assertSessionWorkloadDeleted(t, testContext, client, namespace)
-	for _, name := range []string{"workspace-session", "home-session", "codex-session"} {
-		_, err := client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, name, metav1.GetOptions{})
-		assert.NoError(t, err, "persistent state %s was not retained", name)
-	}
+	_, err = client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, "session-session", metav1.GetOptions{})
+	assert.NoError(t, err, "persistent state was not retained")
 
 	require.NoError(t, client.DestroySession(testContext, namespace, "session"))
-	for _, name := range []string{"workspace-session", "home-session", "codex-session"} {
-		require.Eventually(t, func() bool {
-			_, err := client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, name, metav1.GetOptions{})
+	require.Eventually(t, func() bool {
+		_, err := client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, "session-session", metav1.GetOptions{})
 
-			return apierrors.IsNotFound(err)
-		}, 30*time.Second, 100*time.Millisecond, "persistent state %s was not destroyed", name)
-	}
+		return apierrors.IsNotFound(err)
+	}, 30*time.Second, 100*time.Millisecond, "persistent state was not destroyed")
 }
 
 func integrationNamespace(t *testing.T) string {
@@ -84,7 +61,7 @@ func integrationNamespace(t *testing.T) string {
 	_, err := rand.Read(suffix[:])
 	require.NoError(t, err)
 
-	return fmt.Sprintf("agentctl-integration-%x", suffix)
+	return fmt.Sprintf("airlock-integration-%x", suffix)
 }
 
 func integrationManifest(namespace string) []byte {
@@ -99,39 +76,19 @@ func integrationManifest(namespace string) []byte {
     },
     {
       "apiVersion": "v1",
-      "kind": "Service",
-      "metadata": {"name": "session", "namespace": %[1]q},
-      "spec": {"clusterIP": "None", "selector": {"app": "session"}}
-    },
-    {
-      "apiVersion": "v1",
       "kind": "PersistentVolumeClaim",
-      "metadata": {"name": "workspace-session", "namespace": %[1]q},
+      "metadata": {"name": "session-session", "namespace": %[1]q, "labels": {"coding-agent/session": "session"}},
       "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
     },
     {
-      "apiVersion": "v1",
-      "kind": "PersistentVolumeClaim",
-      "metadata": {"name": "home-session", "namespace": %[1]q},
-      "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
-    },
-    {
-      "apiVersion": "v1",
-      "kind": "PersistentVolumeClaim",
-      "metadata": {"name": "codex-session", "namespace": %[1]q},
-      "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
-    },
-    {
-      "apiVersion": "apps/v1",
-      "kind": "StatefulSet",
-      "metadata": {"name": "session", "namespace": %[1]q},
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {"name": "session-task", "namespace": %[1]q, "labels": {"coding-agent/session": "session"}},
       "spec": {
-        "serviceName": "session",
-        "replicas": 0,
-        "selector": {"matchLabels": {"app": "session"}},
         "template": {
-          "metadata": {"labels": {"app": "session"}},
+          "metadata": {"labels": {"coding-agent/session": "session"}},
           "spec": {
+            "restartPolicy": "Never",
             "containers": [{"name": "agent", "image": "registry.k8s.io/pause:3.10"}]
           }
         }
@@ -144,11 +101,8 @@ func integrationManifest(namespace string) []byte {
 func assertSessionWorkloadDeleted(t *testing.T, ctx context.Context, client *Client, namespace string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		_, err := client.typed.AppsV1().StatefulSets(namespace).Get(ctx, "session", metav1.GetOptions{})
+		jobs, err := client.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: "coding-agent/session=session"})
 
-		return apierrors.IsNotFound(err)
-	}, 30*time.Second, 100*time.Millisecond, "StatefulSet was not deleted")
-
-	_, err := client.typed.CoreV1().Services(namespace).Get(ctx, "session", metav1.GetOptions{})
-	assert.True(t, apierrors.IsNotFound(err), "got Service lookup error %v, want deleted Service", err)
+		return err == nil && len(jobs.Items) == 0
+	}, 30*time.Second, 100*time.Millisecond, "Jobs were not deleted")
 }

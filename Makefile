@@ -1,4 +1,4 @@
-BINARY := agentctl
+BINARY := airlock
 GOLANGCI_LINT_VERSION := v2.11.4
 GOLANGCI_LINT_VERSION_NUMBER := $(patsubst v%,%,$(GOLANGCI_LINT_VERSION))
 DOCKER_CONTEXT ?= colima-codex-k8s
@@ -11,11 +11,11 @@ help: ## Show development commands
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: build
-build: ## Build agentctl
-	go build -o $(BINARY) ./cmd/agentctl
+build: ## Build airlock
+	go build -o $(BINARY) ./cmd/airlock
 
 .PHONY: run
-run: build ## Run agentctl with ARGS="..."
+run: build ## Run airlock with ARGS="..."
 	./$(BINARY) $(ARGS)
 
 .PHONY: test

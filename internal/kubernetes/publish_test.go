@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,12 +17,12 @@ import (
 
 func TestSessionPublishSourceReturnsCompletedUpdateWorkspace(t *testing.T) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "coding-agents"},
-		Spec:       batchv1.JobSpec{Template: publishableSessionPod("update")},
+		ObjectMeta: metav1.ObjectMeta{Name: "review-first", Namespace: "coding-agents", Labels: map[string]string{"coding-agent/session": "review"}},
+		Spec:       batchv1.JobSpec{Template: publishableSessionPod("persistent")},
 		Status:     batchv1.JobStatus{Succeeded: 1},
 	}
 	claim := boundWorkspaceClaim()
-	client := &Client{typed: fake.NewClientset(job, claim)}
+	client := &Client{typed: fake.NewClientset(job, claim, completedTaskPod())}
 	source, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
 	require.NoError(t, err)
 
@@ -31,54 +30,19 @@ func TestSessionPublishSourceReturnsCompletedUpdateWorkspace(t *testing.T) {
 		Repository:     "https://github.com/lokalise/kargo.git",
 		InitialRef:     "main",
 		Image:          "coding-agent:test",
-		WorkspaceClaim: "workspace-review",
+		WorkspaceClaim: "session-review",
 	}
 	assert.Equal(t, want, source)
 }
 
-func TestSessionPublishSourceReturnsStoppedLongWorkspace(t *testing.T) {
-	replicas := int32(0)
-	set := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "coding-agents"},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas: &replicas,
-			Template: publishableSessionPod("long"),
-		},
-	}
-	claim := boundWorkspaceClaim()
-	client := &Client{typed: fake.NewClientset(set, claim)}
-	source, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
-	require.NoError(t, err)
-
-	want := PublishSource{
-		Repository:     "https://github.com/lokalise/kargo.git",
-		InitialRef:     "main",
-		Image:          "coding-agent:test",
-		WorkspaceClaim: "workspace-review",
-	}
-	assert.Equal(t, want, source)
-}
-
-func TestSessionPublishSourceRejectsActiveUpdate(t *testing.T) {
+func TestSessionPublishSourceRejectsActiveTask(t *testing.T) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "coding-agents"},
+		ObjectMeta: metav1.ObjectMeta{Name: "review-first", Namespace: "coding-agents", Labels: map[string]string{"coding-agent/session": "review"}},
 		Status:     batchv1.JobStatus{Active: 1},
 	}
 	client := &Client{typed: fake.NewClientset(job)}
 	_, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
-	require.ErrorContains(t, err, "update session must complete successfully")
-}
-
-func TestSessionPublishSourceRejectsRunningLongSession(t *testing.T) {
-	replicas := int32(1)
-	set := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "coding-agents"},
-		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
-		Status:     appsv1.StatefulSetStatus{Replicas: 1},
-	}
-	client := &Client{typed: fake.NewClientset(set)}
-	_, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
-	require.ErrorContains(t, err, "long session must be stopped")
+	require.ErrorContains(t, err, "active task")
 }
 
 func TestGitHubTokenReturnsTrimmedSecret(t *testing.T) {
@@ -135,7 +99,7 @@ func TestRunPublisherJobReturnsCompletedTerminationResult(t *testing.T) {
 		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
 			Name: "publisher",
 			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-				Message: "branch=yar/review\ncommit=9a4484441215661904e02a807adf5034d13f5bbe\n",
+				Message: "branch=yar/review\ncommit=9a4484441215661904e02a807adf5034d13f5bbe\ntitle=UmV2aWV3IGNoYW5nZXM=\nbody=UmVhZHkgZm9yIHJldmlldw==\n",
 			}},
 		}}},
 	}
@@ -143,7 +107,7 @@ func TestRunPublisherJobReturnsCompletedTerminationResult(t *testing.T) {
 	result, err := client.RunPublisherJob(context.Background(), request)
 	require.NoError(t, err)
 
-	want := PublisherJobResult{Branch: "yar/review", CommitSHA: "9a4484441215661904e02a807adf5034d13f5bbe"}
+	want := PublisherJobResult{Branch: "yar/review", CommitSHA: "9a4484441215661904e02a807adf5034d13f5bbe", Title: "Review changes", Body: "Ready for review"}
 	assert.Equal(t, want, result)
 }
 
@@ -200,7 +164,7 @@ func TestCreatePublisherJobRestrictsWorkspaceAndExecution(t *testing.T) {
 
 	workspace := volumeNamed(t, pod.Volumes, "workspace")
 	require.NotNil(t, workspace.PersistentVolumeClaim)
-	assert.Equal(t, "workspace-review", workspace.PersistentVolumeClaim.ClaimName)
+	assert.Equal(t, "session-review", workspace.PersistentVolumeClaim.ClaimName)
 	assert.True(t, workspace.PersistentVolumeClaim.ReadOnly)
 
 	tmp := volumeNamed(t, pod.Volumes, "tmp")
@@ -228,37 +192,21 @@ func TestDeletePublisherJobRemovesExistingJob(t *testing.T) {
 }
 
 func TestParsePublisherJobResultReadsTerminationContract(t *testing.T) {
-	result := parsePublisherJobResult("branch=yar/KARGO-123-description\ncommit=7e79cf1ec3840a9340bc9fa07d2ca96c514142d4\n")
+	result := parsePublisherJobResult("branch=yar/KARGO-123-description\ncommit=7e79cf1ec3840a9340bc9fa07d2ca96c514142d4\ntitle=S0FSR08tMTIzOiBmaXg=\nbody=Rml4ZXMgdGhlIGJ1Zw==\n")
 	assert.Equal(t, PublisherJobResult{
 		Branch:    "yar/KARGO-123-description",
 		CommitSHA: "7e79cf1ec3840a9340bc9fa07d2ca96c514142d4",
+		Title:     "KARGO-123: fix",
+		Body:      "Fixes the bug",
 	}, result)
 }
 
-func TestResumeSessionRefusesAnActivePublisherJob(t *testing.T) {
-	replicas := int32(0)
-	publisher := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "example-publish", Namespace: "coding-agents"}}
-	session := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "coding-agents"},
-		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
-	}
-	clientset := fake.NewSimpleClientset(publisher, session)
-	client := &Client{typed: clientset, stdout: io.Discard}
-	err := client.ResumeSession(context.Background(), "coding-agents", "example")
-	require.ErrorContains(t, err, "cannot resume while publisher Job example-publish is active")
-
-	got, err := clientset.AppsV1().StatefulSets("coding-agents").Get(context.Background(), "example", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.NotNil(t, got.Spec.Replicas)
-	assert.Zero(t, *got.Spec.Replicas)
-}
-
-func publishableSessionPod(mode string) corev1.PodTemplateSpec {
+func publishableSessionPod(storage string) corev1.PodTemplateSpec {
 	return corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
 		Name:  "agent",
 		Image: "coding-agent:test",
 		Env: []corev1.EnvVar{
-			{Name: "AGENT_MODE", Value: mode},
+			{Name: "AGENT_STORAGE", Value: storage},
 			{Name: "AGENT_REPOSITORY", Value: "https://github.com/lokalise/kargo.git"},
 			{Name: "AGENT_REF", Value: "main"},
 		},
@@ -267,8 +215,20 @@ func publishableSessionPod(mode string) corev1.PodTemplateSpec {
 
 func boundWorkspaceClaim() *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "workspace-review", Namespace: "coding-agents"},
+		ObjectMeta: metav1.ObjectMeta{Name: "session-review", Namespace: "coding-agents"},
 		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+}
+
+func completedTaskPod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "review-pod", Namespace: "coding-agents", Labels: map[string]string{"coding-agent/session": "review"}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "agent",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				Message: "outcome=eyJzdGF0dXMiOiJjb21wbGV0ZWQiLCJzdW1tYXJ5IjoiZG9uZSIsImJsb2NrZXIiOiIifQ==\n",
+			}},
+		}}},
 	}
 }
 
@@ -284,7 +244,7 @@ func validPublisherJobRequest() PublisherJobRequest {
 		AuthorName:     "yar",
 		AuthorEmail:    "12345+yar@users.noreply.github.com",
 		Image:          "coding-agent:test",
-		WorkspaceClaim: "workspace-review",
+		WorkspaceClaim: "session-review",
 		Timeout:        2 * time.Minute,
 	}
 }

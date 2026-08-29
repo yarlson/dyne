@@ -2,20 +2,15 @@ package kubernetes
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
-	"sync"
-	"syscall"
-	"time"
 
-	"golang.org/x/term"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,21 +20,17 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
 
-	"coding-agent-k8s/internal/sessionmanifest"
+	"github.com/yarlson/airlock/internal/sessionmanifest"
 )
 
-const fieldManagerName = "agentctl"
+const fieldManagerName = "airlock"
 
 // Client applies and manages coding-agent resources through the Kubernetes API.
 type Client struct {
@@ -47,18 +38,39 @@ type Client struct {
 	typed   clientset.Interface
 	dynamic dynamic.Interface
 	mapper  meta.RESTMapper
-	stdin   io.Reader
 	stdout  io.Writer
-	stderr  io.Writer
+}
+
+// SessionDefinition contains the retained inputs needed to continue a persistent session.
+type SessionDefinition struct {
+	// Image runs the session task.
+	Image string
+	// Repository is the Git repository stored in the workspace.
+	Repository string
+	// InitialRef is the session's original Git ref.
+	InitialRef string
+	// SetupCommand prepares the retained workspace before each task.
+	SetupCommand string
+	// CloneDepth is the Git history depth used for the initial clone.
+	CloneDepth int
+	// StorageSize is the size of the retained session claim.
+	StorageSize string
 }
 
 // New returns a client configured from the standard kubeconfig loading rules and the supplied streams.
 func New(contextName string, stdin io.Reader, stdout, stderr io.Writer) (*Client, error) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
-	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides).ClientConfig()
+	config, err := loadKubeconfig("", contextName)
 	if err != nil {
-		return nil, fmt.Errorf("load Kubernetes configuration: %w", err)
+		return nil, err
+	}
+
+	return NewForConfig(config, stdin, stdout, stderr)
+}
+
+// NewForConfig returns a client that uses server-owned Kubernetes credentials.
+func NewForConfig(config *rest.Config, stdin io.Reader, stdout, stderr io.Writer) (*Client, error) {
+	if config == nil {
+		return nil, errors.New("kubernetes configuration is required")
 	}
 
 	typed, err := clientset.NewForConfig(config)
@@ -78,9 +90,7 @@ func New(contextName string, stdin io.Reader, stdout, stderr io.Writer) (*Client
 		typed:   typed,
 		dynamic: dynamicClient,
 		mapper:  mapper,
-		stdin:   stdin,
 		stdout:  stdout,
-		stderr:  stderr,
 	}, nil
 }
 
@@ -100,32 +110,115 @@ func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	return nil
 }
 
-// CheckSessionModeAvailable returns an error when another workload kind already owns the session name.
-func (c *Client) CheckSessionModeAvailable(ctx context.Context, namespace, name string, mode sessionmanifest.Mode) error {
-	switch mode {
-	case sessionmanifest.ModeLong:
-		_, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err == nil {
-			return fmt.Errorf("job %s already exists; delete it before starting a long session", name)
-		}
+// CheckSessionAvailable returns an error when any Job or claim already owns the session name.
+func (c *Client) CheckSessionAvailable(ctx context.Context, namespace, name string) error {
+	selector := sessionSelector(name)
+	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("check session Jobs: %w", err)
+	}
 
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("check session Job %s: %w", name, err)
-		}
-	case sessionmanifest.ModeExplore, sessionmanifest.ModeUpdate:
-		_, err := c.typed.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err == nil {
-			return fmt.Errorf("StatefulSet %s already exists; delete it before starting a bounded session", name)
-		}
+	claims, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("check session PersistentVolumeClaims: %w", err)
+	}
 
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("check session StatefulSet %s: %w", name, err)
-		}
-	default:
-		return fmt.Errorf("unsupported session mode %q", mode)
+	if len(jobs.Items) > 0 || len(claims.Items) > 0 {
+		return fmt.Errorf("session %s already exists", name)
 	}
 
 	return nil
+}
+
+// SetGitHubToken stores the short-lived repository credential used by clone and publisher workloads.
+func (c *Client) SetGitHubToken(ctx context.Context, namespace, token string) error {
+	if strings.TrimSpace(token) == "" {
+		return errors.New("GitHub installation token is required")
+	}
+
+	secrets := c.typed.CoreV1().Secrets(namespace)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		secret, err := secrets.Get(ctx, sessionmanifest.GitHubTokenSecretName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			_, err = secrets.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: sessionmanifest.GitHubTokenSecretName, Namespace: namespace},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"token": []byte(token)},
+			}, metav1.CreateOptions{})
+
+			return err
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if secret.Data == nil {
+			secret.Data = make(map[string][]byte)
+		}
+
+		secret.Data["token"] = []byte(token)
+		_, err = secrets.Update(ctx, secret, metav1.UpdateOptions{})
+
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("store GitHub installation token: %w", err)
+	}
+
+	return nil
+}
+
+// PersistentSessionDefinition returns continuation inputs after confirming that no task is active.
+func (c *Client) PersistentSessionDefinition(ctx context.Context, namespace, name string) (SessionDefinition, error) {
+	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(name)})
+	if err != nil {
+		return SessionDefinition{}, fmt.Errorf("list session Jobs: %w", err)
+	}
+
+	for i := range jobs.Items {
+		if jobs.Items[i].Status.Active > 0 {
+			return SessionDefinition{}, fmt.Errorf("session %s already has an active task", name)
+		}
+	}
+
+	publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
+	if err == nil && !jobComplete(publisher) && !jobFailed(publisher) {
+		return SessionDefinition{}, fmt.Errorf("session %s has an active publisher", name)
+	}
+
+	if err != nil && !apierrors.IsNotFound(err) {
+		return SessionDefinition{}, fmt.Errorf("check publisher Job: %w", err)
+	}
+
+	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionmanifest.SessionClaimName(name), metav1.GetOptions{})
+	if err != nil {
+		return SessionDefinition{}, fmt.Errorf("get session PersistentVolumeClaim: %w", err)
+	}
+
+	if claim.Status.Phase != corev1.ClaimBound {
+		return SessionDefinition{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
+	}
+
+	cloneDepth, err := strconv.Atoi(claim.Annotations["airlock.yarlson.dev/clone-depth"])
+	if err != nil || cloneDepth < 0 {
+		return SessionDefinition{}, errors.New("session has an invalid clone depth")
+	}
+
+	image := claim.Annotations["airlock.yarlson.dev/image"]
+	initialRef := claim.Annotations["airlock.yarlson.dev/initial-ref"]
+	if image == "" || initialRef == "" {
+		return SessionDefinition{}, errors.New("session PersistentVolumeClaim has an incomplete definition")
+	}
+
+	return SessionDefinition{
+		Image:        image,
+		Repository:   claim.Annotations["airlock.yarlson.dev/repository"],
+		InitialRef:   initialRef,
+		SetupCommand: claim.Annotations["airlock.yarlson.dev/setup"],
+		CloneDepth:   cloneDepth,
+		StorageSize:  claim.Spec.Resources.Requests.Storage().String(),
+	}, nil
 }
 
 func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstructured) error {
@@ -178,17 +271,20 @@ type ResourceStatus struct {
 	State string
 }
 
+// TaskArtifacts contains the validated result files reported by the latest task Pod.
+type TaskArtifacts struct {
+	// Outcome is the task's completed, blocked, or failed result.
+	Outcome json.RawMessage
+	// PullRequest is the proposed pull request metadata for completed work.
+	PullRequest json.RawMessage
+}
+
 // SessionStatus returns the workloads, Pods, and claims owned by a session.
 func (c *Client) SessionStatus(ctx context.Context, namespace, session string) ([]ResourceStatus, error) {
 	selector := sessionSelector(session)
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return nil, fmt.Errorf("list Jobs: %w", err)
-	}
-
-	sets, err := c.typed.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return nil, fmt.Errorf("list StatefulSets: %w", err)
 	}
 
 	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
@@ -201,13 +297,9 @@ func (c *Client) SessionStatus(ctx context.Context, namespace, session string) (
 		return nil, fmt.Errorf("list PersistentVolumeClaims: %w", err)
 	}
 
-	resources := make([]ResourceStatus, 0, len(jobs.Items)+len(sets.Items)+len(pods.Items)+len(claims.Items))
+	resources := make([]ResourceStatus, 0, len(jobs.Items)+len(pods.Items)+len(claims.Items))
 	for i := range jobs.Items {
 		resources = append(resources, jobResourceStatus(&jobs.Items[i]))
-	}
-
-	for i := range sets.Items {
-		resources = append(resources, statefulSetResourceStatus(&sets.Items[i]))
 	}
 
 	for i := range pods.Items {
@@ -226,8 +318,8 @@ func (c *Client) SessionStatus(ctx context.Context, namespace, session string) (
 	return resources, nil
 }
 
-// StreamPodLogs streams one container's logs to the client's output.
-func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container string, follow bool) (result error) {
+// StreamPodLogs writes one container's logs to the supplied output.
+func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container string, follow bool, output io.Writer) (result error) {
 	stream, err := c.typed.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
 		Container: container,
 		Follow:    follow,
@@ -241,99 +333,9 @@ func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container st
 			result = errors.Join(result, fmt.Errorf("close logs for Pod %s: %w", pod, err))
 		}
 	}()
-	if _, err := io.Copy(c.stdout, stream); err != nil {
+	if _, err := io.Copy(output, stream); err != nil {
 		return fmt.Errorf("stream logs for Pod %s: %w", pod, err)
 	}
-
-	return nil
-}
-
-// ExecPod runs a command in a Pod container and optionally connects the local terminal.
-func (c *Client) ExecPod(ctx context.Context, namespace, pod, container string, command []string, interactive bool) (result error) {
-	request := c.typed.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(pod).
-		Namespace(namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   command,
-			Stdin:     interactive,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       interactive,
-		}, scheme.ParameterCodec)
-	executor, err := remotecommand.NewSPDYExecutor(c.config, "POST", request.URL())
-	if err != nil {
-		return fmt.Errorf("create executor for Pod %s: %w", pod, err)
-	}
-
-	options := remotecommand.StreamOptions{Stdout: c.stdout, Stderr: c.stderr, Tty: interactive}
-	if interactive {
-		terminal, ok := c.stdin.(*os.File)
-		if !ok || !term.IsTerminal(int(terminal.Fd())) {
-			return errors.New("interactive shell requires a terminal")
-		}
-
-		state, err := term.MakeRaw(int(terminal.Fd()))
-		if err != nil {
-			return fmt.Errorf("enable raw terminal mode: %w", err)
-		}
-
-		defer func() {
-			if err := term.Restore(int(terminal.Fd()), state); err != nil {
-				result = errors.Join(result, fmt.Errorf("restore terminal mode: %w", err))
-			}
-		}()
-		sizes := newTerminalSizeQueue(terminal)
-		defer sizes.Stop()
-		options.Stdin = c.stdin
-		options.TerminalSizeQueue = sizes
-	}
-
-	if err := executor.StreamWithContext(ctx, options); err != nil {
-		return fmt.Errorf("execute command in Pod %s: %w", pod, err)
-	}
-
-	return nil
-}
-
-// StopSession scales a long session to zero while retaining its storage.
-func (c *Client) StopSession(ctx context.Context, namespace, name string) error {
-	return c.scaleSession(ctx, namespace, name, 0)
-}
-
-// ResumeSession starts a stopped long session unless its publisher is active.
-func (c *Client) ResumeSession(ctx context.Context, namespace, name string) error {
-	publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
-	if err == nil && !jobComplete(publisher) && !jobFailed(publisher) {
-		return fmt.Errorf("cannot resume while publisher Job %s is active", publisher.Name)
-	}
-
-	if err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("check publisher Job before resume: %w", err)
-	}
-
-	return c.scaleSession(ctx, namespace, name, 1)
-}
-
-func (c *Client) scaleSession(ctx context.Context, namespace, name string, replicas int32) error {
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		scale, err := c.typed.AppsV1().StatefulSets(namespace).GetScale(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-
-		scale.Spec.Replicas = replicas
-		_, err = c.typed.AppsV1().StatefulSets(namespace).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
-
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("scale StatefulSet %s: %w", name, err)
-	}
-
-	_, _ = fmt.Fprintf(c.stdout, "statefulset/%s scaled to %d\n", name, replicas)
 
 	return nil
 }
@@ -362,7 +364,7 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 	}
 
 	var deleteErrors []error
-	for _, claim := range []string{sessionmanifest.WorkspaceClaimName(name), sessionmanifest.HomeClaimName(name), sessionmanifest.CodexClaimName(name)} {
+	for _, claim := range []string{sessionmanifest.SessionClaimName(name)} {
 		err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{})
 		if apierrors.IsNotFound(err) {
 			continue
@@ -383,65 +385,29 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name string) error {
 	propagation := metav1.DeletePropagationBackground
 	options := metav1.DeleteOptions{PropagationPolicy: &propagation}
-	deletions := []struct {
-		kind   string
-		remove func() error
-	}{
-		{kind: "job", remove: func() error { return c.typed.BatchV1().Jobs(namespace).Delete(ctx, name, options) }},
-		{kind: "statefulset", remove: func() error {
-			return c.typed.AppsV1().StatefulSets(namespace).Delete(ctx, name, options)
-		}},
-		{kind: "service", remove: func() error { return c.typed.CoreV1().Services(namespace).Delete(ctx, name, options) }},
+	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionSelector(name)})
+	if err != nil {
+		return fmt.Errorf("list session Jobs for deletion: %w", err)
 	}
+
 	var deleteErrors []error
-	for _, deletion := range deletions {
-		err := deletion.remove()
+	for i := range jobs.Items {
+		jobName := jobs.Items[i].Name
+		err := c.typed.BatchV1().Jobs(namespace).Delete(ctx, jobName, options)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
 
 		if err != nil {
-			deleteErrors = append(deleteErrors, fmt.Errorf("delete %s %s: %w", deletion.kind, name, err))
+			deleteErrors = append(deleteErrors, fmt.Errorf("delete Job %s: %w", jobName, err))
 
 			continue
 		}
 
-		_, _ = fmt.Fprintf(c.stdout, "%s/%s deleted\n", deletion.kind, name)
+		_, _ = fmt.Fprintf(c.stdout, "job/%s deleted\n", jobName)
 	}
 
 	return errors.Join(deleteErrors...)
-}
-
-// WaitForReadyPod waits until the newest Pod for a session is ready and returns its name.
-func (c *Client) WaitForReadyPod(ctx context.Context, namespace, session string, timeout time.Duration) (string, error) {
-	var podName string
-	err := wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		pod, err := c.newestSessionPod(ctx, namespace, session)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-
-			return false, err
-		}
-
-		if pod.Status.Phase == corev1.PodFailed {
-			return false, fmt.Errorf("pod %s failed", pod.Name)
-		}
-
-		if podReady(pod) {
-			podName = pod.Name
-
-			return true, nil
-		}
-
-		return false, nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("wait for session %s Pod: %w", session, err)
-	}
-
-	return podName, nil
 }
 
 // NewestPodName returns the name of the newest Pod owned by a session.
@@ -454,8 +420,54 @@ func (c *Client) NewestPodName(ctx context.Context, namespace, session string) (
 	return pod.Name, nil
 }
 
+// SessionArtifacts returns the result files reported by the newest terminated task Pod.
+func (c *Client) SessionArtifacts(ctx context.Context, namespace, session string) (TaskArtifacts, error) {
+	pod, err := c.newestSessionPod(ctx, namespace, session)
+	if err != nil {
+		return TaskArtifacts{}, err
+	}
+
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != "agent" || status.State.Terminated == nil {
+			continue
+		}
+
+		return parseTaskArtifacts(status.State.Terminated.Message)
+	}
+
+	return TaskArtifacts{}, fmt.Errorf("session Pod %s has no terminated agent result", pod.Name)
+}
+
+func parseTaskArtifacts(message string) (TaskArtifacts, error) {
+	var result TaskArtifacts
+	for _, line := range strings.Split(message, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+
+		contents, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || !json.Valid(contents) {
+			return TaskArtifacts{}, fmt.Errorf("task artifact %s is invalid", key)
+		}
+
+		switch key {
+		case "outcome":
+			result.Outcome = contents
+		case "pull-request":
+			result.PullRequest = contents
+		}
+	}
+
+	if len(result.Outcome) == 0 {
+		return TaskArtifacts{}, errors.New("task did not report an outcome artifact")
+	}
+
+	return result, nil
+}
+
 func (c *Client) newestSessionPod(ctx context.Context, namespace, session string) (*corev1.Pod, error) {
-	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionSelector(session)})
+	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(session)})
 	if err != nil {
 		return nil, fmt.Errorf("list session %s Pods: %w", session, err)
 	}
@@ -465,6 +477,10 @@ func (c *Client) newestSessionPod(ctx context.Context, namespace, session string
 	}
 
 	sort.Slice(pods.Items, func(i, j int) bool {
+		if pods.Items[i].CreationTimestamp.Equal(&pods.Items[j].CreationTimestamp) {
+			return pods.Items[i].Name > pods.Items[j].Name
+		}
+
 		return pods.Items[i].CreationTimestamp.After(pods.Items[j].CreationTimestamp.Time)
 	})
 
@@ -473,6 +489,10 @@ func (c *Client) newestSessionPod(ctx context.Context, namespace, session string
 
 func sessionSelector(session string) string {
 	return labels.Set{"coding-agent/session": session}.AsSelector().String()
+}
+
+func sessionTaskSelector(session string) string {
+	return sessionSelector(session) + ",coding-agent/component!=publisher"
 }
 
 func jobResourceStatus(job *batchv1.Job) ResourceStatus {
@@ -486,32 +506,6 @@ func jobResourceStatus(job *batchv1.Job) ResourceStatus {
 	}
 
 	return ResourceStatus{Kind: "Job", Name: job.Name, Ready: fmt.Sprintf("%d/1", job.Status.Succeeded), State: status}
-}
-
-func statefulSetResourceStatus(set *appsv1.StatefulSet) ResourceStatus {
-	desired := int32(0)
-	if set.Spec.Replicas != nil {
-		desired = *set.Spec.Replicas
-	}
-
-	return ResourceStatus{
-		Kind:  "StatefulSet",
-		Name:  set.Name,
-		Ready: fmt.Sprintf("%d/%d", set.Status.ReadyReplicas, desired),
-		State: statefulSetStatus(set, desired),
-	}
-}
-
-func statefulSetStatus(set *appsv1.StatefulSet, desired int32) string {
-	if desired == 0 {
-		return "Stopped"
-	}
-
-	if set.Status.ReadyReplicas == desired {
-		return "Ready"
-	}
-
-	return "Pending"
 }
 
 func podResourceStatus(pod *corev1.Pod) ResourceStatus {
@@ -531,44 +525,4 @@ func podReady(pod *corev1.Pod) bool {
 	}
 
 	return false
-}
-
-type terminalSizeQueue struct {
-	terminal *os.File
-	resize   chan os.Signal
-	stop     chan struct{}
-	once     sync.Once
-}
-
-func newTerminalSizeQueue(terminal *os.File) *terminalSizeQueue {
-	queue := &terminalSizeQueue{
-		terminal: terminal,
-		resize:   make(chan os.Signal, 1),
-		stop:     make(chan struct{}),
-	}
-	signal.Notify(queue.resize, syscall.SIGWINCH)
-	queue.resize <- syscall.SIGWINCH
-
-	return queue
-}
-
-func (q *terminalSizeQueue) Next() *remotecommand.TerminalSize {
-	select {
-	case <-q.stop:
-		return nil
-	case <-q.resize:
-		width, height, err := term.GetSize(int(q.terminal.Fd()))
-		if err != nil || width <= 0 || height <= 0 || width > 65535 || height > 65535 {
-			return nil
-		}
-
-		return &remotecommand.TerminalSize{Width: uint16(width), Height: uint16(height)}
-	}
-}
-
-func (q *terminalSizeQueue) Stop() {
-	q.once.Do(func() {
-		signal.Stop(q.resize)
-		close(q.stop)
-	})
 }

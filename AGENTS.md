@@ -33,23 +33,27 @@ Before implementation, report the existing pattern, how the change will follow i
 
 ## Architecture
 
-`internal/codingsession` is the entrypoint-neutral product boundary. The CLI and any future in-repository entrypoint use its requests and results instead of lower-level Kubernetes, GitHub, publishing, or manifest types.
+`pkg/agentsandbox` is the entrypoint-neutral product boundary. The HTTP server uses its requests and results instead of lower-level Kubernetes, GitHub, publishing, or manifest types.
 
-- `cmd/agentctl` owns flags, environment and file input, terminal streams, output formatting, signal handling, and process exit. It imports only `internal/codingsession`.
-- `internal/codingsession` owns complete session operations: bootstrap, start, status, logs, tasks, shell access, stop, resume, delete, destroy, and publish. It hides sequencing and translates lower-level results into coding-session contracts.
-- `internal/sessionmanifest` validates session specifications and renders Kubernetes resources for explore, update, and long sessions without contacting a cluster.
-- `internal/kubernetes` owns kubeconfig loading, Kubernetes API operations, execution streams, resource status, lifecycle changes, and publisher Jobs. It does not own CLI parsing or pull-request policy.
+- `cmd/airlock` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
+- `internal/controlplane` owns the private HTTP contract for sessions, tasks, logs, artifacts, publishing, and deletion.
+- `pkg/agentsandbox` owns complete session operations and translates lower-level results into entrypoint-neutral contracts.
+- `internal/sessionmanifest` validates session specifications and renders ephemeral and persistent Job resources without contacting a cluster.
+- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; Kubernetes API operations; resource status; retained definitions; and publisher Jobs.
 - `internal/publish` owns publish eligibility, intent identity, branch ownership, retry recovery, pull-request sequencing, and publisher cleanup.
-- `internal/github` owns supported GitHub repository URLs, authenticated commit identity, branch visibility, and pull-request API operations.
-- `container/` owns the runtime image and entrypoint. It prepares workspaces, runs setup commands and Codex tasks, keeps long sessions idle, and publishes through a clean clone.
+- `internal/github` owns GitHub App installation authentication, supported repository URLs, commit identity, branch visibility, and pull-request operations.
+- `container/` owns the runtime image and entrypoint. It prepares workspaces, runs bounded Codex tasks, validates result artifacts, and publishes through a clean clone.
 
 Keep dependencies directional:
 
 ```text
-cmd/agentctl -> internal/codingsession
-internal/codingsession -> internal/sessionmanifest
-internal/codingsession -> internal/kubernetes
-internal/codingsession -> internal/publish
+cmd/airlock -> internal/controlplane
+cmd/airlock -> internal/github
+cmd/airlock -> pkg/agentsandbox
+internal/controlplane -> pkg/agentsandbox
+pkg/agentsandbox -> internal/sessionmanifest
+pkg/agentsandbox -> internal/kubernetes
+pkg/agentsandbox -> internal/publish
 internal/publish -> internal/kubernetes
 internal/publish -> internal/github
 internal/kubernetes -> internal/sessionmanifest
@@ -59,18 +63,17 @@ Do not bypass an owning module. Keep external SDK types inside their integration
 
 ## Product and trust invariants
 
-- Explore sessions use temporary storage and cannot be published.
-- Update sessions retain workspace, tool-home, and Codex state after their bounded task.
-- Long sessions retain the same state across stop and resume.
-- `stop` scales a long session to zero and retains its state.
+- Ephemeral sessions use temporary storage and cannot continue or publish.
+- Persistent sessions retain workspace, tool-home, Codex state, artifacts, and their immutable definition on one PVC.
+- Every initial or continued task is a bounded Job. Only one task may be active per persistent session.
 - `delete` removes compute resources and retains persistent storage.
-- `destroy` removes compute resources and persistent storage.
-- Only a completed update session or stopped long session can be published.
+- `delete --storage` removes compute resources and persistent storage.
+- Only a successfully completed persistent session can be published.
 - Publishing is explicit, idempotent, non-force-pushing, and recoverable after an ambiguous outcome.
 
-The Pod is the command-execution boundary. The Colima setup is for trusted repositories in a private cluster, not hostile multi-tenant workloads.
+The Pod is the command-execution boundary. The setup is for trusted repositories in a private cluster, not hostile multi-tenant workloads. The HTTP API has no application authentication and must remain behind a private network boundary.
 
-GitHub credentials are available to clone and publisher containers, not the coding agent. Codex credentials are unavailable during repository setup. Prompts and setup commands are visible in Kubernetes workload specifications and must not contain secrets.
+Short-lived GitHub App installation credentials are available to clone and publisher containers, not the coding agent. Codex credentials are unavailable during repository setup. Prompts and setup commands are visible in Kubernetes workload specifications and must not contain secrets.
 
 Kubernetes and GitHub are external integration boundaries. Docker and Colima build and host the local runtime image. These tools stay outside the product API, and ordinary Go tests do not require them.
 
@@ -89,7 +92,7 @@ Kubernetes and GitHub are external integration boundaries. Docker and Colima bui
 - Prefer the standard library and existing dependencies. Add a module only when it materially reduces current complexity or risk.
 - Never invoke `kubectl` from product code. Kubernetes access goes through `client-go` in `internal/kubernetes`.
 
-The repository uses gofumpt, goimports, and gci through golangci-lint. Imports are grouped as standard library, external packages, then `coding-agent-k8s` packages. Separate a return or branch from preceding work, but keep a function containing only that return compact. Add a blank line after a block before the next statement. `make fmt-check` verifies formatting without changing files; `make check` runs the same check in CI.
+The repository uses gofumpt, goimports, and gci through golangci-lint. Imports are grouped as standard library, external packages, then `github.com/yarlson/airlock` packages. Separate a return or branch from preceding work, but keep a function containing only that return compact. Add a blank line after a block before the next statement. `make fmt-check` verifies formatting without changing files; `make check` runs the same check in CI.
 
 ## Tests
 
