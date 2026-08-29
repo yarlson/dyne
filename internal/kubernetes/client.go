@@ -12,10 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"text/tabwriter"
 	"time"
-
-	"coding-agent-k8s/internal/agent"
 
 	"golang.org/x/term"
 	appsv1 "k8s.io/api/apps/v1"
@@ -38,6 +35,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
+
+	"coding-agent-k8s/internal/sessionmanifest"
 )
 
 const fieldManagerName = "agentctl"
@@ -53,31 +52,35 @@ type Client struct {
 	stderr  io.Writer
 }
 
-// New returns a client configured from the standard kubeconfig loading rules.
-func New(contextName string) (*Client, error) {
+// New returns a client configured from the standard kubeconfig loading rules and the supplied streams.
+func New(contextName string, stdin io.Reader, stdout, stderr io.Writer) (*Client, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
 	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("load Kubernetes configuration: %w", err)
 	}
+
 	typed, err := clientset.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("create Kubernetes client: %w", err)
 	}
+
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("create Kubernetes dynamic client: %w", err)
 	}
+
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(typed.Discovery()))
+
 	return &Client{
 		config:  config,
 		typed:   typed,
 		dynamic: dynamicClient,
 		mapper:  mapper,
-		stdin:   os.Stdin,
-		stdout:  os.Stdout,
-		stderr:  os.Stderr,
+		stdin:   stdin,
+		stdout:  stdout,
+		stderr:  stderr,
 	}, nil
 }
 
@@ -87,36 +90,41 @@ func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	if err := json.Unmarshal(manifest, &list); err != nil {
 		return fmt.Errorf("decode resource list: %w", err)
 	}
+
 	for i := range list.Items {
 		if err := c.applyResource(ctx, &list.Items[i]); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
 // CheckSessionModeAvailable returns an error when another workload kind already owns the session name.
-func (c *Client) CheckSessionModeAvailable(ctx context.Context, namespace, name string, mode agent.Mode) error {
+func (c *Client) CheckSessionModeAvailable(ctx context.Context, namespace, name string, mode sessionmanifest.Mode) error {
 	switch mode {
-	case agent.ModeLong:
+	case sessionmanifest.ModeLong:
 		_, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
 			return fmt.Errorf("job %s already exists; delete it before starting a long session", name)
 		}
+
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("check session Job %s: %w", name, err)
 		}
-	case agent.ModeExplore, agent.ModeUpdate:
+	case sessionmanifest.ModeExplore, sessionmanifest.ModeUpdate:
 		_, err := c.typed.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
 			return fmt.Errorf("StatefulSet %s already exists; delete it before starting a bounded session", name)
 		}
+
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("check session StatefulSet %s: %w", name, err)
 		}
 	default:
 		return fmt.Errorf("unsupported session mode %q", mode)
 	}
+
 	return nil
 }
 
@@ -124,22 +132,27 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	if resource.GetName() == "" {
 		return fmt.Errorf("apply %s: resource name is required", resource.GroupVersionKind().String())
 	}
+
 	mapping, err := c.mapper.RESTMapping(resource.GroupVersionKind().GroupKind(), resource.GroupVersionKind().Version)
 	if err != nil {
 		return fmt.Errorf("map %s: %w", resource.GroupVersionKind().String(), err)
 	}
+
 	client := c.dynamic.Resource(mapping.Resource)
 	var resourceClient dynamic.ResourceInterface = client
 	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
 		if resource.GetNamespace() == "" {
 			return fmt.Errorf("apply %s %s: namespace is required", resource.GetKind(), resource.GetName())
 		}
+
 		resourceClient = client.Namespace(resource.GetNamespace())
 	}
+
 	contents, err := json.Marshal(resource.Object)
 	if err != nil {
 		return fmt.Errorf("encode %s %s: %w", resource.GetKind(), resource.GetName(), err)
 	}
+
 	force := true
 	if _, err := resourceClient.Patch(ctx, resource.GetName(), types.ApplyPatchType, contents, metav1.PatchOptions{
 		FieldManager: fieldManagerName,
@@ -147,47 +160,70 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	}); err != nil {
 		return fmt.Errorf("apply %s %s: %w", resource.GetKind(), resource.GetName(), err)
 	}
+
 	_, _ = fmt.Fprintf(c.stdout, "%s/%s applied\n", strings.ToLower(resource.GetKind()), resource.GetName())
+
 	return nil
 }
 
-// WriteSessionStatus writes the workloads, Pods, and claims owned by a session to the client's output.
-func (c *Client) WriteSessionStatus(ctx context.Context, namespace, session string) error {
+// ResourceStatus describes the readiness and state of one Kubernetes resource.
+type ResourceStatus struct {
+	// Kind identifies the resource type.
+	Kind string
+	// Name identifies the resource.
+	Name string
+	// Ready reports current readiness against the desired count.
+	Ready string
+	// State reports the resource lifecycle state.
+	State string
+}
+
+// SessionStatus returns the workloads, Pods, and claims owned by a session.
+func (c *Client) SessionStatus(ctx context.Context, namespace, session string) ([]ResourceStatus, error) {
 	selector := sessionSelector(session)
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("list Jobs: %w", err)
+		return nil, fmt.Errorf("list Jobs: %w", err)
 	}
+
 	sets, err := c.typed.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("list StatefulSets: %w", err)
+		return nil, fmt.Errorf("list StatefulSets: %w", err)
 	}
+
 	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("list Pods: %w", err)
+		return nil, fmt.Errorf("list Pods: %w", err)
 	}
+
 	claims, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return fmt.Errorf("list PersistentVolumeClaims: %w", err)
+		return nil, fmt.Errorf("list PersistentVolumeClaims: %w", err)
 	}
-	output := tabwriter.NewWriter(c.stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(output, "KIND\tNAME\tREADY\tSTATUS")
+
+	resources := make([]ResourceStatus, 0, len(jobs.Items)+len(sets.Items)+len(pods.Items)+len(claims.Items))
 	for i := range jobs.Items {
-		writeJobStatus(output, &jobs.Items[i])
+		resources = append(resources, jobResourceStatus(&jobs.Items[i]))
 	}
+
 	for i := range sets.Items {
-		writeStatefulSetStatus(output, &sets.Items[i])
+		resources = append(resources, statefulSetResourceStatus(&sets.Items[i]))
 	}
+
 	for i := range pods.Items {
-		writePodStatus(output, &pods.Items[i])
+		resources = append(resources, podResourceStatus(&pods.Items[i]))
 	}
+
 	for i := range claims.Items {
-		_, _ = fmt.Fprintf(output, "PersistentVolumeClaim\t%s\t-\t%s\n", claims.Items[i].Name, claims.Items[i].Status.Phase)
+		resources = append(resources, ResourceStatus{
+			Kind:  "PersistentVolumeClaim",
+			Name:  claims.Items[i].Name,
+			Ready: "-",
+			State: string(claims.Items[i].Status.Phase),
+		})
 	}
-	if err := output.Flush(); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	return nil
+
+	return resources, nil
 }
 
 // StreamPodLogs streams one container's logs to the client's output.
@@ -199,6 +235,7 @@ func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container st
 	if err != nil {
 		return fmt.Errorf("open logs for Pod %s: %w", pod, err)
 	}
+
 	defer func() {
 		if err := stream.Close(); err != nil {
 			result = errors.Join(result, fmt.Errorf("close logs for Pod %s: %w", pod, err))
@@ -207,6 +244,7 @@ func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container st
 	if _, err := io.Copy(c.stdout, stream); err != nil {
 		return fmt.Errorf("stream logs for Pod %s: %w", pod, err)
 	}
+
 	return nil
 }
 
@@ -229,16 +267,19 @@ func (c *Client) ExecPod(ctx context.Context, namespace, pod, container string, 
 	if err != nil {
 		return fmt.Errorf("create executor for Pod %s: %w", pod, err)
 	}
+
 	options := remotecommand.StreamOptions{Stdout: c.stdout, Stderr: c.stderr, Tty: interactive}
 	if interactive {
 		terminal, ok := c.stdin.(*os.File)
 		if !ok || !term.IsTerminal(int(terminal.Fd())) {
 			return errors.New("interactive shell requires a terminal")
 		}
+
 		state, err := term.MakeRaw(int(terminal.Fd()))
 		if err != nil {
 			return fmt.Errorf("enable raw terminal mode: %w", err)
 		}
+
 		defer func() {
 			if err := term.Restore(int(terminal.Fd()), state); err != nil {
 				result = errors.Join(result, fmt.Errorf("restore terminal mode: %w", err))
@@ -249,9 +290,11 @@ func (c *Client) ExecPod(ctx context.Context, namespace, pod, container string, 
 		options.Stdin = c.stdin
 		options.TerminalSizeQueue = sizes
 	}
+
 	if err := executor.StreamWithContext(ctx, options); err != nil {
 		return fmt.Errorf("execute command in Pod %s: %w", pod, err)
 	}
+
 	return nil
 }
 
@@ -266,9 +309,11 @@ func (c *Client) ResumeSession(ctx context.Context, namespace, name string) erro
 	if err == nil && !jobComplete(publisher) && !jobFailed(publisher) {
 		return fmt.Errorf("cannot resume while publisher Job %s is active", publisher.Name)
 	}
+
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("check publisher Job before resume: %w", err)
 	}
+
 	return c.scaleSession(ctx, namespace, name, 1)
 }
 
@@ -278,14 +323,18 @@ func (c *Client) scaleSession(ctx context.Context, namespace, name string, repli
 		if err != nil {
 			return err
 		}
+
 		scale.Spec.Replicas = replicas
 		_, err = c.typed.AppsV1().StatefulSets(namespace).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+
 		return err
 	})
 	if err != nil {
 		return fmt.Errorf("scale StatefulSet %s: %w", name, err)
 	}
+
 	_, _ = fmt.Fprintf(c.stdout, "statefulset/%s scaled to %d\n", name, replicas)
+
 	return nil
 }
 
@@ -303,24 +352,31 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 	if err := c.deletePublisherJob(ctx, namespace, name); err != nil {
 		return err
 	}
+
 	if err := c.deleteSessionWorkloads(ctx, namespace, name); err != nil {
 		return err
 	}
+
 	if !deleteStorage {
 		return nil
 	}
+
 	var deleteErrors []error
-	for _, claim := range []string{agent.WorkspaceClaimName(name), agent.HomeClaimName(name), agent.CodexClaimName(name)} {
+	for _, claim := range []string{sessionmanifest.WorkspaceClaimName(name), sessionmanifest.HomeClaimName(name), sessionmanifest.CodexClaimName(name)} {
 		err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{})
 		if apierrors.IsNotFound(err) {
 			continue
 		}
+
 		if err != nil {
 			deleteErrors = append(deleteErrors, fmt.Errorf("delete PersistentVolumeClaim %s: %w", claim, err))
+
 			continue
 		}
+
 		_, _ = fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
 	}
+
 	return errors.Join(deleteErrors...)
 }
 
@@ -343,12 +399,16 @@ func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name str
 		if apierrors.IsNotFound(err) {
 			continue
 		}
+
 		if err != nil {
 			deleteErrors = append(deleteErrors, fmt.Errorf("delete %s %s: %w", deletion.kind, name, err))
+
 			continue
 		}
+
 		_, _ = fmt.Fprintf(c.stdout, "%s/%s deleted\n", deletion.kind, name)
 	}
+
 	return errors.Join(deleteErrors...)
 }
 
@@ -361,20 +421,26 @@ func (c *Client) WaitForReadyPod(ctx context.Context, namespace, session string,
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
+
 			return false, err
 		}
+
 		if pod.Status.Phase == corev1.PodFailed {
 			return false, fmt.Errorf("pod %s failed", pod.Name)
 		}
+
 		if podReady(pod) {
 			podName = pod.Name
+
 			return true, nil
 		}
+
 		return false, nil
 	})
 	if err != nil {
 		return "", fmt.Errorf("wait for session %s Pod: %w", session, err)
 	}
+
 	return podName, nil
 }
 
@@ -384,6 +450,7 @@ func (c *Client) NewestPodName(ctx context.Context, namespace, session string) (
 	if err != nil {
 		return "", err
 	}
+
 	return pod.Name, nil
 }
 
@@ -392,12 +459,15 @@ func (c *Client) newestSessionPod(ctx context.Context, namespace, session string
 	if err != nil {
 		return nil, fmt.Errorf("list session %s Pods: %w", session, err)
 	}
+
 	if len(pods.Items) == 0 {
 		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, session)
 	}
+
 	sort.Slice(pods.Items, func(i, j int) bool {
 		return pods.Items[i].CreationTimestamp.After(pods.Items[j].CreationTimestamp.Time)
 	})
+
 	return &pods.Items[0], nil
 }
 
@@ -405,7 +475,7 @@ func sessionSelector(session string) string {
 	return labels.Set{"coding-agent/session": session}.AsSelector().String()
 }
 
-func writeJobStatus(output io.Writer, job *batchv1.Job) {
+func jobResourceStatus(job *batchv1.Job) ResourceStatus {
 	status := "Running"
 	if job.Status.Succeeded > 0 {
 		status = "Complete"
@@ -414,33 +484,43 @@ func writeJobStatus(output io.Writer, job *batchv1.Job) {
 	} else if job.Status.Active == 0 {
 		status = "Pending"
 	}
-	_, _ = fmt.Fprintf(output, "Job\t%s\t%d/1\t%s\n", job.Name, job.Status.Succeeded, status)
+
+	return ResourceStatus{Kind: "Job", Name: job.Name, Ready: fmt.Sprintf("%d/1", job.Status.Succeeded), State: status}
 }
 
-func writeStatefulSetStatus(output io.Writer, set *appsv1.StatefulSet) {
+func statefulSetResourceStatus(set *appsv1.StatefulSet) ResourceStatus {
 	desired := int32(0)
 	if set.Spec.Replicas != nil {
 		desired = *set.Spec.Replicas
 	}
-	_, _ = fmt.Fprintf(output, "StatefulSet\t%s\t%d/%d\t%s\n", set.Name, set.Status.ReadyReplicas, desired, statefulSetStatus(set, desired))
+
+	return ResourceStatus{
+		Kind:  "StatefulSet",
+		Name:  set.Name,
+		Ready: fmt.Sprintf("%d/%d", set.Status.ReadyReplicas, desired),
+		State: statefulSetStatus(set, desired),
+	}
 }
 
 func statefulSetStatus(set *appsv1.StatefulSet, desired int32) string {
 	if desired == 0 {
 		return "Stopped"
 	}
+
 	if set.Status.ReadyReplicas == desired {
 		return "Ready"
 	}
+
 	return "Pending"
 }
 
-func writePodStatus(output io.Writer, pod *corev1.Pod) {
+func podResourceStatus(pod *corev1.Pod) ResourceStatus {
 	ready := "0/1"
 	if podReady(pod) {
 		ready = "1/1"
 	}
-	_, _ = fmt.Fprintf(output, "Pod\t%s\t%s\t%s\n", pod.Name, ready, pod.Status.Phase)
+
+	return ResourceStatus{Kind: "Pod", Name: pod.Name, Ready: ready, State: string(pod.Status.Phase)}
 }
 
 func podReady(pod *corev1.Pod) bool {
@@ -449,6 +529,7 @@ func podReady(pod *corev1.Pod) bool {
 			return condition.Status == corev1.ConditionTrue
 		}
 	}
+
 	return false
 }
 
@@ -467,6 +548,7 @@ func newTerminalSizeQueue(terminal *os.File) *terminalSizeQueue {
 	}
 	signal.Notify(queue.resize, syscall.SIGWINCH)
 	queue.resize <- syscall.SIGWINCH
+
 	return queue
 }
 
@@ -479,6 +561,7 @@ func (q *terminalSizeQueue) Next() *remotecommand.TerminalSize {
 		if err != nil || width <= 0 || height <= 0 || width > 65535 || height > 65535 {
 			return nil
 		}
+
 		return &remotecommand.TerminalSize{Width: uint16(width), Height: uint16(height)}
 	}
 }

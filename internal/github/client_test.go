@@ -31,9 +31,11 @@ func TestCreatePullRequestSendsDraftRequest(t *testing.T) {
 		if request.Method != http.MethodPost || request.URL.Path != "/repos/lokalise/kargo/pulls" {
 			t.Errorf("got %s %s", request.Method, request.URL.Path)
 		}
+
 		if request.Header.Get("Authorization") != "Bearer secret-token" {
 			t.Error("request does not use the GitHub token")
 		}
+
 		var body struct {
 			Title string `json:"title"`
 			Head  string `json:"head"`
@@ -44,9 +46,11 @@ func TestCreatePullRequestSendsDraftRequest(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
+
 		if body.Title != "Improve delivery" || body.Head != "yar/improve-delivery" || body.Base != "main" || body.Body != "PR details" || !body.Draft {
 			t.Errorf("got request body %#v", body)
 		}
+
 		response.Header().Set("Content-Type", "application/json")
 		_, _ = response.Write([]byte(`{"number":42,"html_url":"https://github.com/lokalise/kargo/pull/42"}`))
 	}))
@@ -56,6 +60,7 @@ func TestCreatePullRequestSendsDraftRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if pull.Number != 42 || pull.URL != "https://github.com/lokalise/kargo/pull/42" {
 		t.Fatalf("got pull request %#v", pull)
 	}
@@ -66,6 +71,7 @@ func TestCommitAuthorUsesAuthenticatedGitHubIdentity(t *testing.T) {
 		if request.Method != http.MethodGet || request.URL.Path != "/user" {
 			t.Errorf("got %s %s", request.Method, request.URL.Path)
 		}
+
 		response.Header().Set("Content-Type", "application/json")
 		_, _ = response.Write([]byte(`{"login":"yar","id":12345}`))
 	}))
@@ -75,6 +81,7 @@ func TestCommitAuthorUsesAuthenticatedGitHubIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if name != "yar" || email != "12345+yar@users.noreply.github.com" {
 		t.Fatalf("got commit identity %q <%s>", name, email)
 	}
@@ -85,6 +92,7 @@ func TestBranchCommitSHAPreservesNestedBranchName(t *testing.T) {
 		if request.RequestURI != "/repos/lokalise/kargo/git/ref/heads/yar/KARGO-123-description" {
 			t.Errorf("got request URI %s", request.RequestURI)
 		}
+
 		response.Header().Set("Content-Type", "application/json")
 		_, _ = response.Write([]byte(`{"object":{"sha":"7e79cf1ec3840a9340bc9fa07d2ca96c514142d4"}}`))
 	}))
@@ -94,6 +102,7 @@ func TestBranchCommitSHAPreservesNestedBranchName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !exists || commit != "7e79cf1ec3840a9340bc9fa07d2ca96c514142d4" {
 		t.Fatalf("got commit %q, exists %t", commit, exists)
 	}
@@ -111,6 +120,7 @@ func TestBranchCommitSHAReportsMissingBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if exists || commit != "" {
 		t.Fatalf("got commit %q, exists %t", commit, exists)
 	}
@@ -122,11 +132,14 @@ func TestWaitForOpenPullRequestHandlesDelayedVisibility(t *testing.T) {
 		if request.URL.Query().Get("state") != "open" || request.URL.Query().Get("head") != "lokalise:yar/change" || request.URL.Query().Get("base") != "main" || request.URL.Query().Get("per_page") != "2" {
 			t.Errorf("got query %s", request.URL.RawQuery)
 		}
+
 		response.Header().Set("Content-Type", "application/json")
 		if requests.Add(1) == 1 {
 			_, _ = response.Write([]byte(`[]`))
+
 			return
 		}
+
 		_, _ = response.Write([]byte(`[{"number":7,"html_url":"https://github.com/lokalise/kargo/pull/7"}]`))
 	}))
 	t.Cleanup(server.Close)
@@ -136,6 +149,7 @@ func TestWaitForOpenPullRequestHandlesDelayedVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if pull == nil || pull.Number != 7 {
 		t.Fatalf("got pull request %#v", pull)
 	}
@@ -147,11 +161,14 @@ func testClient(t *testing.T, serverURL string) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	baseURL, err := url.Parse(serverURL + "/")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	client.api.BaseURL = baseURL
+
 	return client
 }
 
@@ -161,5 +178,6 @@ func kargoRepository(t *testing.T) Repository {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return repository
 }

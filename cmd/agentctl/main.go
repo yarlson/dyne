@@ -9,18 +9,17 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
-	"coding-agent-k8s/internal/agent"
-	"coding-agent-k8s/internal/kubernetes"
-	"coding-agent-k8s/internal/publish"
+	"coding-agent-k8s/internal/codingsession"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -29,6 +28,7 @@ func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
+
 	switch args[0] {
 	case "bootstrap":
 		return bootstrap(ctx, args[1:])
@@ -60,34 +60,60 @@ func run(ctx context.Context, args []string) error {
 func bootstrap(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	namespace := set.String("namespace", codingsession.DefaultNamespace, "Kubernetes namespace")
 	authFile := set.String("auth-file", "", "Codex auth.json file")
 	apiKeyEnv := set.String("api-key-env", "", "environment variable containing a Codex API key")
 	githubTokenEnv := set.String("github-token-env", "", "environment variable containing a GitHub token")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
+
 	if *authFile != "" && *apiKeyEnv != "" {
 		return errors.New("use either --auth-file or --api-key-env")
 	}
-	manifest, err := agent.BootstrapManifest(*namespace, *authFile, *apiKeyEnv, *githubTokenEnv)
+
+	request := codingsession.BootstrapRequest{Namespace: *namespace}
+	if err := request.Validate(); err != nil {
+		return err
+	}
+
+	var err error
+	if *authFile != "" {
+		request.CodexAuthJSON, err = os.ReadFile(*authFile)
+		if err != nil {
+			return fmt.Errorf("read auth file: %w", err)
+		}
+	}
+
+	request.CodexAPIKey, err = environmentValue(*apiKeyEnv)
 	if err != nil {
 		return err
 	}
-	client, err := kubernetes.New(*contextName)
+
+	request.GitHubToken, err = environmentValue(*githubTokenEnv)
 	if err != nil {
 		return err
 	}
-	return client.Apply(ctx, manifest)
+
+	if err := request.Validate(); err != nil {
+		return err
+	}
+
+	control, err := newControl(*contextName)
+	if err != nil {
+		return err
+	}
+
+	return control.Bootstrap(ctx, request)
 }
 
 func start(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("start", flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	namespace := set.String("namespace", codingsession.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	mode := set.String("mode", "", "explore, update, or long")
-	image := set.String("image", agent.DefaultImage, "agent image")
+	image := set.String("image", codingsession.DefaultImage, "agent image")
 	repository := set.String("repo", "", "Git repository URL")
 	ref := set.String("ref", "main", "initial Git ref")
 	cloneDepth := set.Int("clone-depth", 1, "Git history depth; zero clones full history")
@@ -98,32 +124,29 @@ func start(ctx context.Context, args []string) error {
 	if err := set.Parse(args); err != nil {
 		return err
 	}
-	seconds := int64(timeout.Seconds())
-	sessionMode := agent.Mode(*mode)
-	manifest, err := agent.SessionManifest(agent.Session{
-		Name:           *name,
-		Namespace:      *namespace,
-		Image:          *image,
-		Mode:           sessionMode,
-		Repository:     *repository,
-		InitialRef:     *ref,
-		SetupCommand:   *setupCommand,
-		Prompt:         *prompt,
-		CloneDepth:     *cloneDepth,
-		StorageSize:    *storageSize,
-		TimeoutSeconds: seconds,
-	})
+
+	request := codingsession.StartRequest{
+		Target:       codingsession.Target{Namespace: *namespace, Name: *name},
+		Image:        *image,
+		Mode:         codingsession.Mode(*mode),
+		Repository:   *repository,
+		InitialRef:   *ref,
+		SetupCommand: *setupCommand,
+		Prompt:       *prompt,
+		CloneDepth:   *cloneDepth,
+		StorageSize:  *storageSize,
+		Timeout:      *timeout,
+	}
+	if err := request.Validate(); err != nil {
+		return err
+	}
+
+	control, err := newControl(*contextName)
 	if err != nil {
 		return err
 	}
-	client, err := kubernetes.New(*contextName)
-	if err != nil {
-		return err
-	}
-	if err := client.CheckSessionModeAvailable(ctx, *namespace, *name, sessionMode); err != nil {
-		return err
-	}
-	return client.Apply(ctx, manifest)
+
+	return control.Start(ctx, request)
 }
 
 func status(ctx context.Context, args []string) error {
@@ -131,58 +154,64 @@ func status(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return target.cluster.WriteSessionStatus(ctx, target.namespace, target.name)
+
+	result, err := target.control.Status(ctx, target.target)
+	if err != nil {
+		return err
+	}
+
+	return printStatus(result)
 }
 
 func logs(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("logs", flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	namespace := set.String("namespace", codingsession.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	follow := set.Bool("follow", false, "follow log output")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
+
 	if *name == "" {
 		return errors.New("--name is required")
 	}
-	client, err := kubernetes.New(*contextName)
+
+	control, err := newControl(*contextName)
 	if err != nil {
 		return err
 	}
-	pod, err := client.NewestPodName(ctx, *namespace, *name)
-	if err != nil {
-		return err
-	}
-	return client.StreamPodLogs(ctx, *namespace, pod, "agent", *follow)
+
+	return control.StreamLogs(ctx, codingsession.LogRequest{
+		Target: codingsession.Target{Namespace: *namespace, Name: *name},
+		Follow: *follow,
+	})
 }
 
 func task(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("task", flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	namespace := set.String("namespace", codingsession.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "long session name")
 	resume := set.Bool("resume-last", false, "resume the latest Codex thread")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
+
 	if *name == "" || set.NArg() != 1 {
 		return errors.New("task requires --name and one prompt argument")
 	}
-	client, err := kubernetes.New(*contextName)
+
+	control, err := newControl(*contextName)
 	if err != nil {
 		return err
 	}
-	pod, err := client.WaitForReadyPod(ctx, *namespace, *name, 120*time.Second)
-	if err != nil {
-		return err
-	}
-	command := []string{"/usr/local/bin/agent-entrypoint", "task"}
-	if *resume {
-		command = append(command, "--resume-last")
-	}
-	command = append(command, set.Arg(0))
-	return client.ExecPod(ctx, *namespace, pod, "agent", command, false)
+
+	return control.RunTask(ctx, codingsession.TaskRequest{
+		Target:     codingsession.Target{Namespace: *namespace, Name: *name},
+		Prompt:     set.Arg(0),
+		ResumeLast: *resume,
+	})
 }
 
 func shell(ctx context.Context, args []string) error {
@@ -190,17 +219,14 @@ func shell(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	pod, err := target.cluster.WaitForReadyPod(ctx, target.namespace, target.name, 120*time.Second)
-	if err != nil {
-		return err
-	}
-	return target.cluster.ExecPod(ctx, target.namespace, pod, "agent", []string{"bash"}, true)
+
+	return target.control.OpenShell(ctx, target.target)
 }
 
 func publishPullRequest(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("publish", flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	namespace := set.String("namespace", codingsession.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "completed or stopped session name")
 	branch := set.String("branch", "", "new remote branch name")
 	base := set.String("base", "", "pull request base branch; defaults to the session ref")
@@ -212,16 +238,18 @@ func publishPullRequest(ctx context.Context, args []string) error {
 	if err := set.Parse(args); err != nil {
 		return err
 	}
+
 	if strings.TrimSpace(*title) == "" {
 		*title = *commitMessage
 	}
+
 	body, err := readPullRequestBody(*bodyFile)
 	if err != nil {
 		return err
 	}
-	request := publish.Request{
-		Namespace:     *namespace,
-		Session:       *name,
+
+	request := codingsession.PublishRequest{
+		Target:        codingsession.Target{Namespace: *namespace, Name: *name},
 		Branch:        *branch,
 		BaseBranch:    *base,
 		CommitMessage: *commitMessage,
@@ -233,15 +261,19 @@ func publishPullRequest(ctx context.Context, args []string) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	cluster, err := kubernetes.New(*contextName)
+
+	control, err := newControl(*contextName)
 	if err != nil {
 		return err
 	}
-	result, err := publish.Run(ctx, cluster, request)
+
+	result, err := control.Publish(ctx, request)
 	if err != nil {
 		return err
 	}
+
 	printPublishResult(result)
+
 	return nil
 }
 
@@ -250,7 +282,8 @@ func stopSession(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return target.cluster.StopSession(ctx, target.namespace, target.name)
+
+	return target.control.Stop(ctx, target.target)
 }
 
 func resumeSession(ctx context.Context, args []string) error {
@@ -258,7 +291,8 @@ func resumeSession(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return target.cluster.ResumeSession(ctx, target.namespace, target.name)
+
+	return target.control.Resume(ctx, target.target)
 }
 
 func deleteSession(ctx context.Context, args []string) error {
@@ -266,7 +300,8 @@ func deleteSession(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return target.cluster.DeleteSession(ctx, target.namespace, target.name)
+
+	return target.control.Delete(ctx, target.target)
 }
 
 func destroySession(ctx context.Context, args []string) error {
@@ -274,31 +309,37 @@ func destroySession(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return target.cluster.DestroySession(ctx, target.namespace, target.name)
+
+	return target.control.Destroy(ctx, target.target)
 }
 
 type sessionTarget struct {
-	cluster   *kubernetes.Client
-	namespace string
-	name      string
+	control *codingsession.Control
+	target  codingsession.Target
 }
 
 func sessionTargetFromFlags(command string, args []string) (sessionTarget, error) {
 	set := flag.NewFlagSet(command, flag.ContinueOnError)
 	contextName := set.String("context", "", "Kubernetes context")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace")
+	namespace := set.String("namespace", codingsession.DefaultNamespace, "Kubernetes namespace")
 	name := set.String("name", "", "session name")
 	if err := set.Parse(args); err != nil {
 		return sessionTarget{}, err
 	}
+
 	if *name == "" {
 		return sessionTarget{}, errors.New("--name is required")
 	}
-	client, err := kubernetes.New(*contextName)
+
+	control, err := newControl(*contextName)
 	if err != nil {
 		return sessionTarget{}, err
 	}
-	return sessionTarget{cluster: client, namespace: *namespace, name: *name}, nil
+
+	return sessionTarget{
+		control: control,
+		target:  codingsession.Target{Namespace: *namespace, Name: *name},
+	}, nil
 }
 
 func usageError() error {
@@ -313,20 +354,58 @@ func readPullRequestBody(path string) (string, error) {
 	if path == "" {
 		return "", nil
 	}
+
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read pull request body: %w", err)
 	}
+
 	if len(contents) > 64*1024 {
 		return "", errors.New("pull request body cannot exceed 64 KiB")
 	}
+
 	return string(contents), nil
 }
 
-func printPublishResult(result publish.Result) {
+func printStatus(status codingsession.Status) error {
+	output := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(output, "KIND\tNAME\tREADY\tSTATUS")
+	for _, resource := range status.Resources {
+		_, _ = fmt.Fprintf(output, "%s\t%s\t%s\t%s\n", resource.Kind, resource.Name, resource.Ready, resource.State)
+	}
+
+	if err := output.Flush(); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+
+	return nil
+}
+
+func printPublishResult(result codingsession.PublishResult) {
 	fmt.Printf("pull request #%d: %s\n", result.PullRequestNumber, result.PullRequestURL)
 	fmt.Printf("branch: %s\n", result.Branch)
 	if result.CommitSHA != "" {
 		fmt.Printf("commit: %s\n", result.CommitSHA)
 	}
+}
+
+func newControl(contextName string) (*codingsession.Control, error) {
+	return codingsession.New(contextName, codingsession.Streams{
+		Input:       os.Stdin,
+		Output:      os.Stdout,
+		ErrorOutput: os.Stderr,
+	})
+}
+
+func environmentValue(name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+
+	value, ok := os.LookupEnv(name)
+	if !ok || value == "" {
+		return "", fmt.Errorf("environment variable %s is empty", name)
+	}
+
+	return value, nil
 }

@@ -1,0 +1,52 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - goprintffuncname
+    - misspell
+    - nlreturn
+    - noctx
+    - nolintlint
+    - rowserrcheck
+    - sqlclosecheck
+    - tparallel
+    - whitespace
+    - wsl_v5
+  settings:
+    nlreturn:
+      block-size: 1
+    wsl_v5:
+      default: none
+      enable:
+        - after-block
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gci
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+  settings:
+    gofumpt:
+      module-path: coding-agent-k8s
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - coding-agent-k8s
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+      custom-order: true

@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"coding-agent-k8s/internal/agent"
-
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -17,6 +15,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"coding-agent-k8s/internal/sessionmanifest"
 )
 
 const publishIntentAnnotationKey = "coding-agent/publish-intent"
@@ -80,54 +80,68 @@ func (c *Client) SessionPublishSource(ctx context.Context, namespace, session st
 	if jobErr != nil && !apierrors.IsNotFound(jobErr) {
 		return PublishSource{}, fmt.Errorf("get session Job: %w", jobErr)
 	}
+
 	if setErr != nil && !apierrors.IsNotFound(setErr) {
 		return PublishSource{}, fmt.Errorf("get session StatefulSet: %w", setErr)
 	}
+
 	if jobFound == setFound {
 		if jobFound {
 			return PublishSource{}, errors.New("session has both a Job and StatefulSet")
 		}
+
 		return PublishSource{}, fmt.Errorf("session %s does not exist", session)
 	}
+
 	var podSpec corev1.PodSpec
 	if jobFound {
 		if job.Status.Succeeded == 0 || job.Status.Active != 0 {
 			return PublishSource{}, errors.New("update session must complete successfully before publishing")
 		}
+
 		podSpec = job.Spec.Template.Spec
 	} else {
 		desired := int32(1)
 		if set.Spec.Replicas != nil {
 			desired = *set.Spec.Replicas
 		}
+
 		if desired != 0 || set.Status.Replicas != 0 {
 			return PublishSource{}, errors.New("long session must be stopped before publishing")
 		}
+
 		podSpec = set.Spec.Template.Spec
 	}
+
 	agentContainer, err := namedContainer(podSpec.Containers, "agent")
 	if err != nil {
 		return PublishSource{}, err
 	}
+
 	environment := literalContainerEnvironment(agentContainer)
 	mode := environment["AGENT_MODE"]
 	if jobFound && mode != "update" {
 		return PublishSource{}, fmt.Errorf("%s sessions cannot be published", mode)
 	}
+
 	if !jobFound && mode != "long" {
 		return PublishSource{}, fmt.Errorf("unexpected StatefulSet session mode %q", mode)
 	}
+
 	if environment["AGENT_REPOSITORY"] == "" || environment["AGENT_REF"] == "" {
 		return PublishSource{}, errors.New("session repository and base ref are required for publishing")
 	}
-	workspaceClaim := agent.WorkspaceClaimName(session)
+
+	workspaceClaim := sessionmanifest.WorkspaceClaimName(session)
 	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, workspaceClaim, metav1.GetOptions{})
 	if err != nil {
 		return PublishSource{}, fmt.Errorf("get workspace PersistentVolumeClaim: %w", err)
 	}
+
 	if claim.Status.Phase != corev1.ClaimBound {
 		return PublishSource{}, fmt.Errorf("workspace PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
 	}
+
 	return PublishSource{
 		Repository:     environment["AGENT_REPOSITORY"],
 		InitialRef:     environment["AGENT_REF"],
@@ -138,14 +152,16 @@ func (c *Client) SessionPublishSource(ctx context.Context, namespace, session st
 
 // GitHubToken returns the token stored in the namespace's GitHub Secret.
 func (c *Client) GitHubToken(ctx context.Context, namespace string) (string, error) {
-	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, agent.GitHubTokenSecretName, metav1.GetOptions{})
+	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, sessionmanifest.GitHubTokenSecretName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("get GitHub Secret: %w", err)
 	}
+
 	token := strings.TrimSpace(string(secret.Data["token"]))
 	if token == "" {
 		return "", errors.New("GitHub Secret does not contain a token")
 	}
+
 	return token, nil
 }
 
@@ -155,9 +171,11 @@ func (c *Client) PublisherJobIntent(ctx context.Context, namespace, session stri
 	if apierrors.IsNotFound(err) {
 		return "", false, nil
 	}
+
 	if err != nil {
 		return "", false, fmt.Errorf("get publisher Job: %w", err)
 	}
+
 	return job.Annotations[publishIntentAnnotationKey], true, nil
 }
 
@@ -166,18 +184,22 @@ func (c *Client) RunPublisherJob(ctx context.Context, request PublisherJobReques
 	if request.Timeout < time.Second {
 		return PublisherJobResult{}, errors.New("publisher timeout must be at least one second")
 	}
+
 	job, err := c.ensurePublisherJob(ctx, request)
 	if err != nil {
 		return PublisherJobResult{}, err
 	}
+
 	if jobFailed(job) {
 		if err := c.deletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
 			return PublisherJobResult{}, err
 		}
+
 		if _, err := c.createPublisherJob(ctx, request); err != nil {
 			return PublisherJobResult{}, err
 		}
 	}
+
 	return c.waitForPublisherJob(ctx, request.Namespace, request.Session, request.IntentID, request.Timeout)
 }
 
@@ -197,11 +219,14 @@ func (c *Client) ensurePublisherJob(ctx context.Context, request PublisherJobReq
 		if job.Annotations[publishIntentAnnotationKey] != request.IntentID {
 			return nil, errors.New("publisher Job belongs to a different publish request")
 		}
+
 		return job, nil
 	}
+
 	if !apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("get publisher Job: %w", err)
 	}
+
 	return c.createPublisherJob(ctx, request)
 }
 
@@ -211,10 +236,13 @@ func (c *Client) createPublisherJob(ctx context.Context, request PublisherJobReq
 	if apierrors.IsAlreadyExists(err) {
 		return c.ensurePublisherJob(ctx, request)
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("create publisher Job: %w", err)
 	}
+
 	_, _ = fmt.Fprintf(c.stdout, "job/%s created\n", job.Name)
+
 	return created, nil
 }
 
@@ -225,21 +253,27 @@ func (c *Client) waitForPublisherJob(ctx context.Context, namespace, session, in
 		if err != nil {
 			return false, err
 		}
+
 		if job.Annotations[publishIntentAnnotationKey] != intentID {
 			return false, errors.New("publisher Job intent changed while waiting")
 		}
+
 		if jobFailed(job) {
 			return false, c.publisherJobFailure(ctx, namespace, job.Name)
 		}
+
 		if !jobComplete(job) {
 			return false, nil
 		}
+
 		result, err = c.publisherJobResult(ctx, namespace, job.Name)
+
 		return err == nil, err
 	})
 	if err != nil {
 		return PublisherJobResult{}, fmt.Errorf("publish session %s: %w", session, err)
 	}
+
 	return result, nil
 }
 
@@ -248,16 +282,20 @@ func (c *Client) publisherJobResult(ctx context.Context, namespace, jobName stri
 	if err != nil {
 		return PublisherJobResult{}, err
 	}
+
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Name != "publisher" || status.State.Terminated == nil {
 			continue
 		}
+
 		result := parsePublisherJobResult(status.State.Terminated.Message)
 		if result.Branch == "" || !commitSHAPattern.MatchString(result.CommitSHA) {
 			return PublisherJobResult{}, errors.New("publisher did not report a valid branch and commit")
 		}
+
 		return result, nil
 	}
+
 	return PublisherJobResult{}, errors.New("publisher container has no termination result")
 }
 
@@ -266,17 +304,21 @@ func (c *Client) publisherJobFailure(ctx context.Context, namespace, jobName str
 	if err != nil {
 		return err
 	}
+
 	contents, logErr := c.typed.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: "publisher"}).Do(ctx).Raw()
 	if logErr != nil {
 		return fmt.Errorf("publisher Job failed; read logs: %w", logErr)
 	}
+
 	message := strings.TrimSpace(string(contents))
 	if len(message) > 4000 {
 		message = message[len(message)-4000:]
 	}
+
 	if message == "" {
 		message = "publisher container exited without an error message"
 	}
+
 	return errors.New(message)
 }
 
@@ -287,9 +329,11 @@ func (c *Client) publisherJobPod(ctx context.Context, namespace, jobName string)
 	if err != nil {
 		return nil, fmt.Errorf("list publisher Pods: %w", err)
 	}
+
 	if len(pods.Items) != 1 {
 		return nil, fmt.Errorf("publisher Job has %d Pods, want 1", len(pods.Items))
 	}
+
 	return &pods.Items[0], nil
 }
 
@@ -299,21 +343,25 @@ func (c *Client) deletePublisherJob(ctx context.Context, namespace, session stri
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
+
 	if err != nil {
 		return fmt.Errorf("delete publisher Job: %w", err)
 	}
+
 	return wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		jobName := publisherJobName(session)
 		_, jobErr := c.typed.BatchV1().Jobs(namespace).Get(ctx, jobName, metav1.GetOptions{})
 		if jobErr != nil && !apierrors.IsNotFound(jobErr) {
 			return false, jobErr
 		}
+
 		pods, podErr := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labels.Set{"job-name": jobName}.AsSelector().String(),
 		})
 		if podErr != nil {
 			return false, podErr
 		}
+
 		return apierrors.IsNotFound(jobErr) && len(pods.Items) == 0, nil
 	})
 }
@@ -327,6 +375,7 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 		"coding-agent/session":         request.Session,
 		"coding-agent/component":       "publisher",
 	}
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        publisherJobName(request.Session),
@@ -365,7 +414,7 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 						{
 							Name: "git-auth",
 							VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-								SecretName:  agent.GitHubTokenSecretName,
+								SecretName:  sessionmanifest.GitHubTokenSecretName,
 								DefaultMode: int32Pointer(0o440),
 							}},
 						},
@@ -423,6 +472,7 @@ func namedContainer(containers []corev1.Container, name string) (corev1.Containe
 			return container, nil
 		}
 	}
+
 	return corev1.Container{}, fmt.Errorf("session Pod has no %s container", name)
 }
 
@@ -431,6 +481,7 @@ func literalContainerEnvironment(container corev1.Container) map[string]string {
 	for _, variable := range container.Env {
 		environment[variable.Name] = variable.Value
 	}
+
 	return environment
 }
 
@@ -444,6 +495,7 @@ func jobComplete(job *batchv1.Job) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -453,6 +505,7 @@ func jobFailed(job *batchv1.Job) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -463,6 +516,7 @@ func parsePublisherJobResult(message string) PublisherJobResult {
 		if !ok {
 			continue
 		}
+
 		switch key {
 		case "branch":
 			result.Branch = value
@@ -470,6 +524,7 @@ func parsePublisherJobResult(message string) PublisherJobResult {
 			result.CommitSHA = value
 		}
 	}
+
 	return result
 }
 
@@ -491,5 +546,6 @@ func resourceQuantity(value string) resource.Quantity {
 
 func resourceQuantityPointer(value string) *resource.Quantity {
 	quantity := resourceQuantity(value)
+
 	return &quantity
 }

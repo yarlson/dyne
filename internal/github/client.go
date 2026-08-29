@@ -40,12 +40,14 @@ func New(token string) (*Client, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("GitHub token is required")
 	}
+
 	httpClient := &http.Client{
 		Transport: responseBodyLimitTransport{base: http.DefaultTransport},
 		Timeout:   30 * time.Second,
 	}
 	api := gh.NewClient(httpClient).WithAuthToken(token)
 	api.UserAgent = "agentctl"
+
 	return &Client{
 		api:          api,
 		pollInterval: 2 * time.Second,
@@ -58,17 +60,21 @@ func ParseRepository(rawURL string) (Repository, error) {
 	if err != nil {
 		return Repository{}, fmt.Errorf("parse repository URL: %w", err)
 	}
+
 	if parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return Repository{}, errors.New("publishing requires an HTTPS github.com repository URL")
 	}
+
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Repository{}, errors.New("repository URL must contain one owner and repository name")
 	}
+
 	name := strings.TrimSuffix(parts[1], ".git")
 	if name == "" {
 		return Repository{}, errors.New("repository URL has an empty repository name")
 	}
+
 	return Repository{owner: parts[0], name: name}, nil
 }
 
@@ -78,11 +84,13 @@ func (c *Client) CommitAuthor(ctx context.Context) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("get authenticated GitHub user: %w", err)
 	}
+
 	login := result.GetLogin()
 	id := result.GetID()
 	if login == "" || id <= 0 {
 		return "", "", errors.New("authenticated GitHub user has no login or numeric ID")
 	}
+
 	return login, fmt.Sprintf("%d+%s@users.noreply.github.com", id, login), nil
 }
 
@@ -92,13 +100,16 @@ func (c *Client) BranchCommitSHA(ctx context.Context, repository Repository, bra
 	if isNotFound(err) {
 		return "", false, nil
 	}
+
 	if err != nil {
 		return "", false, fmt.Errorf("get GitHub branch %s: %w", branch, err)
 	}
+
 	commit := result.GetObject().GetSHA()
 	if commit == "" {
 		return "", false, fmt.Errorf("GitHub branch %s has no commit", branch)
 	}
+
 	return commit, true, nil
 }
 
@@ -113,12 +124,15 @@ func (c *Client) WaitForBranchCommit(ctx context.Context, repository Repository,
 		if err != nil {
 			return err
 		}
+
 		if exists {
 			if actual != expectedCommitSHA {
 				return fmt.Errorf("GitHub branch %s points to %s instead of %s", branch, actual, expectedCommitSHA)
 			}
+
 			return nil
 		}
+
 		select {
 		case <-waitCtx.Done():
 			return fmt.Errorf("wait for GitHub branch %s: %w", branch, waitCtx.Err())
@@ -140,16 +154,20 @@ func (c *Client) FindOpenPullRequest(ctx context.Context, repository Repository,
 	if err != nil {
 		return nil, fmt.Errorf("find existing GitHub pull request: %w", err)
 	}
+
 	if len(pulls) == 0 {
 		return nil, nil
 	}
+
 	if len(pulls) > 1 {
 		return nil, errors.New("more than one open pull request uses the publish branch and base")
 	}
+
 	pull, err := pullRequestFromAPI(pulls[0])
 	if err != nil {
 		return nil, err
 	}
+
 	return &pull, nil
 }
 
@@ -164,9 +182,11 @@ func (c *Client) WaitForOpenPullRequest(ctx context.Context, repository Reposito
 		if err != nil {
 			return nil, err
 		}
+
 		if pull != nil {
 			return pull, nil
 		}
+
 		select {
 		case <-waitCtx.Done():
 			return nil, nil
@@ -187,6 +207,7 @@ func (c *Client) CreatePullRequest(ctx context.Context, repository Repository, b
 	if err != nil {
 		return PullRequest{}, fmt.Errorf("create GitHub pull request: %w", err)
 	}
+
 	return pullRequestFromAPI(result)
 }
 
@@ -194,11 +215,13 @@ func pullRequestFromAPI(result *gh.PullRequest) (PullRequest, error) {
 	if result == nil || result.GetNumber() <= 0 || result.GetHTMLURL() == "" {
 		return PullRequest{}, errors.New("GitHub returned a pull request without a number or URL")
 	}
+
 	return PullRequest{Number: result.GetNumber(), URL: result.GetHTMLURL()}, nil
 }
 
 func isNotFound(err error) bool {
 	var responseErr *gh.ErrorResponse
+
 	return errors.As(err, &responseErr) && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound
 }
 
@@ -211,11 +234,13 @@ func (t responseBodyLimitTransport) RoundTrip(request *http.Request) (*http.Resp
 	if err != nil {
 		return nil, err
 	}
+
 	if response.Body != nil {
 		response.Body = struct {
 			io.Reader
 			io.Closer
 		}{Reader: io.LimitReader(response.Body, maxResponseBodyBytes), Closer: response.Body}
 	}
+
 	return response, nil
 }

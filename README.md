@@ -162,47 +162,17 @@ Agent Jobs use `backoffLimit: 0` and do not push code automatically. Only the ex
 
 Colima's local-path storage survives Pod replacement and VM restart, but it is tied to the single VM. Deleting the PVC, its PV, or the Colima profile can delete the data. Back up or push valuable work before destroying storage.
 
-## Live conformance proof
+## Development
 
-The ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. The live conformance package is disabled unless `AGENTCTL_PROOF=1` is set. A full core run builds `agentctl` and a uniquely tagged image from one clean Git commit, creates two independently owned namespaces in sequence, and proves exploration, bounded updates, long-session continuation, setup, storage, cleanup, and Colima restart behavior.
-
-Run the core proof only against a dedicated Colima profile. The restart phase refuses a profile that contains non-system workloads outside the proof namespace.
+The repository adopts the same developer entrypoint locally and in CI:
 
 ```bash
-AGENTCTL_PROOF=1 \
-AGENTCTL_PROOF_CONTEXT=colima-codex-proof \
-AGENTCTL_PROOF_COLIMA_PROFILE=codex-proof \
-AGENTCTL_PROOF_AUTH_FILE="$HOME/.codex/auth.json" \
-AGENTCTL_PROOF_ALLOW_VM_RESTART=1 \
-go test -v -count=1 -timeout=90m ./internal/conformance
+make doctor
+make check
+make build
+make image
 ```
 
-Each run writes a sanitized verdict and Kubernetes status snapshots under `.proof/<run-id>/`. Generated evidence is ignored by Git. Set `AGENTCTL_PROOF_KEEP_FAILED=1` only when the failed namespace must remain for local diagnosis.
+`make tools` installs the pinned golangci-lint version. Ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. There is currently no live conformance suite; state-changing runtime verification must use an explicitly isolated Colima profile and own its cleanup.
 
-Pull request publishing is a separate proof. It runs only when an approved disposable repository and the name of a populated token environment variable are supplied:
-
-```bash
-export AGENTCTL_PROOF_GITHUB_TOKEN="$(gh auth token)"
-
-AGENTCTL_PROOF=1 \
-AGENTCTL_PROOF_CONTEXT=colima-codex-proof \
-AGENTCTL_PROOF_COLIMA_PROFILE=codex-proof \
-AGENTCTL_PROOF_AUTH_FILE="$HOME/.codex/auth.json" \
-AGENTCTL_PROOF_ALLOW_VM_RESTART=1 \
-AGENTCTL_PROOF_GITHUB_REPOSITORY=https://github.com/example/coding-agent-proof.git \
-AGENTCTL_PROOF_GITHUB_TOKEN_ENV=AGENTCTL_PROOF_GITHUB_TOKEN \
-go test -v -count=1 -timeout=90m ./internal/conformance
-
-unset AGENTCTL_PROOF_GITHUB_TOKEN
-```
-
-The publishing proof uses only branches prefixed with `codex-proof/<run-id>/`, closes the pull requests it creates, deletes its branches, and fails when external cleanup is incomplete. It never defaults to the repository used by a coding session.
-
-## Checks
-
-```bash
-gofmt -w cmd internal
-go test ./...
-go vet ./...
-env -u DOCKER_HOST docker --context colima-codex-k8s build -f container/Dockerfile -t coding-agent:local .
-```
+Repository conventions are documented in [AGENTS.md](AGENTS.md), [docs/GO.md](docs/GO.md), [docs/TESTING.md](docs/TESTING.md), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
