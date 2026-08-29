@@ -2,6 +2,7 @@ package sessionmanifest
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -117,7 +118,7 @@ func TestRenderSelectsWorkloadAndStorageForSessionLifecycle(t *testing.T) {
 			}
 
 			storage := renderedStorage(resources[test.workload])
-			if !mapsEqual(storage, test.wantStorage) {
+			if !maps.Equal(storage, test.wantStorage) {
 				t.Fatalf("got storage %v, want %v", storage, test.wantStorage)
 			}
 		})
@@ -221,18 +222,4 @@ func renderedStorage(workload renderedResource) map[string]string {
 	}
 
 	return storage
-}
-
-func mapsEqual(got, want map[string]string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-
-	for key, value := range want {
-		if got[key] != value {
-			return false
-		}
-	}
-
-	return true
 }
