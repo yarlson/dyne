@@ -172,8 +172,11 @@ make check
 make build
 make image
 make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
+make e2e-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof DOCKER_CONTEXT=colima-codex-proof
 ```
 
 `make tools` installs the pinned golangci-lint version. Ordinary Go tests do not contact Docker, Kubernetes, Codex, or GitHub. The opt-in integration test uses the named Kubernetes context, creates a unique namespace, verifies apply, scale, delete, and destroy behavior, and removes the namespace during cleanup. Use only an explicitly isolated test cluster.
+
+The opt-in E2E suite builds the current coding-agent image and runs exploration and persistent-session journeys through the top-level coding-session boundary. It clones a fixed repository from an in-cluster Git server, runs `mise install` and npm setup, and uses a deterministic Codex substitute installed by setup. The suite verifies workspace permissions, retained workspace, tool-home and Codex state, temporary `/tmp` state, stop and resume, delete and destroy, and namespace cleanup. It does not use Codex credentials or create GitHub branches or pull requests.
 
 Repository conventions are documented in [AGENTS.md](AGENTS.md).
