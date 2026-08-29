@@ -13,6 +13,7 @@ import (
 
 	"github.com/yarlson/airlock/internal/kubernetes"
 	"github.com/yarlson/airlock/internal/publish"
+	"github.com/yarlson/airlock/internal/sessionmanifest"
 )
 
 func TestNewRejectsMissingStreamsBeforeLoadingKubeconfig(t *testing.T) {
@@ -105,17 +106,23 @@ func TestContinueCreatesResumableJobAgainstPersistentSession(t *testing.T) {
 			assert.Equal(t, "review", name)
 
 			return kubernetes.SessionDefinition{
+				AgentName:    "reviewer",
 				Image:        "coding-agent:test",
 				Repository:   "https://github.com/lokalise/kargo.git",
 				InitialRef:   "main",
 				CloneDepth:   1,
 				StorageSize:  "10Gi",
 				SetupCommand: "make tools",
+				Skills: []sessionmanifest.AgentSkill{{
+					Name: "code-review", Contents: "retained skill",
+				}},
 			}, nil
 		},
 		apply: func(_ context.Context, manifest []byte) error {
 			assert.Contains(t, string(manifest), `"name": "review-followup"`)
 			assert.Contains(t, string(manifest), `"name": "AGENT_RESUME"`)
+			assert.Contains(t, string(manifest), `"name": "session-review-agent"`)
+			assert.Contains(t, string(manifest), `"path": "code-review/SKILL.md"`)
 			assert.NotContains(t, string(manifest), `"kind": "PersistentVolumeClaim"`)
 
 			return nil

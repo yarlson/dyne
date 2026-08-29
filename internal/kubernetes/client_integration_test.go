@@ -23,7 +23,7 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 		t.Skip("KUBERNETES_INTEGRATION_CONTEXT is required")
 	}
 
-	client, err := New(contextName, nil, io.Discard, io.Discard)
+	client, err := New(contextName, io.Discard)
 	require.NoError(t, err)
 	namespace := integrationNamespace(t)
 	t.Cleanup(func() {

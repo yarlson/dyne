@@ -52,6 +52,8 @@ func (c *Control) Continue(ctx context.Context, request ContinueRequest) error {
 		InitialRef:     definition.InitialRef,
 		SetupCommand:   definition.SetupCommand,
 		Prompt:         request.Prompt,
+		AgentName:      definition.AgentName,
+		Skills:         definition.Skills,
 		CloneDepth:     definition.CloneDepth,
 		StorageSize:    definition.StorageSize,
 		TimeoutSeconds: int64(request.Timeout.Seconds()),
@@ -317,12 +319,28 @@ func (request StartRequest) manifest() ([]byte, error) {
 		InitialRef:     request.InitialRef,
 		SetupCommand:   request.SetupCommand,
 		Prompt:         request.Prompt,
+		AgentName:      request.AgentName,
+		Instructions:   request.Instructions,
+		Skills:         manifestSkills(request.Skills),
 		CloneDepth:     request.CloneDepth,
 		StorageSize:    request.StorageSize,
 		TimeoutSeconds: int64(request.Timeout.Seconds()),
 	})
 
 	return manifest, err
+}
+
+func manifestSkills(skills []AgentSkill) []sessionmanifest.AgentSkill {
+	if len(skills) == 0 {
+		return nil
+	}
+
+	result := make([]sessionmanifest.AgentSkill, len(skills))
+	for i, skill := range skills {
+		result[i] = sessionmanifest.AgentSkill{Name: skill.Name, Contents: skill.Contents}
+	}
+
+	return result
 }
 
 func (request PublishRequest) publishRequest() publish.Request {

@@ -50,6 +50,10 @@ type SessionDefinition struct {
 	InitialRef string
 	// SetupCommand prepares the retained workspace before each task.
 	SetupCommand string
+	// AgentName identifies the retained agent configuration when one was used.
+	AgentName string
+	// Skills contains the retained instruction-only Codex skills.
+	Skills []sessionmanifest.AgentSkill
 	// CloneDepth is the Git history depth used for the initial clone.
 	CloneDepth int
 	// StorageSize is the size of the retained session claim.
@@ -108,7 +112,7 @@ func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	return nil
 }
 
-// CheckSessionAvailable returns an error when any Job or claim already owns the session name.
+// CheckSessionAvailable returns an error when retained resources already own the session name.
 func (c *Client) CheckSessionAvailable(ctx context.Context, namespace, name string) error {
 	selector := sessionSelector(name)
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
@@ -121,7 +125,12 @@ func (c *Client) CheckSessionAvailable(ctx context.Context, namespace, name stri
 		return fmt.Errorf("check session PersistentVolumeClaims: %w", err)
 	}
 
-	if len(jobs.Items) > 0 || len(claims.Items) > 0 {
+	configMaps, err := c.typed.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("check session ConfigMaps: %w", err)
+	}
+
+	if len(jobs.Items) > 0 || len(claims.Items) > 0 || len(configMaps.Items) > 0 {
 		return fmt.Errorf("session %s already exists", name)
 	}
 
@@ -209,14 +218,60 @@ func (c *Client) PersistentSessionDefinition(ctx context.Context, namespace, nam
 		return SessionDefinition{}, errors.New("session PersistentVolumeClaim has an incomplete definition")
 	}
 
+	agentName := claim.Annotations["airlock.yarlson.dev/agent"]
+	var skills []sessionmanifest.AgentSkill
+	if agentName != "" {
+		configuration, err := c.typed.CoreV1().ConfigMaps(namespace).Get(ctx, sessionmanifest.SessionAgentConfigName(name), metav1.GetOptions{})
+		if err != nil {
+			return SessionDefinition{}, fmt.Errorf("get agent ConfigMap: %w", err)
+		}
+
+		skills, err = retainedAgentSkills(configuration, agentName)
+		if err != nil {
+			return SessionDefinition{}, err
+		}
+	}
+
 	return SessionDefinition{
 		Image:        image,
 		Repository:   claim.Annotations["airlock.yarlson.dev/repository"],
 		InitialRef:   initialRef,
 		SetupCommand: claim.Annotations["airlock.yarlson.dev/setup"],
+		AgentName:    agentName,
+		Skills:       skills,
 		CloneDepth:   cloneDepth,
 		StorageSize:  claim.Spec.Resources.Requests.Storage().String(),
 	}, nil
+}
+
+func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]sessionmanifest.AgentSkill, error) {
+	if configuration.Immutable == nil || !*configuration.Immutable || configuration.Annotations["airlock.yarlson.dev/agent"] != agentName {
+		return nil, errors.New("agent ConfigMap has an invalid definition")
+	}
+
+	if strings.TrimSpace(configuration.Data["instructions"]) == "" {
+		return nil, errors.New("agent ConfigMap has an incomplete definition")
+	}
+
+	skills := make([]sessionmanifest.AgentSkill, 0, len(configuration.Data)-1)
+	for key, contents := range configuration.Data {
+		name, found := strings.CutPrefix(key, "skill-")
+		if !found {
+			if key != "instructions" {
+				return nil, fmt.Errorf("agent ConfigMap has unsupported key %q", key)
+			}
+
+			continue
+		}
+
+		skills = append(skills, sessionmanifest.AgentSkill{Name: name, Contents: contents})
+	}
+
+	sort.Slice(skills, func(i, j int) bool {
+		return skills[i].Name < skills[j].Name
+	})
+
+	return skills, nil
 }
 
 func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstructured) error {
@@ -357,6 +412,21 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 	}
 
 	if !deleteStorage {
+		_, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionmanifest.SessionClaimName(name), metav1.GetOptions{})
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("check session PersistentVolumeClaim: %w", err)
+		}
+	}
+
+	if err := c.deleteAgentConfig(ctx, namespace, name); err != nil {
+		return err
+	}
+
+	if !deleteStorage {
 		return nil
 	}
 
@@ -370,6 +440,21 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 	}
 
 	_, _ = fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
+
+	return nil
+}
+
+func (c *Client) deleteAgentConfig(ctx context.Context, namespace, session string) error {
+	name := sessionmanifest.SessionAgentConfigName(session)
+	if err := c.typed.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("delete ConfigMap %s: %w", name, err)
+	}
+
+	_, _ = fmt.Fprintf(c.stdout, "configmap/%s deleted\n", name)
 
 	return nil
 }

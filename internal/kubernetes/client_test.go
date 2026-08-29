@@ -61,6 +61,16 @@ func TestCheckSessionAvailableRejectsExistingSessionResources(t *testing.T) {
 	require.ErrorContains(t, err, "session example already exists")
 }
 
+func TestCheckSessionAvailableRejectsRetainedAgentConfiguration(t *testing.T) {
+	labels := map[string]string{"coding-agent/session": "example"}
+	client := &Client{typed: fake.NewClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "session-example-agent", Namespace: "coding-agents", Labels: labels},
+	}), stdout: io.Discard}
+
+	err := client.CheckSessionAvailable(context.Background(), "coding-agents", "example")
+	require.ErrorContains(t, err, "session example already exists")
+}
+
 func TestSetGitHubTokenReplacesOnlyRepositoryCredential(t *testing.T) {
 	clientset := fake.NewClientset(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: sessionmanifest.GitHubTokenSecretName, Namespace: "coding-agents"},
@@ -108,6 +118,50 @@ func TestPersistentSessionDefinitionSurvivesWorkloadDeletion(t *testing.T) {
 	}, definition)
 }
 
+func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testing.T) {
+	labels := map[string]string{"coding-agent/session": "example"}
+	claim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "session-example",
+			Namespace: "coding-agents",
+			Labels:    labels,
+			Annotations: map[string]string{
+				"airlock.yarlson.dev/image":       "coding-agent:test",
+				"airlock.yarlson.dev/initial-ref": "main",
+				"airlock.yarlson.dev/clone-depth": "1",
+				"airlock.yarlson.dev/agent":       "reviewer",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{Resources: corev1.VolumeResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+		}},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	client := &Client{typed: fake.NewClientset(claim)}
+
+	_, err := client.PersistentSessionDefinition(context.Background(), "coding-agents", "example")
+	require.ErrorContains(t, err, "get agent ConfigMap")
+
+	immutable := true
+	client.typed = fake.NewClientset(claim, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        sessionmanifest.SessionAgentConfigName("example"),
+			Namespace:   "coding-agents",
+			Labels:      labels,
+			Annotations: map[string]string{"airlock.yarlson.dev/agent": "reviewer"},
+		},
+		Immutable: &immutable,
+		Data: map[string]string{
+			"instructions":      "Review correctness and tests.",
+			"skill-code-review": "retained skill",
+		},
+	})
+	definition, err := client.PersistentSessionDefinition(context.Background(), "coding-agents", "example")
+	require.NoError(t, err)
+	assert.Equal(t, "reviewer", definition.AgentName)
+	assert.Equal(t, []sessionmanifest.AgentSkill{{Name: "code-review", Contents: "retained skill"}}, definition.Skills)
+}
+
 func TestNewestPodNameReportsMissingSession(t *testing.T) {
 	client := &Client{typed: fake.NewClientset()}
 	_, err := client.NewestPodName(context.Background(), "coding-agents", "missing")
@@ -144,6 +198,29 @@ func TestDeleteSessionRemovesComputeAndRetainsPersistentState(t *testing.T) {
 	}
 }
 
+func TestDeleteSessionRetainsPersistentAgentConfiguration(t *testing.T) {
+	clientset := fake.NewClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "session-example", Namespace: "coding-agents"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "session-example-agent", Namespace: "coding-agents"}},
+	)
+	client := &Client{typed: clientset, stdout: io.Discard}
+
+	require.NoError(t, client.DeleteSession(context.Background(), "coding-agents", "example"))
+	_, err := clientset.CoreV1().ConfigMaps("coding-agents").Get(context.Background(), "session-example-agent", metav1.GetOptions{})
+	assert.NoError(t, err)
+}
+
+func TestDeleteSessionRemovesEphemeralAgentConfiguration(t *testing.T) {
+	clientset := fake.NewClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "session-example-agent", Namespace: "coding-agents"},
+	})
+	client := &Client{typed: clientset, stdout: io.Discard}
+
+	require.NoError(t, client.DeleteSession(context.Background(), "coding-agents", "example"))
+	_, err := clientset.CoreV1().ConfigMaps("coding-agents").Get(context.Background(), "session-example-agent", metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err))
+}
+
 func TestDestroySessionRemovesComputeAndPersistentState(t *testing.T) {
 	claimNames := []string{"session-example"}
 	client, clientset := sessionClientWithPersistentState(claimNames)
@@ -155,6 +232,18 @@ func TestDestroySessionRemovesComputeAndPersistentState(t *testing.T) {
 		_, err := clientset.CoreV1().PersistentVolumeClaims("coding-agents").Get(context.Background(), name, metav1.GetOptions{})
 		assert.True(t, apierrors.IsNotFound(err), "got PersistentVolumeClaim %s lookup error %v, want deleted claim", name, err)
 	}
+}
+
+func TestDestroySessionRemovesPersistentAgentConfiguration(t *testing.T) {
+	clientset := fake.NewClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "session-example", Namespace: "coding-agents"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "session-example-agent", Namespace: "coding-agents"}},
+	)
+	client := &Client{typed: clientset, stdout: io.Discard}
+
+	require.NoError(t, client.DestroySession(context.Background(), "coding-agents", "example"))
+	_, err := clientset.CoreV1().ConfigMaps("coding-agents").Get(context.Background(), "session-example-agent", metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err))
 }
 
 func TestDestroySessionIgnoresMissingPersistentState(t *testing.T) {

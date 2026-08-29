@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -16,6 +17,7 @@ const (
 	// GitHubTokenSecretName is the name of the Secret that stores the GitHub token.
 	GitHubTokenSecretName = "coding-agent-git-auth"
 	codexAuthSecretName   = "coding-agent-auth"
+	maxAgentConfigBytes   = 900 * 1024
 )
 
 // Storage controls whether a session retains state after its task Pod is removed.
@@ -27,6 +29,14 @@ const (
 	// StoragePersistent retains workspace, tool, and agent state on one claim.
 	StoragePersistent Storage = "persistent"
 )
+
+// AgentSkill contains one instruction-only Codex skill.
+type AgentSkill struct {
+	// Name identifies the skill inside the Codex skill directory.
+	Name string
+	// Contents is the complete SKILL.md file.
+	Contents string
+}
 
 // Spec defines one coding-session workload.
 type Spec struct {
@@ -50,6 +60,12 @@ type Spec struct {
 	SetupCommand string
 	// Prompt is the task given to a bounded session.
 	Prompt string
+	// AgentName identifies the reusable agent template used to start the session.
+	AgentName string
+	// Instructions are additional Codex developer instructions.
+	Instructions string
+	// Skills are the instruction-only Codex skills available to the agent.
+	Skills []AgentSkill
 	// CloneDepth limits fetched Git history; zero fetches the full history.
 	CloneDepth int
 	// StorageSize is the requested size of the workspace and tool-home claims.
@@ -68,7 +84,7 @@ type resourceList struct {
 
 var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
-func (s Spec) validate() error {
+func (s Spec) validate(initial bool) error {
 	if !dnsLabelPattern.MatchString(s.Name) || len(s.Name) > 40 {
 		return errors.New("name must be a lowercase DNS label no longer than 40 characters")
 	}
@@ -105,6 +121,33 @@ func (s Spec) validate() error {
 		return errors.New("prompt is required")
 	}
 
+	if s.AgentName == "" {
+		if s.Instructions != "" || len(s.Skills) > 0 {
+			return errors.New("agent name is required for instructions and skills")
+		}
+	} else {
+		if !dnsLabelPattern.MatchString(s.AgentName) || len(s.AgentName) > 63 {
+			return errors.New("agent name must be a lowercase DNS label no longer than 63 characters")
+		}
+
+		if initial && strings.TrimSpace(s.Instructions) == "" {
+			return errors.New("agent instructions are required")
+		}
+
+		if err := validateAgentSkills(s.Skills); err != nil {
+			return err
+		}
+
+		size := len(s.Instructions)
+		for _, skill := range s.Skills {
+			size += len(skill.Name) + len(skill.Contents)
+		}
+
+		if size > maxAgentConfigBytes {
+			return fmt.Errorf("instructions and skills exceed %d bytes", maxAgentConfigBytes)
+		}
+	}
+
 	switch s.Storage {
 	case StorageEphemeral, StoragePersistent:
 	default:
@@ -132,16 +175,18 @@ func RenderContinuation(s Spec) ([]byte, error) {
 	return render(s, false)
 }
 
-func render(s Spec, createClaim bool) ([]byte, error) {
-	if err := s.validate(); err != nil {
+func render(s Spec, initial bool) ([]byte, error) {
+	if err := s.validate(initial); err != nil {
 		return nil, err
 	}
 
 	items := []resource{denyIngressPolicy(s.Namespace)}
-	if createClaim && s.Storage == StoragePersistent {
-		items = append(items,
-			persistentVolumeClaim(s),
-		)
+	if initial && s.Storage == StoragePersistent {
+		items = append(items, persistentVolumeClaim(s))
+	}
+
+	if initial && s.AgentName != "" {
+		items = append(items, agentConfigMap(s))
 	}
 
 	items = append(items, sessionJob(s))
@@ -174,20 +219,25 @@ func denyIngressPolicy(namespace string) resource {
 }
 
 func persistentVolumeClaim(s Spec) resource {
+	annotations := map[string]any{
+		"airlock.yarlson.dev/image":       s.Image,
+		"airlock.yarlson.dev/repository":  s.Repository,
+		"airlock.yarlson.dev/initial-ref": s.InitialRef,
+		"airlock.yarlson.dev/setup":       s.SetupCommand,
+		"airlock.yarlson.dev/clone-depth": fmt.Sprintf("%d", s.CloneDepth),
+	}
+	if s.AgentName != "" {
+		annotations["airlock.yarlson.dev/agent"] = s.AgentName
+	}
+
 	return resource{
 		"apiVersion": "v1",
 		"kind":       "PersistentVolumeClaim",
 		"metadata": map[string]any{
-			"name":      SessionClaimName(s.Name),
-			"namespace": s.Namespace,
-			"labels":    sessionLabels(s.Name),
-			"annotations": map[string]any{
-				"airlock.yarlson.dev/image":       s.Image,
-				"airlock.yarlson.dev/repository":  s.Repository,
-				"airlock.yarlson.dev/initial-ref": s.InitialRef,
-				"airlock.yarlson.dev/setup":       s.SetupCommand,
-				"airlock.yarlson.dev/clone-depth": fmt.Sprintf("%d", s.CloneDepth),
-			},
+			"name":        SessionClaimName(s.Name),
+			"namespace":   s.Namespace,
+			"labels":      sessionLabels(s.Name),
+			"annotations": annotations,
 		},
 		"spec": map[string]any{
 			"accessModes": []any{"ReadWriteOnce"},
@@ -243,20 +293,22 @@ func sessionPodTemplate(s Spec) map[string]any {
 				sessionContainer(s, "workspace-init", []any{"init"}, false, mountAccess{workspace: true, home: true, tmp: true}),
 				sessionContainer(s, "auth-init", []any{"auth"}, false, mountAccess{codex: true}),
 			},
-			"containers": []any{sessionContainer(s, "agent", []any{"run"}, workspaceReadOnly, mountAccess{workspace: true, home: true, tmp: true, codex: true, artifacts: true, logs: true})},
+			"containers": []any{sessionContainer(s, "agent", []any{"run"}, workspaceReadOnly, mountAccess{workspace: true, home: true, tmp: true, codex: true, artifacts: true, logs: true, agentInstructions: s.AgentName != "", agentSkills: len(s.Skills) > 0})},
 			"volumes":    sessionVolumes(s),
 		},
 	}
 }
 
 type mountAccess struct {
-	workspace bool
-	home      bool
-	tmp       bool
-	codex     bool
-	artifacts bool
-	logs      bool
-	gitAuth   bool
+	workspace         bool
+	home              bool
+	tmp               bool
+	codex             bool
+	artifacts         bool
+	logs              bool
+	gitAuth           bool
+	agentInstructions bool
+	agentSkills       bool
 }
 
 func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, access mountAccess) map[string]any {
@@ -292,27 +344,41 @@ func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, a
 		volumeMounts = append(volumeMounts, map[string]any{"name": "git-auth", "mountPath": "/var/run/git-auth", "readOnly": true})
 	}
 
+	if access.agentSkills {
+		volumeMounts = append(volumeMounts, map[string]any{"name": "agent-config", "mountPath": "/home/agent/.agents/skills", "readOnly": true})
+	}
+
+	environment := []any{
+		map[string]any{"name": "AGENT_STORAGE", "value": string(s.Storage)},
+		map[string]any{"name": "AGENT_REPOSITORY", "value": s.Repository},
+		map[string]any{"name": "AGENT_REF", "value": s.InitialRef},
+		map[string]any{"name": "AGENT_SETUP", "value": s.SetupCommand},
+		map[string]any{"name": "AGENT_TASK", "value": s.Prompt},
+		map[string]any{"name": "AGENT_TASK_ID", "value": taskName(s)},
+		map[string]any{"name": "AGENT_RESUME", "value": fmt.Sprintf("%t", s.Resume)},
+		map[string]any{"name": "AGENT_CLONE_DEPTH", "value": fmt.Sprintf("%d", s.CloneDepth)},
+		map[string]any{"name": "HOME", "value": "/home/agent"},
+		map[string]any{"name": "CODEX_HOME", "value": "/codex"},
+		map[string]any{"name": "MISE_DATA_DIR", "value": "/home/agent/.local/share/mise"},
+		map[string]any{"name": "MISE_CACHE_DIR", "value": "/home/agent/.cache/mise"},
+		map[string]any{"name": "npm_config_cache", "value": "/home/agent/.cache/npm"},
+	}
+	if access.agentInstructions {
+		environment = append(environment, map[string]any{
+			"name": "AGENT_INSTRUCTIONS",
+			"valueFrom": map[string]any{
+				"configMapKeyRef": map[string]any{"name": SessionAgentConfigName(s.Name), "key": "instructions"},
+			},
+		})
+	}
+
 	return map[string]any{
 		"name":            name,
 		"image":           s.Image,
 		"imagePullPolicy": "IfNotPresent",
 		"args":            args,
 		"workingDir":      "/workspace",
-		"env": []any{
-			map[string]any{"name": "AGENT_STORAGE", "value": string(s.Storage)},
-			map[string]any{"name": "AGENT_REPOSITORY", "value": s.Repository},
-			map[string]any{"name": "AGENT_REF", "value": s.InitialRef},
-			map[string]any{"name": "AGENT_SETUP", "value": s.SetupCommand},
-			map[string]any{"name": "AGENT_TASK", "value": s.Prompt},
-			map[string]any{"name": "AGENT_TASK_ID", "value": taskName(s)},
-			map[string]any{"name": "AGENT_RESUME", "value": fmt.Sprintf("%t", s.Resume)},
-			map[string]any{"name": "AGENT_CLONE_DEPTH", "value": fmt.Sprintf("%d", s.CloneDepth)},
-			map[string]any{"name": "HOME", "value": "/home/agent"},
-			map[string]any{"name": "CODEX_HOME", "value": "/codex"},
-			map[string]any{"name": "MISE_DATA_DIR", "value": "/home/agent/.local/share/mise"},
-			map[string]any{"name": "MISE_CACHE_DIR", "value": "/home/agent/.cache/mise"},
-			map[string]any{"name": "npm_config_cache", "value": "/home/agent/.cache/npm"},
-		},
+		"env":             environment,
 		"securityContext": map[string]any{
 			"allowPrivilegeEscalation": false,
 			"readOnlyRootFilesystem":   true,
@@ -368,7 +434,7 @@ func sessionVolumes(s Spec) []any {
 		session["persistentVolumeClaim"] = map[string]any{"claimName": SessionClaimName(s.Name)}
 	}
 
-	return []any{
+	volumes := []any{
 		session,
 		map[string]any{"name": "tmp", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": "1Gi"}},
 		map[string]any{
@@ -388,6 +454,76 @@ func sessionVolumes(s Spec) []any {
 			},
 		},
 	}
+	if len(s.Skills) > 0 {
+		items := make([]any, len(s.Skills))
+		skills := slices.Clone(s.Skills)
+		slices.SortFunc(skills, func(left, right AgentSkill) int {
+			return strings.Compare(left.Name, right.Name)
+		})
+		for i, skill := range skills {
+			items[i] = map[string]any{"key": agentSkillKey(skill.Name), "path": skill.Name + "/SKILL.md"}
+		}
+
+		volumes = append(volumes, map[string]any{
+			"name": "agent-config",
+			"configMap": map[string]any{
+				"name":  SessionAgentConfigName(s.Name),
+				"items": items,
+			},
+		})
+	}
+
+	return volumes
+}
+
+// SessionAgentConfigName returns the immutable agent configuration owned by a session.
+func SessionAgentConfigName(name string) string {
+	return "session-" + name + "-agent"
+}
+
+func agentConfigMap(s Spec) resource {
+	data := map[string]any{"instructions": s.Instructions}
+	for _, skill := range s.Skills {
+		data[agentSkillKey(skill.Name)] = skill.Contents
+	}
+
+	return resource{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":        SessionAgentConfigName(s.Name),
+			"namespace":   s.Namespace,
+			"labels":      sessionLabels(s.Name),
+			"annotations": map[string]any{"airlock.yarlson.dev/agent": s.AgentName},
+		},
+		"immutable": true,
+		"data":      data,
+	}
+}
+
+func agentSkillKey(name string) string {
+	return "skill-" + name
+}
+
+func validateAgentSkills(skills []AgentSkill) error {
+	names := make(map[string]struct{}, len(skills))
+	for _, skill := range skills {
+		if !dnsLabelPattern.MatchString(skill.Name) || len(skill.Name) > 63 {
+			return errors.New("skill name must be a lowercase DNS label no longer than 63 characters")
+		}
+
+		if strings.TrimSpace(skill.Contents) == "" {
+			return fmt.Errorf("skill %s contents are required", skill.Name)
+		}
+
+		if _, exists := names[skill.Name]; exists {
+			return fmt.Errorf("skill %s is duplicated", skill.Name)
+		}
+
+		names[skill.Name] = struct{}{}
+	}
+
+	return nil
 }
 
 func sessionLabels(session string) map[string]any {

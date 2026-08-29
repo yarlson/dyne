@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yarlson/airlock/internal/agentconfig"
 	"github.com/yarlson/airlock/internal/controlplane"
 	airlockgithub "github.com/yarlson/airlock/internal/github"
 	"github.com/yarlson/airlock/pkg/agentsandbox"
@@ -41,6 +42,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
 	case "server":
 		return serve(ctx, args[1:], stderr)
+	case "agents":
+		return listAgents(ctx, args[1:], stdout)
 	case "start":
 		return start(ctx, args[1:], stdout)
 	case "status":
@@ -76,8 +79,21 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 	githubAppID := set.Int64("github-app-id", 0, "GitHub App ID")
 	githubInstallationID := set.Int64("github-installation-id", 0, "GitHub App installation ID")
 	githubPrivateKeyFile := set.String("github-private-key-file", "", "GitHub App private key file")
+	agentsFile := set.String("agents-file", "", "agent definitions YAML file")
 	if err := set.Parse(args); err != nil {
 		return err
+	}
+
+	var agents *agentconfig.Catalog
+	if *agentsFile != "" {
+		var err error
+		agents, err = agentconfig.Load(*agentsFile, agentconfig.Defaults{
+			StorageSize: *storageSize,
+			TaskTimeout: *taskTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("load agents file: %w", err)
+		}
 	}
 
 	if *githubPrivateKeyFile == "" {
@@ -106,7 +122,7 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 
 	handler := controlplane.New(control, controlplane.Config{
-		Namespace: *namespace, Image: *image, StorageSize: *storageSize, TaskTimeout: *taskTimeout,
+		Namespace: *namespace, Image: *image, TaskTimeout: *taskTimeout, Agents: agents,
 	}, nil)
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listenAddress)
 	if err != nil {
@@ -137,32 +153,38 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 func start(ctx context.Context, args []string, stdout io.Writer) error {
 	set := flag.NewFlagSet("start", flag.ContinueOnError)
 	server := serverFlag(set)
+	agent := set.String("agent", "", "configured agent name")
 	name := set.String("name", "", "session name")
-	storage := set.String("storage", "", "ephemeral or persistent")
 	repository := set.String("repo", "", "Git repository URL")
 	ref := set.String("ref", "main", "initial Git ref")
-	setup := set.String("setup", "", "setup command")
 	prompt := set.String("prompt", "", "coding task")
-	cloneDepth := set.Int("clone-depth", 1, "Git history depth; zero clones full history")
-	storageSize := set.String("storage-size", "", "persistent claim size override")
 	timeout := set.Duration("timeout", 0, "task deadline override")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
 
-	body := map[string]any{
-		"name": *name, "storage": *storage, "repository": *repository, "ref": *ref,
-		"setup": *setup, "prompt": *prompt, "clone_depth": *cloneDepth,
-	}
-	if *storageSize != "" {
-		body["storage_size"] = *storageSize
+	if *agent == "" {
+		return errors.New("--agent is required")
 	}
 
+	body := map[string]any{
+		"name": *name, "repository": *repository, "ref": *ref, "prompt": *prompt,
+	}
 	if *timeout != 0 {
 		body["timeout_seconds"] = int64(timeout.Seconds())
 	}
 
-	return requestJSON(ctx, http.MethodPost, *server, "/v1/sessions", body, stdout)
+	return requestJSON(ctx, http.MethodPost, *server, "/v1/agents/"+url.PathEscape(*agent)+"/sessions", body, stdout)
+}
+
+func listAgents(ctx context.Context, args []string, stdout io.Writer) error {
+	set := flag.NewFlagSet("agents", flag.ContinueOnError)
+	server := serverFlag(set)
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+
+	return requestJSON(ctx, http.MethodGet, *server, "/v1/agents", nil, stdout)
 }
 
 func task(ctx context.Context, args []string, stdout io.Writer) error {
@@ -328,5 +350,5 @@ func requestJSON(ctx context.Context, method, serverURL, path string, body any, 
 }
 
 func usage() string {
-	return "usage: airlock <server|start|status|logs|artifacts|task|publish|delete> [options]"
+	return "usage: airlock <server|agents|start|status|logs|artifacts|task|publish|delete> [options]"
 }

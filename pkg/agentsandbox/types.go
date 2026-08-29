@@ -63,6 +63,14 @@ type Target struct {
 	Name string
 }
 
+// AgentSkill contains one instruction-only Codex skill.
+type AgentSkill struct {
+	// Name identifies the skill in Codex.
+	Name string
+	// Contents is the complete SKILL.md file.
+	Contents string
+}
+
 // StartRequest defines a new coding session.
 type StartRequest struct {
 	// Target identifies the session.
@@ -79,6 +87,12 @@ type StartRequest struct {
 	SetupCommand string
 	// Prompt is the initial task for an explore or update session.
 	Prompt string
+	// AgentName identifies the reusable agent template used to start the session.
+	AgentName string
+	// Instructions are additional Codex developer instructions.
+	Instructions string
+	// Skills are the instruction-only Codex skills available to the agent.
+	Skills []AgentSkill
 	// CloneDepth limits fetched Git history; zero fetches full history.
 	CloneDepth int
 	// StorageSize is the requested size of each persistent workspace claim.

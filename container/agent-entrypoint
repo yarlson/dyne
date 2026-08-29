@@ -121,6 +121,11 @@ run_task() {
   load_api_key
   rm -f /artifacts/outcome.json /artifacts/pull-request.json
   local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
+  if [[ -n "${AGENT_INSTRUCTIONS:-}" ]]; then
+    local encoded_instructions
+    encoded_instructions="$(node -e 'process.stdout.write(JSON.stringify(process.env.AGENT_INSTRUCTIONS))')"
+    args+=(-c "developer_instructions=${encoded_instructions}")
+  fi
   if [[ "${AGENT_STORAGE:-}" == "ephemeral" ]]; then
     args+=(--ephemeral)
   fi

@@ -4,20 +4,20 @@ Airlock is a small HTTP control plane for coding-agent Jobs on Kubernetes. One s
 
 ## Runtime model
 
-Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, artifacts, and session definition. A continuation is another Job mounted to the same PVC.
+Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, artifacts, and session definition. A continuation is another Job mounted to the same PVC. An agent-backed session also owns an immutable ConfigMap containing its developer instructions and selected instruction-only skills.
 
 This keeps recovery simple:
 
 - Kubernetes replaces a failed task Pod. Persistent work written before the failure remains on the PVC.
 - A new `airlock task` continues the retained Codex thread and workspace after a task completes or fails.
 - The PVC stores the immutable session definition, so continuation still works after the old Jobs are deleted or the Airlock server restarts.
-- `airlock delete` removes Jobs and keeps the PVC. `airlock delete --storage` also deletes the PVC.
+- `airlock delete` removes Jobs and keeps a persistent session's PVC and agent configuration. `airlock delete --storage` also deletes retained state.
 
 The namespace must already exist and enforce the security policy appropriate for the cluster. Codex credentials must already exist in a Secret named `coding-agent-auth`. The Secret can contain `auth.json` or `CODEX_API_KEY`. Repository credentials are not stored there.
 
 ## Security boundary
 
-The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations.
+The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations. Agent definitions, instructions, skills, setup commands, and task prompts must not contain secrets. Principals allowed to read the server file, ConfigMaps, or Pod specifications can read those values.
 
 Agent Pods run as UID/GID 1000 with a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, no privilege escalation, bounded resources, and denied ingress. The agent can still access the network and its Codex credential. Airlock is intended for trusted repositories in a private cluster, not hostile multi-tenant execution.
 
@@ -44,6 +44,7 @@ Example with kubeconfig:
 ./bin/airlock server \
   --context colima-codex-proof \
   --namespace coding-agents \
+  --agents-file ./agents.yaml \
   --github-app-id 123 \
   --github-installation-id 456 \
   --github-private-key-file /secure/airlock-app.pem
@@ -57,10 +58,59 @@ Example with EKS and an assumed role:
   --aws-region eu-west-1 \
   --aws-role-arn arn:aws:iam::123456789012:role/airlock-control-plane \
   --namespace coding-agents \
+  --agents-file ./agents.yaml \
   --github-app-id 123 \
   --github-installation-id 456 \
   --github-private-key-file /secure/airlock-app.pem
 ```
+
+## Define agents
+
+An agent is a reusable session template loaded when the server starts. Changing the file requires a server restart and affects only new sessions. Existing persistent sessions continue with the immutable configuration they started with.
+
+```yaml
+version: v1
+
+agents:
+  reviewer:
+    description: Reviews repository changes.
+    storage: ephemeral
+    instructions: |
+      Review correctness, security, tests, naming, and maintainability.
+      Do not modify files unless the task requests changes.
+    skills:
+      - skills/code-review/SKILL.md
+    setup: mise install
+    clone_depth: 1
+    timeout: 2h
+
+  implementer:
+    description: Implements focused changes.
+    storage: persistent
+    instructions: Implement the smallest safe change and run focused tests.
+    setup: mise install
+    clone_depth: 1
+    storage_size: 10Gi
+    timeout: 4h
+```
+
+Each definition requires a description, `ephemeral` or `persistent` storage, and non-empty instructions. Clone depth defaults to 1. Storage size and timeout inherit the server defaults; storage size is valid only for persistent agents. The server rejects the complete file at startup if any definition is invalid.
+
+Skill paths are relative to the agent file and must identify a regular, non-symlink `SKILL.md` inside that directory. Each skill needs YAML frontmatter with a lowercase DNS-label name and a non-empty description. Airlock packages only `SKILL.md`; scripts, references, assets, plugins, and hooks are not supported. Configured skills are additive to repository and Codex system skills.
+
+List the configured agents and start a session from one:
+
+```bash
+airlock agents
+
+airlock start \
+  --agent reviewer \
+  --name review-example \
+  --repo https://github.com/example/project.git \
+  --prompt 'Review the current changes.'
+```
+
+The repository, ref, prompt, session name, and optional timeout belong to the session instance. Storage, setup, clone depth, storage size, instructions, and skills belong to the agent definition and cannot be overridden by the client.
 
 ## Run and continue sessions
 
@@ -68,10 +118,9 @@ Client commands use `--server` or `AIRLOCK_SERVER`; the default is `http://127.0
 
 ```bash
 airlock start \
+  --agent implementer \
   --name update-example \
-  --storage persistent \
   --repo https://github.com/example/project.git \
-  --setup 'mise install && npm ci' \
   --prompt 'Implement the requested change and run focused tests.'
 
 airlock status --name update-example
@@ -81,7 +130,7 @@ airlock artifacts --name update-example
 airlock task --name update-example 'Address the remaining failed test.'
 ```
 
-Use `--storage ephemeral` for disposable exploration. Ephemeral sessions cannot continue or publish.
+The selected agent definition controls storage and setup. Sessions created from ephemeral agents cannot continue or publish.
 
 ## Outcomes, artifacts, and publishing
 
@@ -102,9 +151,10 @@ The publisher mounts the retained workspace and artifacts read-only, makes a cle
 
 ## HTTP API
 
-The CLI uses these endpoints:
+The CLI uses the agent creation endpoint and the session lifecycle endpoints:
 
-- `POST /v1/sessions`
+- `GET /v1/agents`
+- `POST /v1/agents/{agent}/sessions`
 - `GET /v1/sessions/{name}`
 - `POST /v1/sessions/{name}/tasks`
 - `GET /v1/sessions/{name}/logs`

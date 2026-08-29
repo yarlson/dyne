@@ -55,6 +55,15 @@ cat > "${HOME}/.local/bin/codex" <<'CODEX'
 set -euo pipefail
 prompt="${!#}"
 prompt="${prompt%%$'\n'*}"
+verify_agent_configuration() {
+  [[ " $* " == *' -c developer_instructions="Follow the E2E agent contract." '* ]]
+  test "$(cat /home/agent/.agents/skills/e2e-contract/SKILL.md)" = "$(printf '%s' '---
+name: e2e-contract
+description: Verify the E2E agent contract.
+---
+
+Use the configured E2E behavior.')"
+}
 case "${prompt}" in
   explore-repository)
     test "$(cat /workspace/README.md)" = "fixture repository"
@@ -66,6 +75,7 @@ case "${prompt}" in
     printf 'exploration completed with a read-only workspace\n'
     ;;
   apply-update)
+	verify_agent_configuration "$@"
     test "$(cat /workspace/README.md)" = "fixture repository"
     test -s "${HOME}/mise-version"
     test -f /workspace/package-lock.json
@@ -75,6 +85,7 @@ case "${prompt}" in
     printf 'temporary update state\n' > /tmp/update-marker
     ;;
   verify-update-state)
+	verify_agent_configuration "$@"
     test "$(cat /workspace/update-marker)" = "workspace state retained"
     test "$(cat "${HOME}/tool-marker")" = "tool state retained"
     test "$(cat "${CODEX_HOME}/update-marker")" = "Codex state retained"
@@ -84,6 +95,7 @@ case "${prompt}" in
     printf 'temporary long state\n' > /tmp/long-marker
     ;;
   verify-stop-resume)
+	verify_agent_configuration "$@"
     test "$(cat /workspace/long-marker)" = "long workspace state"
     test "$(cat "${CODEX_HOME}/long-marker")" = "long Codex state"
     test ! -e /tmp/long-marker
@@ -92,6 +104,7 @@ case "${prompt}" in
     printf 'temporary resumed state\n' > /tmp/resume-marker
     ;;
   verify-delete-recreate)
+	verify_agent_configuration "$@"
     test "$(cat /workspace/long-marker)" = "long workspace state"
     test "$(cat "${HOME}/resume-marker")" = "resume state retained"
     test "$(cat "${CODEX_HOME}/long-marker")" = "long Codex state"
@@ -130,7 +143,19 @@ func TestPersistentSessionRetainsStateAndReplacesTemporaryStorage(t *testing.T) 
 	environment := newTestEnvironment(t)
 	target := codingsession.Target{Namespace: environment.sessionNamespace, Name: "persistent"}
 
-	require.NoError(t, environment.control.Start(environment.context, startRequest(environment, target, codingsession.StoragePersistent, "apply-update")))
+	request := startRequest(environment, target, codingsession.StoragePersistent, "apply-update")
+	request.AgentName = "e2e-agent"
+	request.Instructions = "Follow the E2E agent contract."
+	request.Skills = []codingsession.AgentSkill{{
+		Name: "e2e-contract",
+		Contents: `---
+name: e2e-contract
+description: Verify the E2E agent contract.
+---
+
+Use the configured E2E behavior.`,
+	}}
+	require.NoError(t, environment.control.Start(environment.context, request))
 	environment.requireJobSucceeded(t, target.Name)
 	environment.requirePersistentClaims(t, target)
 
@@ -141,10 +166,18 @@ func TestPersistentSessionRetainsStateAndReplacesTemporaryStorage(t *testing.T) 
 
 	require.NoError(t, environment.control.Delete(environment.context, target))
 	environment.requireOnlyPersistentClaims(t, target)
+	_, err := environment.client.CoreV1().ConfigMaps(environment.sessionNamespace).Get(
+		environment.context, "session-persistent-agent", metav1.GetOptions{},
+	)
+	require.NoError(t, err)
 	require.NoError(t, environment.control.Continue(environment.context, codingsession.ContinueRequest{Target: target, TaskID: "verify-delete", Prompt: "verify-delete-recreate", Timeout: 5 * time.Minute}))
 	environment.requireJobSucceeded(t, "persistent-verify-delete")
 
 	require.NoError(t, environment.control.Destroy(environment.context, target))
+	_, err = environment.client.CoreV1().ConfigMaps(environment.sessionNamespace).Get(
+		environment.context, "session-persistent-agent", metav1.GetOptions{},
+	)
+	assert.True(t, apierrors.IsNotFound(err), "agent configuration was not destroyed")
 	environment.requireSessionAbsent(t, target)
 }
 

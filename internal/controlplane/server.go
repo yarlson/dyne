@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/yarlson/airlock/internal/agentconfig"
 	"github.com/yarlson/airlock/pkg/agentsandbox"
 )
 
@@ -22,10 +24,10 @@ type Config struct {
 	Namespace string
 	// Image is the default coding-agent image.
 	Image string
-	// StorageSize is the default retained-session claim size.
-	StorageSize string
 	// TaskTimeout is the default Job deadline.
 	TaskTimeout time.Duration
+	// Agents contains the reusable agent definitions available to clients.
+	Agents *agentconfig.Catalog
 }
 
 type operations interface {
@@ -49,7 +51,8 @@ func New(control operations, config Config, newTaskID taskIDGenerator) http.Hand
 
 	server := &server{control: control, config: config, newTaskID: newTaskID}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/sessions", server.createSession)
+	mux.HandleFunc("GET /v1/agents", server.listAgents)
+	mux.HandleFunc("POST /v1/agents/{agent}/sessions", server.createAgentSession)
 	mux.HandleFunc("GET /v1/sessions/{name}", server.sessionStatus)
 	mux.HandleFunc("POST /v1/sessions/{name}/tasks", server.continueSession)
 	mux.HandleFunc("GET /v1/sessions/{name}/logs", server.sessionLogs)
@@ -66,55 +69,58 @@ type server struct {
 	newTaskID taskIDGenerator
 }
 
-type createSessionRequest struct {
+type createAgentSessionRequest struct {
 	Name           string `json:"name"`
-	Storage        string `json:"storage"`
 	Repository     string `json:"repository"`
 	InitialRef     string `json:"ref"`
-	SetupCommand   string `json:"setup"`
 	Prompt         string `json:"prompt"`
-	CloneDepth     *int   `json:"clone_depth"`
-	StorageSize    string `json:"storage_size"`
 	TimeoutSeconds *int64 `json:"timeout_seconds"`
 }
 
-func (s *server) createSession(writer http.ResponseWriter, request *http.Request) {
-	var input createSessionRequest
+func (s *server) listAgents(writer http.ResponseWriter, _ *http.Request) {
+	writeJSON(writer, http.StatusOK, struct {
+		Agents []agentconfig.Summary `json:"agents"`
+	}{Agents: s.config.Agents.List()})
+}
+
+func (s *server) createAgentSession(writer http.ResponseWriter, request *http.Request) {
+	agentName := request.PathValue("agent")
+	definition, found := s.config.Agents.Find(agentName)
+	if !found {
+		writeError(writer, http.StatusNotFound, fmt.Errorf("agent %s is not configured", agentName))
+
+		return
+	}
+
+	var input createAgentSessionRequest
 	if err := decodeJSON(writer, request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, err)
 
 		return
 	}
 
-	cloneDepth := 1
-	if input.CloneDepth != nil {
-		cloneDepth = *input.CloneDepth
-	}
-
-	storageSize := input.StorageSize
-	if storageSize == "" {
-		storageSize = s.config.StorageSize
-	}
-
-	timeout := s.config.TaskTimeout
-	if input.TimeoutSeconds != nil {
-		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
-	}
-
 	if input.InitialRef == "" {
 		input.InitialRef = "main"
+	}
+
+	timeout := definition.Timeout
+	if input.TimeoutSeconds != nil {
+		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
 	}
 
 	err := s.control.Start(request.Context(), agentsandbox.StartRequest{
 		Target:       agentsandbox.Target{Namespace: s.config.Namespace, Name: input.Name},
 		Image:        s.config.Image,
-		Storage:      agentsandbox.Storage(input.Storage),
+		Storage:      agentsandbox.Storage(definition.Storage),
 		Repository:   input.Repository,
 		InitialRef:   input.InitialRef,
-		SetupCommand: input.SetupCommand,
+		SetupCommand: definition.SetupCommand,
 		Prompt:       input.Prompt,
-		CloneDepth:   cloneDepth,
-		StorageSize:  storageSize,
+		AgentName:    definition.Name,
+		Instructions: definition.Instructions,
+		Skills:       sandboxSkills(definition.Skills),
+		CloneDepth:   definition.CloneDepth,
+		StorageSize:  definition.StorageSize,
 		Timeout:      timeout,
 	})
 	if err != nil {
@@ -123,7 +129,9 @@ func (s *server) createSession(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
-	writeJSON(writer, http.StatusAccepted, map[string]string{"name": input.Name, "task_id": input.Name})
+	writeJSON(writer, http.StatusAccepted, map[string]string{
+		"agent": definition.Name, "name": input.Name, "task_id": input.Name,
+	})
 }
 
 func (s *server) continueSession(writer http.ResponseWriter, request *http.Request) {
@@ -290,4 +298,17 @@ func randomTaskID() (string, error) {
 	}
 
 	return strings.ToLower(hex.EncodeToString(contents)), nil
+}
+
+func sandboxSkills(skills []agentconfig.Skill) []agentsandbox.AgentSkill {
+	if len(skills) == 0 {
+		return nil
+	}
+
+	result := make([]agentsandbox.AgentSkill, len(skills))
+	for i, skill := range skills {
+		result[i] = agentsandbox.AgentSkill{Name: skill.Name, Contents: skill.Contents}
+	}
+
+	return result
 }
