@@ -16,8 +16,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-
-	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 func TestSessionStatusDescribesOwnedResources(t *testing.T) {
@@ -73,13 +71,13 @@ func TestCheckSessionAvailableRejectsRetainedAgentConfiguration(t *testing.T) {
 
 func TestSetGitHubTokenReplacesOnlyRepositoryCredential(t *testing.T) {
 	clientset := fake.NewClientset(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: sessionmanifest.GitHubTokenSecretName, Namespace: "coding-agents"},
+		ObjectMeta: metav1.ObjectMeta{Name: githubTokenSecretName, Namespace: "coding-agents"},
 		Data:       map[string][]byte{"token": []byte("old"), "unrelated": []byte("keep")},
 	})
 	client := &Client{typed: clientset}
 	require.NoError(t, client.SetGitHubToken(context.Background(), "coding-agents", "short-lived"))
 
-	secret, err := clientset.CoreV1().Secrets("coding-agents").Get(context.Background(), sessionmanifest.GitHubTokenSecretName, metav1.GetOptions{})
+	secret, err := clientset.CoreV1().Secrets("coding-agents").Get(context.Background(), githubTokenSecretName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, []byte("short-lived"), secret.Data["token"])
 	assert.Equal(t, []byte("keep"), secret.Data["unrelated"])
@@ -144,7 +142,7 @@ func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testin
 	immutable := true
 	client.typed = fake.NewClientset(claim, &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        sessionmanifest.SessionAgentConfigName("example"),
+			Name:        sessionAgentConfigName("example"),
 			Namespace:   "coding-agents",
 			Labels:      labels,
 			Annotations: map[string]string{"dyne.yarlson.dev/agent": "reviewer"},
@@ -158,7 +156,7 @@ func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testin
 	definition, err := client.persistentSessionDefinition(context.Background(), "coding-agents", "example")
 	require.NoError(t, err)
 	assert.Equal(t, "reviewer", definition.AgentName)
-	assert.Equal(t, []sessionmanifest.AgentSkill{{Name: "code-review", Contents: "retained skill"}}, definition.Skills)
+	assert.Equal(t, []SessionSkill{{Name: "code-review", Contents: "retained skill"}}, definition.Skills)
 }
 
 func TestWriteSessionLogsReportsMissingSession(t *testing.T) {

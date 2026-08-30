@@ -9,7 +9,6 @@ import (
 
 	"github.com/yarlson/dyne/internal/kubernetes"
 	"github.com/yarlson/dyne/internal/publish"
-	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 type sessionTarget struct {
@@ -301,28 +300,28 @@ func (request sessionStartRequest) kubernetesRequest() kubernetes.SessionRequest
 		Name:           request.target.name,
 		Namespace:      request.target.namespace,
 		Image:          request.image,
-		Storage:        sessionmanifest.Storage(request.storage),
+		Storage:        kubernetes.SessionStorage(request.storage),
 		Repository:     request.repository,
 		InitialRef:     request.initialRef,
 		SetupCommand:   request.setupCommand,
 		Prompt:         request.prompt,
 		AgentName:      request.agentName,
 		Instructions:   request.instructions,
-		Skills:         manifestSkills(request.skills),
+		Skills:         kubernetesSkills(request.skills),
 		CloneDepth:     request.cloneDepth,
 		StorageSize:    request.storageSize,
 		TimeoutSeconds: int64(request.timeout.Seconds()),
 	}
 }
 
-func manifestSkills(skills []AgentSkill) []sessionmanifest.AgentSkill {
+func kubernetesSkills(skills []AgentSkill) []kubernetes.SessionSkill {
 	if len(skills) == 0 {
 		return nil
 	}
 
-	result := make([]sessionmanifest.AgentSkill, len(skills))
+	result := make([]kubernetes.SessionSkill, len(skills))
 	for i, skill := range skills {
-		result[i] = sessionmanifest.AgentSkill{Name: skill.Name, Contents: skill.Contents}
+		result[i] = kubernetes.SessionSkill{Name: skill.Name, Contents: skill.Contents}
 	}
 
 	return result

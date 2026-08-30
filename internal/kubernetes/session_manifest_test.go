@@ -1,4 +1,4 @@
-package sessionmanifest
+package kubernetes
 
 import (
 	"encoding/json"
@@ -61,14 +61,14 @@ type renderedResource struct {
 func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 	tests := []struct {
 		name          string
-		storage       Storage
+		storage       SessionStorage
 		workload      string
 		wantResources []string
 		wantStorage   map[string]string
 	}{
 		{
 			name:     "ephemeral session uses emptyDir",
-			storage:  StorageEphemeral,
+			storage:  SessionStorageEphemeral,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
@@ -81,7 +81,7 @@ func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 		},
 		{
 			name:     "persistent session uses one claim",
-			storage:  StoragePersistent,
+			storage:  SessionStoragePersistent,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
@@ -98,7 +98,7 @@ func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			spec := validSpec()
 			spec.Storage = test.storage
-			manifest, err := Render(spec)
+			manifest, err := renderSessionManifest(spec)
 			require.NoError(t, err)
 
 			resources := decodeRenderedResources(t, manifest)
@@ -121,7 +121,7 @@ func TestRenderContinuationReusesPersistentStorage(t *testing.T) {
 	spec.TaskName = "example-continue-abc123"
 	spec.StorageSize = ""
 	spec.Resume = true
-	manifest, err := RenderContinuation(spec)
+	manifest, err := renderContinuationManifest(spec)
 	require.NoError(t, err)
 
 	resources := decodeRenderedResources(t, manifest)
@@ -137,12 +137,12 @@ func TestRenderPackagesAgentInstructionsAndSkills(t *testing.T) {
 	spec := validSpec()
 	spec.AgentName = "reviewer"
 	spec.Instructions = "Review correctness and tests."
-	spec.Skills = []AgentSkill{{
+	spec.Skills = []SessionSkill{{
 		Name:     "code-review",
 		Contents: "---\nname: code-review\ndescription: Review code.\n---\n\nReview changed code.\n",
 	}}
 
-	manifest, err := Render(spec)
+	manifest, err := renderSessionManifest(spec)
 	require.NoError(t, err)
 	resources := decodeRenderedResources(t, manifest)
 
@@ -193,9 +193,9 @@ func TestRenderContinuationReusesAgentConfiguration(t *testing.T) {
 	spec.TaskName = "example-continue-abc123"
 	spec.Resume = true
 	spec.AgentName = "reviewer"
-	spec.Skills = []AgentSkill{{Name: "code-review", Contents: "retained skill"}}
+	spec.Skills = []SessionSkill{{Name: "code-review", Contents: "retained skill"}}
 
-	manifest, err := RenderContinuation(spec)
+	manifest, err := renderContinuationManifest(spec)
 	require.NoError(t, err)
 	resources := decodeRenderedResources(t, manifest)
 
@@ -214,7 +214,7 @@ func TestRenderAgentWithoutSkillsDoesNotProjectInstructionsAsSkill(t *testing.T)
 	spec.AgentName = "reviewer"
 	spec.Instructions = "Review correctness and tests."
 
-	manifest, err := Render(spec)
+	manifest, err := renderSessionManifest(spec)
 	require.NoError(t, err)
 	resources := decodeRenderedResources(t, manifest)
 
@@ -231,16 +231,16 @@ func TestRenderAgentWithoutSkillsDoesNotProjectInstructionsAsSkill(t *testing.T)
 func TestRenderRejectsInvalidContracts(t *testing.T) {
 	cases := []struct {
 		name    string
-		change  func(*Spec)
+		change  func(*sessionManifestSpec)
 		message string
 	}{
-		{name: "unsafe name", change: func(s *Spec) { s.Name = "Not Safe" }, message: "name"},
-		{name: "missing prompt", change: func(s *Spec) { s.Prompt = "" }, message: "prompt"},
-		{name: "unknown storage", change: func(s *Spec) { s.Storage = "remote" }, message: "unsupported"},
-		{name: "negative clone depth", change: func(s *Spec) { s.CloneDepth = -1 }, message: "clone depth"},
+		{name: "unsafe name", change: func(s *sessionManifestSpec) { s.Name = "Not Safe" }, message: "name"},
+		{name: "missing prompt", change: func(s *sessionManifestSpec) { s.Prompt = "" }, message: "prompt"},
+		{name: "unknown storage", change: func(s *sessionManifestSpec) { s.Storage = "remote" }, message: "unsupported"},
+		{name: "negative clone depth", change: func(s *sessionManifestSpec) { s.CloneDepth = -1 }, message: "clone depth"},
 		{
 			name: "oversized agent configuration",
-			change: func(s *Spec) {
+			change: func(s *sessionManifestSpec) {
 				s.AgentName = "reviewer"
 				s.Instructions = strings.Repeat("x", 900*1024+1)
 			},
@@ -251,18 +251,18 @@ func TestRenderRejectsInvalidContracts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			spec := validSpec()
 			test.change(&spec)
-			_, err := Render(spec)
+			_, err := renderSessionManifest(spec)
 			require.ErrorContains(t, err, test.message)
 		})
 	}
 }
 
-func validSpec() Spec {
-	return Spec{
+func validSpec() sessionManifestSpec {
+	return sessionManifestSpec{
 		Name:           "example",
-		Namespace:      DefaultNamespace,
-		Image:          DefaultImage,
-		Storage:        StoragePersistent,
+		Namespace:      "coding-agents",
+		Image:          "coding-agent:local",
+		Storage:        SessionStoragePersistent,
 		InitialRef:     "main",
 		Prompt:         "inspect the repository",
 		CloneDepth:     1,

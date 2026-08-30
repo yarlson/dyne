@@ -17,8 +17,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
-
-	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 const publishIntentAnnotationKey = "coding-agent/publish-intent"
@@ -134,7 +132,7 @@ func (c *Client) SessionPublishSource(ctx context.Context, namespace, session st
 		return PublishSource{}, errors.New("session repository and base ref are required for publishing")
 	}
 
-	workspaceClaim := sessionmanifest.SessionClaimName(session)
+	workspaceClaim := sessionClaimName(session)
 
 	return PublishSource{
 		Repository:     definition.Repository,
@@ -146,7 +144,7 @@ func (c *Client) SessionPublishSource(ctx context.Context, namespace, session st
 
 // GitHubToken returns the token stored in the namespace's GitHub Secret.
 func (c *Client) GitHubToken(ctx context.Context, namespace string) (string, error) {
-	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, sessionmanifest.GitHubTokenSecretName, metav1.GetOptions{})
+	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, githubTokenSecretName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("get GitHub Secret: %w", err)
 	}
@@ -414,7 +412,7 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 						{
 							Name: "git-auth",
 							VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-								SecretName:  sessionmanifest.GitHubTokenSecretName,
+								SecretName:  githubTokenSecretName,
 								DefaultMode: new(int32(0o440)),
 							}},
 						},

@@ -38,8 +38,7 @@ Before implementation, report the existing pattern, how the change will follow i
 - `cmd/dyne` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
 - `internal/controlplane` owns the private HTTP contract for sessions, tasks, logs, artifacts, publishing, and deletion.
 - `internal/agent` owns configured agent and session operations and translates lower-level results into entrypoint-neutral contracts.
-- `internal/sessionmanifest` validates session specifications and renders ephemeral and persistent Job resources without contacting a cluster.
-- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; Kubernetes API operations; resource status; retained definitions; and publisher Jobs.
+- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; session resource validation and rendering; Kubernetes API operations; resource status; retained definitions; and publisher Jobs.
 - `internal/publish` owns publish eligibility, intent identity, branch ownership, retry recovery, pull-request sequencing, and publisher cleanup.
 - `internal/github` owns GitHub App installation authentication, supported repository URLs, commit identity, branch visibility, and pull-request operations.
 - `container/` owns the runtime image and entrypoint. It prepares workspaces, runs bounded Codex tasks, validates result artifacts, and publishes through a clean clone.
@@ -52,12 +51,10 @@ cmd/dyne -> internal/github
 cmd/dyne -> internal/agent
 internal/controlplane -> internal/agent
 internal/agentconfig -> internal/agent
-internal/agent -> internal/sessionmanifest
 internal/agent -> internal/kubernetes
 internal/agent -> internal/publish
 internal/publish -> internal/kubernetes
 internal/publish -> internal/github
-internal/kubernetes -> internal/sessionmanifest
 ```
 
 Do not bypass an owning module. Keep external SDK types inside their integration package and translate them at the boundary.

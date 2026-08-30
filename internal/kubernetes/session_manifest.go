@@ -1,4 +1,4 @@
-package sessionmanifest
+package kubernetes
 
 import (
 	"encoding/json"
@@ -10,93 +10,47 @@ import (
 )
 
 const (
-	// DefaultNamespace is the namespace used when a caller does not specify one.
-	DefaultNamespace = "coding-agents"
-	// DefaultImage is the coding-session image used when a caller does not specify one.
-	DefaultImage = "coding-agent:local"
-	// GitHubTokenSecretName is the name of the Secret that stores the GitHub token.
-	GitHubTokenSecretName = "coding-agent-git-auth"
-	codexAuthSecretName   = "coding-agent-auth"
-	maxAgentConfigBytes   = 900 * 1024
-	// SessionImageAnnotation stores the image in a retained session definition.
-	SessionImageAnnotation = "dyne.yarlson.dev/image"
-	// SessionRepositoryAnnotation stores the repository in a retained session definition.
-	SessionRepositoryAnnotation = "dyne.yarlson.dev/repository"
-	// SessionInitialRefAnnotation stores the initial ref in a retained session definition.
-	SessionInitialRefAnnotation = "dyne.yarlson.dev/initial-ref"
-	// SessionSetupAnnotation stores the setup command in a retained session definition.
-	SessionSetupAnnotation = "dyne.yarlson.dev/setup"
-	// SessionCloneDepthAnnotation stores the clone depth in a retained session definition.
-	SessionCloneDepthAnnotation = "dyne.yarlson.dev/clone-depth"
-	// SessionAgentAnnotation stores the configured agent name in retained resources.
-	SessionAgentAnnotation = "dyne.yarlson.dev/agent"
+	githubTokenSecretName       = "coding-agent-git-auth"
+	codexAuthSecretName         = "coding-agent-auth"
+	maxAgentConfigBytes         = 900 * 1024
+	sessionImageAnnotation      = "dyne.yarlson.dev/image"
+	sessionRepositoryAnnotation = "dyne.yarlson.dev/repository"
+	sessionInitialRefAnnotation = "dyne.yarlson.dev/initial-ref"
+	sessionSetupAnnotation      = "dyne.yarlson.dev/setup"
+	sessionCloneDepthAnnotation = "dyne.yarlson.dev/clone-depth"
+	sessionAgentAnnotation      = "dyne.yarlson.dev/agent"
 )
 
-// Storage controls whether a session retains state after its task Pod is removed.
-type Storage string
-
-const (
-	// StorageEphemeral uses Pod-owned temporary storage for one disposable task.
-	StorageEphemeral Storage = "ephemeral"
-	// StoragePersistent retains workspace, tool, and agent state on one claim.
-	StoragePersistent Storage = "persistent"
-)
-
-// AgentSkill contains one instruction-only Codex skill.
-type AgentSkill struct {
-	// Name identifies the skill inside the Codex skill directory.
-	Name string
-	// Contents is the complete SKILL.md file.
-	Contents string
-}
-
-// Spec defines one coding-session workload.
-type Spec struct {
-	// Name identifies the session and prefixes its Kubernetes resources.
-	Name string
-	// Namespace is the Kubernetes namespace that owns the session.
-	Namespace string
-	// Image is the container image that runs setup and agent commands.
-	Image string
-	// Storage selects whether session state is temporary or persistent.
-	Storage Storage
-	// TaskName identifies the Job; an empty value uses the session name.
-	TaskName string
-	// Resume continues the retained agent thread for a persistent session.
-	Resume bool
-	// Repository is the Git repository cloned into the workspace; an empty value initializes a new repository.
-	Repository string
-	// InitialRef is the Git branch or tag cloned for the session.
-	InitialRef string
-	// SetupCommand is the shell command run before the agent starts.
-	SetupCommand string
-	// Prompt is the task given to a bounded session.
-	Prompt string
-	// AgentName identifies the reusable agent template used to start the session.
-	AgentName string
-	// Instructions are additional Codex developer instructions.
-	Instructions string
-	// Skills are the instruction-only Codex skills available to the agent.
-	Skills []AgentSkill
-	// CloneDepth limits fetched Git history; zero fetches the full history.
-	CloneDepth int
-	// StorageSize is the requested size of the workspace and tool-home claims.
-	StorageSize string
-	// TimeoutSeconds is the bounded session deadline in seconds.
+type sessionManifestSpec struct {
+	Name           string
+	Namespace      string
+	Image          string
+	Storage        SessionStorage
+	TaskName       string
+	Resume         bool
+	Repository     string
+	InitialRef     string
+	SetupCommand   string
+	Prompt         string
+	AgentName      string
+	Instructions   string
+	Skills         []SessionSkill
+	CloneDepth     int
+	StorageSize    string
 	TimeoutSeconds int64
 }
 
-type resource map[string]any
+type manifestResource map[string]any
 
-type resourceList struct {
-	APIVersion string     `json:"apiVersion"`
-	Kind       string     `json:"kind"`
-	Items      []resource `json:"items"`
+type manifestResourceList struct {
+	APIVersion string             `json:"apiVersion"`
+	Kind       string             `json:"kind"`
+	Items      []manifestResource `json:"items"`
 }
 
 var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
-func (s Spec) validate(initial bool) error {
+func (s sessionManifestSpec) validate(initial bool) error {
 	if !dnsLabelPattern.MatchString(s.Name) || len(s.Name) > 40 {
 		return errors.New("name must be a lowercase DNS label no longer than 40 characters")
 	}
@@ -161,7 +115,7 @@ func (s Spec) validate(initial bool) error {
 	}
 
 	switch s.Storage {
-	case StorageEphemeral, StoragePersistent:
+	case SessionStorageEphemeral, SessionStoragePersistent:
 	default:
 		return fmt.Errorf("unsupported storage %q", s.Storage)
 	}
@@ -169,14 +123,12 @@ func (s Spec) validate(initial bool) error {
 	return nil
 }
 
-// Render validates a session and returns the Kubernetes resources that run it.
-func Render(s Spec) ([]byte, error) {
+func renderSessionManifest(s sessionManifestSpec) ([]byte, error) {
 	return render(s, true)
 }
 
-// RenderContinuation returns a Job that reuses an existing persistent session claim.
-func RenderContinuation(s Spec) ([]byte, error) {
-	if s.Storage != StoragePersistent {
+func renderContinuationManifest(s sessionManifestSpec) ([]byte, error) {
+	if s.Storage != SessionStoragePersistent {
 		return nil, errors.New("continuation requires persistent storage")
 	}
 
@@ -187,13 +139,13 @@ func RenderContinuation(s Spec) ([]byte, error) {
 	return render(s, false)
 }
 
-func render(s Spec, initial bool) ([]byte, error) {
+func render(s sessionManifestSpec, initial bool) ([]byte, error) {
 	if err := s.validate(initial); err != nil {
 		return nil, err
 	}
 
-	items := []resource{denyIngressPolicy(s.Namespace)}
-	if initial && s.Storage == StoragePersistent {
+	items := []manifestResource{denyIngressPolicy(s.Namespace)}
+	if initial && s.Storage == SessionStoragePersistent {
 		items = append(items, persistentVolumeClaim(s))
 	}
 
@@ -206,17 +158,16 @@ func render(s Spec, initial bool) ([]byte, error) {
 	return encodeResourceList(items)
 }
 
-func encodeResourceList(items []resource) ([]byte, error) {
-	return json.MarshalIndent(resourceList{APIVersion: "v1", Kind: "List", Items: items}, "", "  ")
+func encodeResourceList(items []manifestResource) ([]byte, error) {
+	return json.MarshalIndent(manifestResourceList{APIVersion: "v1", Kind: "List", Items: items}, "", "  ")
 }
 
-// SessionClaimName returns the persistent claim that owns all retained session state.
-func SessionClaimName(name string) string {
+func sessionClaimName(name string) string {
 	return "session-" + name
 }
 
-func denyIngressPolicy(namespace string) resource {
-	return resource{
+func denyIngressPolicy(namespace string) manifestResource {
+	return manifestResource{
 		"apiVersion": "networking.k8s.io/v1",
 		"kind":       "NetworkPolicy",
 		"metadata": map[string]any{
@@ -230,23 +181,23 @@ func denyIngressPolicy(namespace string) resource {
 	}
 }
 
-func persistentVolumeClaim(s Spec) resource {
+func persistentVolumeClaim(s sessionManifestSpec) manifestResource {
 	annotations := map[string]any{
-		SessionImageAnnotation:      s.Image,
-		SessionRepositoryAnnotation: s.Repository,
-		SessionInitialRefAnnotation: s.InitialRef,
-		SessionSetupAnnotation:      s.SetupCommand,
-		SessionCloneDepthAnnotation: fmt.Sprintf("%d", s.CloneDepth),
+		sessionImageAnnotation:      s.Image,
+		sessionRepositoryAnnotation: s.Repository,
+		sessionInitialRefAnnotation: s.InitialRef,
+		sessionSetupAnnotation:      s.SetupCommand,
+		sessionCloneDepthAnnotation: fmt.Sprintf("%d", s.CloneDepth),
 	}
 	if s.AgentName != "" {
-		annotations[SessionAgentAnnotation] = s.AgentName
+		annotations[sessionAgentAnnotation] = s.AgentName
 	}
 
-	return resource{
+	return manifestResource{
 		"apiVersion": "v1",
 		"kind":       "PersistentVolumeClaim",
 		"metadata": map[string]any{
-			"name":        SessionClaimName(s.Name),
+			"name":        sessionClaimName(s.Name),
 			"namespace":   s.Namespace,
 			"labels":      sessionLabels(s.Name),
 			"annotations": annotations,
@@ -260,12 +211,12 @@ func persistentVolumeClaim(s Spec) resource {
 	}
 }
 
-func sessionJob(s Spec) resource {
+func sessionJob(s sessionManifestSpec) manifestResource {
 	name := taskName(s)
 	labels := sessionLabels(s.Name)
 	labels["coding-agent/task"] = name
 
-	return resource{
+	return manifestResource{
 		"apiVersion": "batch/v1",
 		"kind":       "Job",
 		"metadata": map[string]any{
@@ -281,8 +232,8 @@ func sessionJob(s Spec) resource {
 	}
 }
 
-func sessionPodTemplate(s Spec) map[string]any {
-	workspaceReadOnly := s.Storage == StorageEphemeral
+func sessionPodTemplate(s sessionManifestSpec) map[string]any {
+	workspaceReadOnly := s.Storage == SessionStorageEphemeral
 
 	return map[string]any{
 		"metadata": map[string]any{"labels": taskLabels(s)},
@@ -323,7 +274,7 @@ type mountAccess struct {
 	agentSkills       bool
 }
 
-func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, access mountAccess) map[string]any {
+func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceReadOnly bool, access mountAccess) map[string]any {
 	volumeMounts := make([]any, 0, 5)
 	if access.workspace {
 		volumeMounts = append(volumeMounts, map[string]any{"name": "session", "mountPath": "/workspace", "subPath": "workspace", "readOnly": workspaceReadOnly})
@@ -379,7 +330,7 @@ func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, a
 		environment = append(environment, map[string]any{
 			"name": "AGENT_INSTRUCTIONS",
 			"valueFrom": map[string]any{
-				"configMapKeyRef": map[string]any{"name": SessionAgentConfigName(s.Name), "key": "instructions"},
+				"configMapKeyRef": map[string]any{"name": sessionAgentConfigName(s.Name), "key": "instructions"},
 			},
 		})
 	}
@@ -414,14 +365,14 @@ func sessionContainer(s Spec, name string, args []any, workspaceReadOnly bool, a
 	}
 }
 
-func taskLabels(s Spec) map[string]any {
+func taskLabels(s sessionManifestSpec) map[string]any {
 	labels := sessionLabels(s.Name)
 	labels["coding-agent/task"] = taskName(s)
 
 	return labels
 }
 
-func taskName(s Spec) string {
+func taskName(s sessionManifestSpec) string {
 	if s.TaskName != "" {
 		return s.TaskName
 	}
@@ -429,7 +380,7 @@ func taskName(s Spec) string {
 	return s.Name
 }
 
-func sessionDirectoryContainer(s Spec) map[string]any {
+func sessionDirectoryContainer(s sessionManifestSpec) map[string]any {
 	container := sessionContainer(s, "session-init", nil, false, mountAccess{})
 	container["command"] = []any{"mkdir"}
 	container["args"] = []any{"-p", "/session/workspace", "/session/home", "/session/agent", "/session/logs", "/session/artifacts", "/session/state"}
@@ -438,12 +389,12 @@ func sessionDirectoryContainer(s Spec) map[string]any {
 	return container
 }
 
-func sessionVolumes(s Spec) []any {
+func sessionVolumes(s sessionManifestSpec) []any {
 	session := map[string]any{"name": "session"}
-	if s.Storage == StorageEphemeral {
+	if s.Storage == SessionStorageEphemeral {
 		session["emptyDir"] = map[string]any{"sizeLimit": "7Gi"}
 	} else {
-		session["persistentVolumeClaim"] = map[string]any{"claimName": SessionClaimName(s.Name)}
+		session["persistentVolumeClaim"] = map[string]any{"claimName": sessionClaimName(s.Name)}
 	}
 
 	volumes := []any{
@@ -460,7 +411,7 @@ func sessionVolumes(s Spec) []any {
 		map[string]any{
 			"name": "git-auth",
 			"secret": map[string]any{
-				"secretName":  GitHubTokenSecretName,
+				"secretName":  githubTokenSecretName,
 				"optional":    true,
 				"defaultMode": 288,
 			},
@@ -469,7 +420,7 @@ func sessionVolumes(s Spec) []any {
 	if len(s.Skills) > 0 {
 		items := make([]any, len(s.Skills))
 		skills := slices.Clone(s.Skills)
-		slices.SortFunc(skills, func(left, right AgentSkill) int {
+		slices.SortFunc(skills, func(left, right SessionSkill) int {
 			return strings.Compare(left.Name, right.Name)
 		})
 		for i, skill := range skills {
@@ -479,7 +430,7 @@ func sessionVolumes(s Spec) []any {
 		volumes = append(volumes, map[string]any{
 			"name": "agent-config",
 			"configMap": map[string]any{
-				"name":  SessionAgentConfigName(s.Name),
+				"name":  sessionAgentConfigName(s.Name),
 				"items": items,
 			},
 		})
@@ -488,25 +439,24 @@ func sessionVolumes(s Spec) []any {
 	return volumes
 }
 
-// SessionAgentConfigName returns the immutable agent configuration owned by a session.
-func SessionAgentConfigName(name string) string {
+func sessionAgentConfigName(name string) string {
 	return "session-" + name + "-agent"
 }
 
-func agentConfigMap(s Spec) resource {
+func agentConfigMap(s sessionManifestSpec) manifestResource {
 	data := map[string]any{"instructions": s.Instructions}
 	for _, skill := range s.Skills {
 		data[agentSkillKey(skill.Name)] = skill.Contents
 	}
 
-	return resource{
+	return manifestResource{
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
 		"metadata": map[string]any{
-			"name":        SessionAgentConfigName(s.Name),
+			"name":        sessionAgentConfigName(s.Name),
 			"namespace":   s.Namespace,
 			"labels":      sessionLabels(s.Name),
-			"annotations": map[string]any{SessionAgentAnnotation: s.AgentName},
+			"annotations": map[string]any{sessionAgentAnnotation: s.AgentName},
 		},
 		"immutable": true,
 		"data":      data,
@@ -517,7 +467,7 @@ func agentSkillKey(name string) string {
 	return "skill-" + name
 }
 
-func validateAgentSkills(skills []AgentSkill) error {
+func validateAgentSkills(skills []SessionSkill) error {
 	names := make(map[string]struct{}, len(skills))
 	for _, skill := range skills {
 		if !dnsLabelPattern.MatchString(skill.Name) || len(skill.Name) > 63 {

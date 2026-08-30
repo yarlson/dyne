@@ -26,8 +26,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/util/retry"
-
-	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 const fieldManagerName = "dyne"
@@ -48,8 +46,26 @@ type sessionDefinition struct {
 	InitialRef   string
 	SetupCommand string
 	AgentName    string
-	Skills       []sessionmanifest.AgentSkill
+	Skills       []SessionSkill
 	CloneDepth   int
+}
+
+// SessionStorage controls whether Kubernetes retains session state after its task Pod is removed.
+type SessionStorage string
+
+const (
+	// SessionStorageEphemeral uses Pod-owned temporary storage for one disposable task.
+	SessionStorageEphemeral SessionStorage = "ephemeral"
+	// SessionStoragePersistent retains workspace, tool, and agent state on one claim.
+	SessionStoragePersistent SessionStorage = "persistent"
+)
+
+// SessionSkill contains one instruction-only Codex skill mounted into a session.
+type SessionSkill struct {
+	// Name identifies the skill inside the Codex skill directory.
+	Name string
+	// Contents is the complete SKILL.md file.
+	Contents string
 }
 
 // SessionRequest contains the validated inputs used to create one session workload.
@@ -57,14 +73,14 @@ type SessionRequest struct {
 	Name           string
 	Namespace      string
 	Image          string
-	Storage        sessionmanifest.Storage
+	Storage        SessionStorage
 	Repository     string
 	InitialRef     string
 	SetupCommand   string
 	Prompt         string
 	AgentName      string
 	Instructions   string
-	Skills         []sessionmanifest.AgentSkill
+	Skills         []SessionSkill
 	CloneDepth     int
 	StorageSize    string
 	TimeoutSeconds int64
@@ -138,7 +154,7 @@ func (request SessionRequest) Validate() error {
 }
 
 func (request SessionRequest) manifest() ([]byte, error) {
-	return sessionmanifest.Render(sessionmanifest.Spec{
+	return renderSessionManifest(sessionManifestSpec{
 		Name:           request.Name,
 		Namespace:      request.Namespace,
 		Image:          request.Image,
@@ -163,12 +179,12 @@ func (c *Client) ContinueSession(ctx context.Context, request ContinuationReques
 		return err
 	}
 
-	manifest, err := sessionmanifest.RenderContinuation(sessionmanifest.Spec{
+	manifest, err := renderContinuationManifest(sessionManifestSpec{
 		Name:           request.Name,
 		TaskName:       request.TaskName,
 		Namespace:      request.Namespace,
 		Image:          definition.Image,
-		Storage:        sessionmanifest.StoragePersistent,
+		Storage:        SessionStoragePersistent,
 		Repository:     definition.Repository,
 		InitialRef:     definition.InitialRef,
 		SetupCommand:   definition.SetupCommand,
@@ -219,10 +235,10 @@ func (c *Client) SetGitHubToken(ctx context.Context, namespace, token string) er
 
 	secrets := c.typed.CoreV1().Secrets(namespace)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		secret, err := secrets.Get(ctx, sessionmanifest.GitHubTokenSecretName, metav1.GetOptions{})
+		secret, err := secrets.Get(ctx, githubTokenSecretName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			_, err = secrets.Create(ctx, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: sessionmanifest.GitHubTokenSecretName, Namespace: namespace},
+				ObjectMeta: metav1.ObjectMeta{Name: githubTokenSecretName, Namespace: namespace},
 				Type:       corev1.SecretTypeOpaque,
 				Data:       map[string][]byte{"token": []byte(token)},
 			}, metav1.CreateOptions{})
@@ -275,7 +291,7 @@ func (c *Client) persistentSessionDefinition(ctx context.Context, namespace, nam
 }
 
 func (c *Client) retainedSessionDefinition(ctx context.Context, namespace, name string) (sessionDefinition, error) {
-	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionmanifest.SessionClaimName(name), metav1.GetOptions{})
+	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionClaimName(name), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return sessionDefinition{}, fmt.Errorf("%w: get session PersistentVolumeClaim: %w", errRetainedSessionNotFound, err)
 	}
@@ -288,21 +304,21 @@ func (c *Client) retainedSessionDefinition(ctx context.Context, namespace, name 
 		return sessionDefinition{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
 	}
 
-	cloneDepth, err := strconv.Atoi(claim.Annotations[sessionmanifest.SessionCloneDepthAnnotation])
+	cloneDepth, err := strconv.Atoi(claim.Annotations[sessionCloneDepthAnnotation])
 	if err != nil || cloneDepth < 0 {
 		return sessionDefinition{}, errors.New("session has an invalid clone depth")
 	}
 
-	image := claim.Annotations[sessionmanifest.SessionImageAnnotation]
-	initialRef := claim.Annotations[sessionmanifest.SessionInitialRefAnnotation]
+	image := claim.Annotations[sessionImageAnnotation]
+	initialRef := claim.Annotations[sessionInitialRefAnnotation]
 	if image == "" || initialRef == "" {
 		return sessionDefinition{}, errors.New("session PersistentVolumeClaim has an incomplete definition")
 	}
 
-	agentName := claim.Annotations[sessionmanifest.SessionAgentAnnotation]
-	var skills []sessionmanifest.AgentSkill
+	agentName := claim.Annotations[sessionAgentAnnotation]
+	var skills []SessionSkill
 	if agentName != "" {
-		configuration, err := c.typed.CoreV1().ConfigMaps(namespace).Get(ctx, sessionmanifest.SessionAgentConfigName(name), metav1.GetOptions{})
+		configuration, err := c.typed.CoreV1().ConfigMaps(namespace).Get(ctx, sessionAgentConfigName(name), metav1.GetOptions{})
 		if err != nil {
 			return sessionDefinition{}, fmt.Errorf("get agent ConfigMap: %w", err)
 		}
@@ -315,17 +331,17 @@ func (c *Client) retainedSessionDefinition(ctx context.Context, namespace, name 
 
 	return sessionDefinition{
 		Image:        image,
-		Repository:   claim.Annotations[sessionmanifest.SessionRepositoryAnnotation],
+		Repository:   claim.Annotations[sessionRepositoryAnnotation],
 		InitialRef:   initialRef,
-		SetupCommand: claim.Annotations[sessionmanifest.SessionSetupAnnotation],
+		SetupCommand: claim.Annotations[sessionSetupAnnotation],
 		AgentName:    agentName,
 		Skills:       skills,
 		CloneDepth:   cloneDepth,
 	}, nil
 }
 
-func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]sessionmanifest.AgentSkill, error) {
-	if configuration.Immutable == nil || !*configuration.Immutable || configuration.Annotations[sessionmanifest.SessionAgentAnnotation] != agentName {
+func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]SessionSkill, error) {
+	if configuration.Immutable == nil || !*configuration.Immutable || configuration.Annotations[sessionAgentAnnotation] != agentName {
 		return nil, errors.New("agent ConfigMap has an invalid definition")
 	}
 
@@ -333,7 +349,7 @@ func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]s
 		return nil, errors.New("agent ConfigMap has an incomplete definition")
 	}
 
-	skills := make([]sessionmanifest.AgentSkill, 0, len(configuration.Data)-1)
+	skills := make([]SessionSkill, 0, len(configuration.Data)-1)
 	for key, contents := range configuration.Data {
 		name, found := strings.CutPrefix(key, "skill-")
 		if !found {
@@ -344,7 +360,7 @@ func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]s
 			continue
 		}
 
-		skills = append(skills, sessionmanifest.AgentSkill{Name: name, Contents: contents})
+		skills = append(skills, SessionSkill{Name: name, Contents: contents})
 	}
 
 	sort.Slice(skills, func(i, j int) bool {
@@ -501,7 +517,7 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 	}
 
 	if !deleteStorage {
-		_, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionmanifest.SessionClaimName(name), metav1.GetOptions{})
+		_, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionClaimName(name), metav1.GetOptions{})
 		if err == nil {
 			return nil
 		}
@@ -519,7 +535,7 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 		return nil
 	}
 
-	claim := sessionmanifest.SessionClaimName(name)
+	claim := sessionClaimName(name)
 	if err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -534,7 +550,7 @@ func (c *Client) deleteSession(ctx context.Context, namespace, name string, dele
 }
 
 func (c *Client) deleteAgentConfig(ctx context.Context, namespace, session string) error {
-	name := sessionmanifest.SessionAgentConfigName(session)
+	name := sessionAgentConfigName(session)
 	if err := c.typed.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil

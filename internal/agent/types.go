@@ -3,15 +3,13 @@ package agent
 import (
 	"context"
 	"encoding/json"
-
-	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 const (
 	// DefaultNamespace is the namespace used when a caller does not specify one.
-	DefaultNamespace = sessionmanifest.DefaultNamespace
+	DefaultNamespace = "coding-agents"
 	// DefaultImage is the coding-session image used when a caller does not specify one.
-	DefaultImage = sessionmanifest.DefaultImage
+	DefaultImage = "coding-agent:local"
 )
 
 // Storage controls whether a session retains state after a task finishes.

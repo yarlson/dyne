@@ -13,8 +13,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 func TestSessionPublishSourceReturnsCompletedUpdateWorkspace(t *testing.T) {
@@ -65,7 +63,7 @@ func TestSessionPublishSourceReportsMissingRetainedAgentDefinition(t *testing.T)
 		Status:     batchv1.JobStatus{Succeeded: 1},
 	}
 	claim := boundWorkspaceClaim()
-	claim.Annotations[sessionmanifest.SessionAgentAnnotation] = "implementer"
+	claim.Annotations[sessionAgentAnnotation] = "implementer"
 	client := &Client{typed: fake.NewClientset(job, claim, completedTaskPod())}
 
 	_, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
