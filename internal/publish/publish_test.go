@@ -10,325 +10,293 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/yarlson/dyne/internal/github"
-	"github.com/yarlson/dyne/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/session"
 )
 
-func TestPublishSessionRecoversExistingPullRequestAndCleansPublisher(t *testing.T) {
-	request := validPublishRequest()
-	wantIntentID := "34205b65a7344f406dd8d5802ceb811d7216f535751324a35dadac24bd776d92"
+func TestPublishRecordsIntentBeforeCheckingOrChangingGitHub(t *testing.T) {
 	var operations []string
-	cluster := publishClusterForRequest(t)
-	cluster.intent = func(context.Context, string, string) (string, bool, error) {
-		return wantIntentID, true, nil
-	}
-	cluster.waitPublisher = func(_ context.Context, namespace, session, intentID string, timeout time.Duration) (kubernetes.PublisherJobResult, error) {
-		operations = append(operations, "wait for publisher")
-		assert.Equal(t, "coding-agents", namespace)
-		assert.Equal(t, "review", session)
-		assert.Equal(t, wantIntentID, intentID)
-		assert.Equal(t, time.Minute, timeout)
+	repository := newMemoryRepository()
+	repository.created = func(Record) { operations = append(operations, "record intent") }
+	runtime := runtimeStub{run: func(request RuntimeRequest) (RuntimeResult, error) {
+		operations = append(operations, "publish branch")
+		assert.Equal(t, "installation-token", request.RepositoryCredential)
 
-		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: "9a4484441215661904e02a807adf5034d13f5bbe", Title: "Review changes", Body: "Ready for review"}, nil
-	}
-	cluster.deletePublisher = func(_ context.Context, namespace, session string) error {
-		operations = append(operations, "delete publisher")
-		assert.Equal(t, "coding-agents", namespace)
-		assert.Equal(t, "review", session)
-
-		return nil
-	}
+		return RuntimeResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
+	}}
 	client := githubClientStub{
-		findPull: func(_ context.Context, _ github.Repository, baseBranch, branch string) (*github.PullRequest, error) {
+		findPull: func() (*github.PullRequest, error) {
 			operations = append(operations, "find pull request")
-			assert.Equal(t, "main", baseBranch)
-			assert.Equal(t, "yar/review", branch)
 
-			return &github.PullRequest{Number: 17, URL: "https://github.com/lokalise/kargo/pull/17"}, nil
-		},
-	}
-	result, err := publishSession(context.Background(), cluster, request, githubClientFactory(t, client))
-	require.NoError(t, err)
-
-	wantResult := Result{
-		PullRequestNumber: 17,
-		PullRequestURL:    "https://github.com/lokalise/kargo/pull/17",
-		Branch:            "yar/review",
-	}
-	assert.Equal(t, wantResult, result)
-
-	wantOperations := []string{"find pull request", "wait for publisher", "delete publisher"}
-	assert.Equal(t, wantOperations, operations)
-}
-
-func TestSessionRejectsInvalidRequestBeforeUsingCluster(t *testing.T) {
-	request := validPublishRequest()
-	request.Branch = " yar/review"
-	_, err := Session(context.Background(), nil, request)
-	require.EqualError(t, err, "branch must not start or end with whitespace")
-}
-
-func TestPublishSessionRejectsExistingBranchWithoutPublisherOwnership(t *testing.T) {
-	request := validPublishRequest()
-	cluster := publishClusterForRequest(t)
-	client := githubClientStub{
-		findPull: func(context.Context, github.Repository, string, string) (*github.PullRequest, error) {
 			return nil, nil
 		},
-		branchCommit: func(context.Context, github.Repository, string) (string, bool, error) {
-			return "9a4484441215661904e02a807adf5034d13f5bbe", true, nil
-		},
-	}
-	_, err := publishSession(context.Background(), cluster, request, githubClientFactory(t, client))
-	require.EqualError(t, err, "remote branch yar/review already exists and is not owned by this publish request")
-}
-
-func TestPublishSessionCleansFailedPublisherWhenBranchWasNotCreated(t *testing.T) {
-	publisherFailure := errors.New("publisher Pod failed")
-	var operations []string
-	cluster := publishClusterForRequest(t)
-	cluster.runPublisher = func(context.Context, kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error) {
-		operations = append(operations, "publish branch")
-
-		return kubernetes.PublisherJobResult{}, publisherFailure
-	}
-	cluster.deletePublisher = func(context.Context, string, string) error {
-		operations = append(operations, "delete publisher")
-
-		return nil
-	}
-	client := githubClientStub{
-		findPull: func(context.Context, github.Repository, string, string) (*github.PullRequest, error) {
-			return nil, nil
-		},
-		branchCommit: func(context.Context, github.Repository, string) (string, bool, error) {
-			operations = append(operations, "check branch")
-
-			return "", false, nil
-		},
-	}
-	_, err := publishSession(context.Background(), cluster, validPublishRequest(), githubClientFactory(t, client))
-	require.ErrorIs(t, err, publisherFailure)
-
-	wantOperations := []string{"check branch", "publish branch", "check branch", "delete publisher"}
-	assert.Equal(t, wantOperations, operations)
-}
-
-func TestPublishSessionStopsAfterCancellation(t *testing.T) {
-	cluster := publishClusterForRequest(t)
-	cluster.source = func(context.Context, string, string) (kubernetes.PublishSource, error) {
-		return kubernetes.PublishSource{}, context.Canceled
-	}
-	_, err := publishSession(context.Background(), cluster, validPublishRequest(), func(string) (githubClient, error) {
-		require.FailNow(t, "created a GitHub client after cancellation")
-
-		return nil, nil
-	})
-	require.ErrorIs(t, err, context.Canceled)
-}
-
-func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing.T) {
-	request := validPublishRequest()
-	commitSHA := "9a4484441215661904e02a807adf5034d13f5bbe"
-	createFailure := errors.New("create request connection reset")
-	var operations []string
-	cluster := publishClusterForRequest(t)
-	cluster.runPublisher = func(_ context.Context, job kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error) {
-		operations = append(operations, "publish branch")
-		assert.Equal(t, "coding-agents", job.Namespace)
-		assert.Equal(t, "review", job.Session)
-		assert.Equal(t, "https://github.com/lokalise/kargo.git", job.Repository)
-		assert.Equal(t, "main", job.BaseRef)
-		assert.Equal(t, "yar/review", job.Branch)
-		assert.Equal(t, "Review changes", job.CommitMessage)
-		assert.Equal(t, "dyne", job.AuthorName)
-		assert.Equal(t, "dyne@localhost", job.AuthorEmail)
-		assert.Equal(t, "coding-agent:test", job.Image)
-		assert.Equal(t, "workspace-review", job.WorkspaceClaim)
-		assert.Equal(t, time.Minute, job.Timeout)
-		assert.NotEmpty(t, job.IntentID)
-
-		return kubernetes.PublisherJobResult{Branch: "yar/review", CommitSHA: commitSHA, Title: "Review changes", Body: "Ready for review"}, nil
-	}
-	cluster.deletePublisher = func(_ context.Context, namespace, session string) error {
-		operations = append(operations, "delete publisher")
-		assert.Equal(t, "coding-agents", namespace)
-		assert.Equal(t, "review", session)
-
-		return nil
-	}
-	client := githubClientStub{
-		branchCommit: func(_ context.Context, _ github.Repository, branch string) (string, bool, error) {
+		branchCommit: func() (string, bool, error) {
 			operations = append(operations, "find branch")
-			assert.Equal(t, "yar/review", branch)
 
 			return "", false, nil
 		},
-		waitBranch: func(_ context.Context, _ github.Repository, branch, expectedCommit string, timeout time.Duration) error {
-			operations = append(operations, "wait for branch")
-			assert.Equal(t, "yar/review", branch)
-			assert.Equal(t, commitSHA, expectedCommit)
-			assert.Equal(t, 30*time.Second, timeout)
+		createPull: func() (github.PullRequest, error) {
+			operations = append(operations, "create pull request")
 
-			return nil
+			return github.PullRequest{Number: 17, URL: "https://github.com/lokalise/ratchet-test-service/pull/17"}, nil
 		},
-		findPull: func(context.Context, github.Repository, string, string) (*github.PullRequest, error) {
-			operations = append(operations, "find pull request")
+	}
+	control := newTestControl(t, repository, runtime, client)
+
+	result, err := control.Publish(context.Background(), validRequest())
+	require.NoError(t, err)
+	assert.Equal(t, 17, result.PullRequestNumber)
+	assert.Equal(t, StateCompleted, repository.records["review"].State)
+	require.NotEmpty(t, operations)
+	assert.Equal(t, "record intent", operations[0])
+}
+
+func TestPublishDoesNotClaimBranchThatPredatesDurableOwnership(t *testing.T) {
+	repository := newMemoryRepository()
+	runtimeCalls := 0
+	runtime := runtimeStub{run: func(RuntimeRequest) (RuntimeResult, error) {
+		runtimeCalls++
+
+		return RuntimeResult{}, nil
+	}}
+	client := githubClientStub{
+		findPull:     func() (*github.PullRequest, error) { return nil, nil },
+		branchCommit: func() (string, bool, error) { return validCommitSHA, true, nil },
+	}
+	control := newTestControl(t, repository, runtime, client)
+
+	_, err := control.Publish(context.Background(), validRequest())
+	assert.Equal(t, ErrorConflict, ErrorKindOf(err))
+	assert.ErrorIs(t, err, ErrConflict)
+	assert.Equal(t, StateConflicted, repository.records["review"].State)
+	assert.Equal(t, 0, runtimeCalls)
+}
+
+func TestPublishRecoversPullRequestAfterAmbiguousCreateFailure(t *testing.T) {
+	createFailure := errors.New("connection reset")
+	repository := newMemoryRepository()
+	runtime := runtimeStub{run: func(RuntimeRequest) (RuntimeResult, error) {
+		return RuntimeResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
+	}}
+	findCalls := 0
+	client := githubClientStub{
+		findPull: func() (*github.PullRequest, error) {
+			findCalls++
 
 			return nil, nil
 		},
-		createPull: func(_ context.Context, _ github.Repository, baseBranch, branch, title, body string, draft bool) (github.PullRequest, error) {
-			operations = append(operations, "create pull request")
-			assert.Equal(t, "main", baseBranch)
-			assert.Equal(t, "yar/review", branch)
-			assert.Equal(t, "Review changes", title)
-			assert.Equal(t, "Ready for review", body)
-			assert.True(t, draft)
-
-			return github.PullRequest{}, createFailure
-		},
-		waitPull: func(_ context.Context, _ github.Repository, baseBranch, branch string, timeout time.Duration) (*github.PullRequest, error) {
-			operations = append(operations, "recover pull request")
-			assert.Equal(t, "main", baseBranch)
-			assert.Equal(t, "yar/review", branch)
-			assert.Equal(t, 10*time.Second, timeout)
-
-			return &github.PullRequest{Number: 23, URL: "https://github.com/lokalise/kargo/pull/23"}, nil
+		branchCommit: func() (string, bool, error) { return "", false, nil },
+		createPull:   func() (github.PullRequest, error) { return github.PullRequest{}, createFailure },
+		waitPull: func() (*github.PullRequest, error) {
+			return &github.PullRequest{Number: 23, URL: "https://github.com/lokalise/ratchet-test-service/pull/23"}, nil
 		},
 	}
-	result, err := publishSession(context.Background(), cluster, request, githubClientFactory(t, client))
+	control := newTestControl(t, repository, runtime, client)
+
+	result, err := control.Publish(context.Background(), validRequest())
 	require.NoError(t, err)
+	assert.Equal(t, 23, result.PullRequestNumber)
+	assert.GreaterOrEqual(t, findCalls, 2)
+	assert.Equal(t, StateCompleted, repository.records["review"].State)
+}
 
-	wantResult := Result{
-		PullRequestNumber: 23,
-		PullRequestURL:    "https://github.com/lokalise/kargo/pull/23",
-		Branch:            "yar/review",
-		CommitSHA:         commitSHA,
+func TestPublishDoesNotClaimBranchAfterAmbiguousPublisherFailure(t *testing.T) {
+	repository := newMemoryRepository()
+	publishFailure := errors.New("publisher connection lost")
+	runtime := runtimeStub{run: func(RuntimeRequest) (RuntimeResult, error) {
+		return RuntimeResult{}, publishFailure
+	}}
+	branchChecks := 0
+	client := githubClientStub{
+		findPull: func() (*github.PullRequest, error) { return nil, nil },
+		branchCommit: func() (string, bool, error) {
+			branchChecks++
+			if branchChecks < 3 {
+				return "", false, nil
+			}
+
+			return validCommitSHA, true, nil
+		},
 	}
-	assert.Equal(t, wantResult, result)
+	control := newTestControl(t, repository, runtime, client)
 
-	wantOperations := []string{
-		"find pull request",
-		"find branch",
-		"publish branch",
-		"wait for branch",
-		"create pull request",
-		"recover pull request",
-		"delete publisher",
+	_, err := control.Publish(context.Background(), validRequest())
+	require.ErrorIs(t, err, publishFailure)
+	assert.Equal(t, StateReady, repository.records["review"].State)
+	assert.Empty(t, repository.records["review"].CommitSHA)
+}
+
+func TestPublishRetryFinishesCleanupFromDurablePullRequestState(t *testing.T) {
+	repository := newMemoryRepository()
+	runtimeFailure := errors.New("cluster unavailable")
+	runtime := runtimeStub{
+		run: func(RuntimeRequest) (RuntimeResult, error) {
+			return RuntimeResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
+		},
+		delete: func(string) error { return runtimeFailure },
 	}
-	assert.Equal(t, wantOperations, operations)
+	pull := github.PullRequest{Number: 17, URL: "https://github.com/lokalise/ratchet-test-service/pull/17"}
+	client := githubClientStub{
+		findPull:     func() (*github.PullRequest, error) { return nil, nil },
+		branchCommit: func() (string, bool, error) { return "", false, nil },
+		createPull:   func() (github.PullRequest, error) { return pull, nil },
+	}
+	control := newTestControl(t, repository, runtime, client)
+
+	_, err := control.Publish(context.Background(), validRequest())
+	require.ErrorIs(t, err, runtimeFailure)
+	assert.Equal(t, StatePullRequestCreated, repository.records["review"].State)
+
+	restartedClient := githubClientStub{findPull: func() (*github.PullRequest, error) { return &pull, nil }}
+	restarted := newTestControl(t, repository, runtimeStub{}, restartedClient)
+	result, err := restarted.Publish(context.Background(), validRequest())
+	require.NoError(t, err)
+	assert.Equal(t, 17, result.PullRequestNumber)
+	assert.Equal(t, StateCompleted, repository.records["review"].State)
 }
 
-type publishClusterStub struct {
-	source          func(context.Context, string, string) (kubernetes.PublishSource, error)
-	token           func(context.Context, string) (string, error)
-	intent          func(context.Context, string, string) (string, bool, error)
-	runPublisher    func(context.Context, kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error)
-	waitPublisher   func(context.Context, string, string, string, time.Duration) (kubernetes.PublisherJobResult, error)
-	deletePublisher func(context.Context, string, string) error
+const validCommitSHA = "9a4484441215661904e02a807adf5034d13f5bbe"
+
+func validRequest() Request {
+	return Request{
+		Session: "review", Branch: "yar/review", CommitMessage: "Fix the README link",
+		Draft: true, Timeout: time.Minute,
+	}
 }
 
-func (c publishClusterStub) SessionPublishSource(ctx context.Context, namespace, session string) (kubernetes.PublishSource, error) {
-	return c.source(ctx, namespace, session)
+func newTestControl(t *testing.T, repository *memoryRepository, runtime runtimeStub, client githubClientStub) *Control {
+	t.Helper()
+	control, err := New(Config{
+		Sessions: sessionStub{}, Repository: repository, Runtime: runtime,
+		RepositoryAuth: tokenProviderStub("installation-token"),
+	})
+	require.NoError(t, err)
+	control.newGitHubClient = func(string) (githubClient, error) { return client, nil }
+	control.now = func() time.Time { return time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC) }
+
+	return control
 }
 
-func (c publishClusterStub) GitHubToken(ctx context.Context, namespace string) (string, error) {
-	return c.token(ctx, namespace)
+type sessionStub struct{}
+
+func (sessionStub) PreparePublication(context.Context, string) (*session.Publication, error) {
+	return &session.Publication{Source: session.PublicationSource{
+		Repository: "https://github.com/lokalise/ratchet-test-service", InitialRef: "main",
+		Image:       "coding-agent:test",
+		PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
+	}}, nil
 }
 
-func (c publishClusterStub) PublisherJobIntent(ctx context.Context, namespace, session string) (string, bool, error) {
-	return c.intent(ctx, namespace, session)
+type tokenProviderStub string
+
+func (t tokenProviderStub) InstallationToken(context.Context) (string, error) { return string(t), nil }
+
+type runtimeStub struct {
+	run    func(RuntimeRequest) (RuntimeResult, error)
+	delete func(string) error
 }
 
-func (c publishClusterStub) RunPublisherJob(ctx context.Context, request kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error) {
-	return c.runPublisher(ctx, request)
+func (runtimeStub) Scope() string { return "coding-agents" }
+func (r runtimeStub) RunPublisher(_ context.Context, request RuntimeRequest) (RuntimeResult, error) {
+	if r.run != nil {
+		return r.run(request)
+	}
+
+	return RuntimeResult{}, nil
 }
 
-func (c publishClusterStub) WaitForPublisherJob(ctx context.Context, namespace, session, intentID string, timeout time.Duration) (kubernetes.PublisherJobResult, error) {
-	return c.waitPublisher(ctx, namespace, session, intentID, timeout)
-}
+func (r runtimeStub) DeletePublisher(_ context.Context, sessionName string) error {
+	if r.delete != nil {
+		return r.delete(sessionName)
+	}
 
-func (c publishClusterStub) DeletePublisherJob(ctx context.Context, namespace, session string) error {
-	return c.deletePublisher(ctx, namespace, session)
+	return nil
 }
 
 type githubClientStub struct {
-	branchCommit func(context.Context, github.Repository, string) (string, bool, error)
-	waitBranch   func(context.Context, github.Repository, string, string, time.Duration) error
-	findPull     func(context.Context, github.Repository, string, string) (*github.PullRequest, error)
-	waitPull     func(context.Context, github.Repository, string, string, time.Duration) (*github.PullRequest, error)
-	createPull   func(context.Context, github.Repository, string, string, string, string, bool) (github.PullRequest, error)
+	branchCommit func() (string, bool, error)
+	findPull     func() (*github.PullRequest, error)
+	waitPull     func() (*github.PullRequest, error)
+	createPull   func() (github.PullRequest, error)
 }
 
-func (c githubClientStub) BranchCommitSHA(ctx context.Context, repository github.Repository, branch string) (string, bool, error) {
-	return c.branchCommit(ctx, repository, branch)
-}
-
-func (c githubClientStub) WaitForBranchCommit(ctx context.Context, repository github.Repository, branch, commit string, timeout time.Duration) error {
-	return c.waitBranch(ctx, repository, branch, commit, timeout)
-}
-
-func (c githubClientStub) FindOpenPullRequest(ctx context.Context, repository github.Repository, baseBranch, branch string) (*github.PullRequest, error) {
-	return c.findPull(ctx, repository, baseBranch, branch)
-}
-
-func (c githubClientStub) WaitForOpenPullRequest(ctx context.Context, repository github.Repository, baseBranch, branch string, timeout time.Duration) (*github.PullRequest, error) {
-	return c.waitPull(ctx, repository, baseBranch, branch, timeout)
-}
-
-func (c githubClientStub) CreatePullRequest(ctx context.Context, repository github.Repository, baseBranch, branch, title, body string, draft bool) (github.PullRequest, error) {
-	return c.createPull(ctx, repository, baseBranch, branch, title, body, draft)
-}
-
-func validPublishRequest() Request {
-	return Request{
-		Namespace:     "coding-agents",
-		Session:       "review",
-		Branch:        "yar/review",
-		CommitMessage: "Review changes",
-		Draft:         true,
-		Timeout:       time.Minute,
+func (c githubClientStub) BranchCommitSHA(context.Context, github.Repository, string) (string, bool, error) {
+	if c.branchCommit != nil {
+		return c.branchCommit()
 	}
+
+	return "", false, nil
 }
 
-func eligiblePublishSource() kubernetes.PublishSource {
-	return kubernetes.PublishSource{
-		Repository:     "https://github.com/lokalise/kargo.git",
-		InitialRef:     "main",
-		Image:          "coding-agent:test",
-		WorkspaceClaim: "workspace-review",
-	}
+func (githubClientStub) WaitForBranchCommit(context.Context, github.Repository, string, string, time.Duration) error {
+	return nil
 }
 
-func publishClusterForRequest(t *testing.T) publishClusterStub {
-	t.Helper()
-
-	return publishClusterStub{
-		source: func(_ context.Context, namespace, session string) (kubernetes.PublishSource, error) {
-			assert.Equal(t, "coding-agents", namespace)
-			assert.Equal(t, "review", session)
-
-			return eligiblePublishSource(), nil
-		},
-		token: func(_ context.Context, namespace string) (string, error) {
-			assert.Equal(t, "coding-agents", namespace)
-
-			return "github-token", nil
-		},
-		intent: func(_ context.Context, namespace, session string) (string, bool, error) {
-			assert.Equal(t, "coding-agents", namespace)
-			assert.Equal(t, "review", session)
-
-			return "", false, nil
-		},
+func (c githubClientStub) FindOpenPullRequest(context.Context, github.Repository, string, string) (*github.PullRequest, error) {
+	if c.findPull != nil {
+		return c.findPull()
 	}
+
+	return nil, nil
 }
 
-func githubClientFactory(t *testing.T, client githubClient) func(string) (githubClient, error) {
-	t.Helper()
-
-	return func(token string) (githubClient, error) {
-		assert.Equal(t, "github-token", token)
-
-		return client, nil
+func (c githubClientStub) WaitForOpenPullRequest(context.Context, github.Repository, string, string, time.Duration) (*github.PullRequest, error) {
+	if c.waitPull != nil {
+		return c.waitPull()
 	}
+
+	return nil, nil
+}
+
+func (c githubClientStub) CreatePullRequest(context.Context, github.Repository, string, string, string, string, bool) (github.PullRequest, error) {
+	if c.createPull != nil {
+		return c.createPull()
+	}
+
+	return github.PullRequest{}, nil
+}
+
+type memoryRepository struct {
+	records map[string]Record
+	created func(Record)
+}
+
+func newMemoryRepository() *memoryRepository { return &memoryRepository{records: map[string]Record{}} }
+
+func (r *memoryRepository) Create(_ context.Context, record Record) (Record, error) {
+	if _, exists := r.records[record.Session]; exists {
+		return Record{}, ErrConflict
+	}
+
+	record.Revision = 1
+	r.records[record.Session] = record
+	if r.created != nil {
+		r.created(record)
+	}
+
+	return record, nil
+}
+
+func (r *memoryRepository) Get(_ context.Context, sessionName string) (Record, error) {
+	record, exists := r.records[sessionName]
+	if !exists {
+		return Record{}, ErrNotFound
+	}
+
+	return record, nil
+}
+
+func (r *memoryRepository) Update(_ context.Context, record Record) (Record, error) {
+	current, exists := r.records[record.Session]
+	if !exists {
+		return Record{}, ErrNotFound
+	}
+
+	if current.Revision != record.Revision {
+		return Record{}, ErrConflict
+	}
+
+	record.Revision++
+	r.records[record.Session] = record
+
+	return record, nil
 }

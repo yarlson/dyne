@@ -23,11 +23,11 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 		t.Skip("KUBERNETES_INTEGRATION_CONTEXT is required")
 	}
 
-	config, err := loadKubeconfig("", contextName)
-	require.NoError(t, err)
-	client, err := NewForConfig(config, io.Discard)
+	config, err := LoadConnectionConfig(context.Background(), ConnectionConfig{ContextName: contextName})
 	require.NoError(t, err)
 	namespace := integrationNamespace(t)
+	client, err := NewForConfig(config, Config{Namespace: namespace, Output: io.Discard})
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -44,12 +44,12 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 	defer cancel()
 	require.NoError(t, client.apply(testContext, integrationManifest(namespace)))
 
-	require.NoError(t, client.DeleteSession(testContext, namespace, "session"))
+	require.NoError(t, client.Delete(testContext, "session", false))
 	assertSessionWorkloadDeleted(t, testContext, client, namespace)
 	_, err = client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, "session-session", metav1.GetOptions{})
 	assert.NoError(t, err, "persistent state was not retained")
 
-	require.NoError(t, client.DestroySession(testContext, namespace, "session"))
+	require.NoError(t, client.Delete(testContext, "session", true))
 	require.Eventually(t, func() bool {
 		_, err := client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, "session-session", metav1.GetOptions{})
 

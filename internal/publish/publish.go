@@ -6,50 +6,101 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/yarlson/dyne/internal/github"
-	"github.com/yarlson/dyne/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/session"
 )
+
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Request defines one idempotent workspace publish operation.
 type Request struct {
-	// Namespace owns the source session.
-	Namespace string
-	// Session identifies the completed persistent source session.
-	Session string
-	// Branch is the new remote branch that will contain the changes.
-	Branch string
-	// BaseBranch is the pull request target and defaults to the session's initial ref.
-	BaseBranch string
-	// CommitMessage is the message used for the workspace commit.
+	Session       string
+	Branch        string
+	BaseBranch    string
 	CommitMessage string
-	// Draft controls whether GitHub creates a draft pull request.
-	Draft bool
-	// Timeout bounds the publisher Job and the wait for its result.
-	Timeout time.Duration
+	Draft         bool
+	Timeout       time.Duration
 }
 
 // Result identifies the pull request, branch, and commit produced by publishing.
 type Result struct {
-	// PullRequestNumber is the repository-local pull request number.
 	PullRequestNumber int
-	// PullRequestURL is the pull request's GitHub web URL.
-	PullRequestURL string
-	// Branch is the remote branch containing the published changes.
-	Branch string
-	// CommitSHA is the published commit, or empty when publishing recovers an existing pull request.
+	PullRequestURL    string
+	Branch            string
+	CommitSHA         string
+}
+
+// State is the durable progress of one publish operation.
+type State string
+
+const (
+	// StatePending means the intent is durable but remote ownership is not established.
+	StatePending State = "pending"
+	// StateReady means GitHub confirmed that the requested branch and pull request were absent.
+	StateReady State = "ready"
+	// StateBranchPublished means the owned remote branch and commit are durable.
+	StateBranchPublished State = "branch_published"
+	// StatePullRequestCreated means GitHub has the owned pull request but runtime cleanup remains.
+	StatePullRequestCreated State = "pull_request_created"
+	// StateCompleted means the pull request exists and disposable publisher resources are removed.
+	StateCompleted State = "completed"
+	// StateConflicted means the requested GitHub names existed before ownership was established.
+	StateConflicted State = "conflicted"
+)
+
+// Record is the durable publish intent, progress, and result for one session.
+type Record struct {
+	Session           string
+	IntentID          string
+	Request           Request
+	Repository        string
+	Image             string
+	Title             string
+	Body              string
+	State             State
+	CommitSHA         string
+	PullRequestNumber int
+	PullRequestURL    string
+	Failure           string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	Revision          int64
+}
+
+// RuntimeRequest contains the complete disposable publisher projection.
+type RuntimeRequest struct {
+	Session              string
+	IntentID             string
+	Image                string
+	Repository           string
+	RepositoryCredential string
+	BaseRef              string
+	Branch               string
+	CommitMessage        string
+	AuthorName           string
+	AuthorEmail          string
+	Timeout              time.Duration
+}
+
+// RuntimeResult identifies the branch and commit produced by a publisher execution.
+type RuntimeResult struct {
+	Branch    string
 	CommitSHA string
 }
 
-type publishCluster interface {
-	SessionPublishSource(context.Context, string, string) (kubernetes.PublishSource, error)
-	GitHubToken(context.Context, string) (string, error)
-	PublisherJobIntent(context.Context, string, string) (string, bool, error)
-	RunPublisherJob(context.Context, kubernetes.PublisherJobRequest) (kubernetes.PublisherJobResult, error)
-	WaitForPublisherJob(context.Context, string, string, string, time.Duration) (kubernetes.PublisherJobResult, error)
-	DeletePublisherJob(context.Context, string, string) error
+// Runtime executes isolated workspace publication.
+type Runtime interface {
+	Scope() string
+	RunPublisher(context.Context, RuntimeRequest) (RuntimeResult, error)
+	DeletePublisher(context.Context, string) error
+}
+
+type sessionOperations interface {
+	PreparePublication(context.Context, string) (*session.Publication, error)
 }
 
 type githubClient interface {
@@ -60,22 +111,107 @@ type githubClient interface {
 	CreatePullRequest(context.Context, github.Repository, string, string, string, string, bool) (github.PullRequest, error)
 }
 
-// Session publishes an eligible session workspace and opens or recovers its pull request.
-func Session(ctx context.Context, cluster *kubernetes.Client, request Request) (Result, error) {
-	return publishSession(ctx, cluster, request, func(token string) (githubClient, error) {
-		return github.New(token)
-	})
+// ErrorKind classifies a publishing failure for entrypoints.
+type ErrorKind string
+
+const (
+	// ErrorInvalid identifies an invalid publish request.
+	ErrorInvalid ErrorKind = "invalid"
+	// ErrorConflict identifies a branch, pull request, or intent ownership conflict.
+	ErrorConflict ErrorKind = "conflict"
+	// ErrorUnavailable identifies a storage, runtime, or GitHub failure.
+	ErrorUnavailable ErrorKind = "unavailable"
+)
+
+type operationError struct {
+	kind    ErrorKind
+	message string
+	cause   error
 }
 
-func publishSession(ctx context.Context, cluster publishCluster, request Request, newGitHubClient func(string) (githubClient, error)) (Result, error) {
-	if err := request.Validate(); err != nil {
-		return Result{}, err
+func (e *operationError) Error() string { return e.message }
+func (e *operationError) Unwrap() error { return e.cause }
+
+// ErrorKindOf returns the stable classification of a publishing failure.
+func ErrorKindOf(err error) ErrorKind {
+	var target *operationError
+	if errors.As(err, &target) {
+		return target.kind
 	}
 
-	source, err := cluster.SessionPublishSource(ctx, request.Namespace, request.Session)
+	return ""
+}
+
+// Config contains durable publishing dependencies.
+type Config struct {
+	Sessions       sessionOperations
+	Repository     Repository
+	Runtime        Runtime
+	RepositoryAuth session.RepositoryTokenProvider
+}
+
+// Control publishes eligible session workspaces.
+type Control struct {
+	sessions        sessionOperations
+	repository      Repository
+	runtime         Runtime
+	repositoryAuth  session.RepositoryTokenProvider
+	newGitHubClient func(string) (githubClient, error)
+	now             func() time.Time
+}
+
+// New creates publishing control with durable state and explicit integrations.
+func New(config Config) (*Control, error) {
+	if config.Sessions == nil {
+		return nil, errors.New("session control is required")
+	}
+
+	if config.Repository == nil {
+		return nil, errors.New("publish repository is required")
+	}
+
+	if config.Runtime == nil {
+		return nil, errors.New("publisher runtime is required")
+	}
+
+	if config.RepositoryAuth == nil {
+		return nil, errors.New("repository credential provider is required")
+	}
+
+	return &Control{
+		sessions: config.Sessions, repository: config.Repository, runtime: config.Runtime,
+		repositoryAuth:  config.RepositoryAuth,
+		newGitHubClient: func(token string) (githubClient, error) { return github.New(token) },
+		now:             time.Now,
+	}, nil
+}
+
+// Publish creates or resumes one durable publish operation.
+func (c *Control) Publish(ctx context.Context, request Request) (Result, error) {
+	if err := request.Validate(); err != nil {
+		return Result{}, &operationError{kind: ErrorInvalid, message: err.Error(), cause: err}
+	}
+
+	result, err := c.publish(ctx, request)
+	if err != nil {
+		kind := ErrorUnavailable
+		if errors.Is(err, ErrConflict) {
+			kind = ErrorConflict
+		}
+
+		return Result{}, &operationError{kind: kind, message: "publish session failed", cause: err}
+	}
+
+	return result, nil
+}
+
+func (c *Control) publish(ctx context.Context, request Request) (Result, error) {
+	publication, err := c.sessions.PreparePublication(ctx, request.Session)
 	if err != nil {
 		return Result{}, err
 	}
+	defer publication.Close()
+	source := publication.Source
 
 	if request.BaseBranch == "" {
 		request.BaseBranch = source.InitialRef
@@ -86,196 +222,236 @@ func publishSession(ctx context.Context, cluster publishCluster, request Request
 		return Result{}, err
 	}
 
-	token, err := cluster.GitHubToken(ctx, request.Namespace)
+	metadata, err := pullRequestMetadata(source.PullRequest)
 	if err != nil {
 		return Result{}, err
 	}
 
-	client, err := newGitHubClient(token)
+	intentID := publishIntentID(request, c.runtime.Scope(), source.Repository)
+	now := c.now().UTC()
+	record := Record{
+		Session: request.Session, IntentID: intentID, Request: request,
+		Repository: source.Repository, Image: source.Image, Title: metadata.Title, Body: metadata.Body,
+		State: StatePending, CreatedAt: now, UpdatedAt: now,
+	}
+	record, err = c.createOrLoad(ctx, record)
 	if err != nil {
 		return Result{}, err
 	}
 
-	intentID, err := publishIntentID(request, source.Repository)
+	if record.State == StateCompleted {
+		return recordResult(record), nil
+	}
+
+	if record.State == StateConflicted {
+		return Result{}, fmt.Errorf("%w: %s", ErrConflict, record.Failure)
+	}
+
+	token, err := c.repositoryAuth.InstallationToken(ctx)
 	if err != nil {
 		return Result{}, err
 	}
 
-	publisherIntent, publisherExists, err := cluster.PublisherJobIntent(ctx, request.Namespace, request.Session)
+	client, err := c.newGitHubClient(token)
 	if err != nil {
 		return Result{}, err
 	}
 
-	if publisherExists && publisherIntent != intentID {
-		return Result{}, errors.New("publisher Job belongs to a different publish request")
-	}
-
-	existingPull, err := client.FindOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch)
-	if err != nil {
-		return Result{}, err
-	}
-
-	if existingPull != nil {
-		if publisherExists {
-			if err := removePublisherJobAfterCompletion(ctx, cluster, request, intentID, existingPull.URL); err != nil {
-				return Result{}, err
-			}
-		}
-
-		return pullRequestResult(*existingPull, request.Branch, ""), nil
-	}
-
-	remoteCommit, branchExists, err := client.BranchCommitSHA(ctx, repository, request.Branch)
-	if err != nil {
-		return Result{}, err
-	}
-
-	if branchExists && !publisherExists {
-		return Result{}, fmt.Errorf("remote branch %s already exists and is not owned by this publish request", request.Branch)
-	}
-
-	var publisherResult kubernetes.PublisherJobResult
-	if branchExists {
-		publisherResult, err = cluster.WaitForPublisherJob(ctx, request.Namespace, request.Session, intentID, request.Timeout)
+	if record.State == StatePending {
+		record, err = c.establishOwnership(ctx, record, repository, client)
 		if err != nil {
 			return Result{}, err
 		}
+	}
 
-		if publisherResult.Branch != request.Branch || publisherResult.CommitSHA != remoteCommit {
-			return Result{}, fmt.Errorf("publisher result %s at %s does not match remote branch %s at %s", publisherResult.Branch, publisherResult.CommitSHA, request.Branch, remoteCommit)
-		}
-	} else {
-		publisherResult, err = publishBranch(ctx, cluster, client, repository, source, request, intentID)
-		if err != nil {
+	if pull, err := client.FindOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch); err != nil {
+		return Result{}, err
+	} else if pull != nil {
+		record.PullRequestNumber = pull.Number
+		record.PullRequestURL = pull.URL
+		record.State = StatePullRequestCreated
+		if record, err = c.save(ctx, record); err != nil {
 			return Result{}, err
 		}
 
-		remoteCommit = publisherResult.CommitSHA
+		return c.finish(ctx, record)
 	}
 
-	pull, err := createOrRecoverPullRequest(ctx, client, repository, request, publisherResult)
+	if record.State == StateReady {
+		record, err = c.publishBranch(ctx, record, token)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+
+	if err := client.WaitForBranchCommit(ctx, repository, request.Branch, record.CommitSHA, 30*time.Second); err != nil {
+		return Result{}, err
+	}
+
+	pull, err := client.CreatePullRequest(
+		ctx, repository, request.BaseBranch, request.Branch, record.Title, record.Body, request.Draft,
+	)
+	if err != nil {
+		existing, findErr := client.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
+		if findErr != nil {
+			return Result{}, errors.Join(err, findErr)
+		}
+
+		if existing == nil {
+			return Result{}, err
+		}
+
+		pull = *existing
+	}
+
+	record.PullRequestNumber = pull.Number
+	record.PullRequestURL = pull.URL
+	record.State = StatePullRequestCreated
+	record, err = c.save(ctx, record)
 	if err != nil {
 		return Result{}, err
 	}
 
-	if err := cluster.DeletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
-		return Result{}, fmt.Errorf("pull request created at %s; clean publisher Job: %w", pull.URL, err)
-	}
-
-	return pullRequestResult(pull, request.Branch, remoteCommit), nil
+	return c.finish(ctx, record)
 }
 
-func removePublisherJobAfterCompletion(ctx context.Context, cluster publishCluster, request Request, intentID, pullRequestURL string) error {
-	if _, err := cluster.WaitForPublisherJob(ctx, request.Namespace, request.Session, intentID, request.Timeout); err != nil {
-		return fmt.Errorf("pull request already exists at %s; wait for publisher Job: %w", pullRequestURL, err)
-	}
-
-	if err := cluster.DeletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
-		return fmt.Errorf("pull request already exists at %s; clean publisher Job: %w", pullRequestURL, err)
-	}
-
-	return nil
-}
-
-func publishBranch(ctx context.Context, cluster publishCluster, client githubClient, repository github.Repository, source kubernetes.PublishSource, request Request, intentID string) (kubernetes.PublisherJobResult, error) {
-	authorName, authorEmail := github.CommitAuthor()
-
-	result, err := cluster.RunPublisherJob(ctx, kubernetes.PublisherJobRequest{
-		Namespace:      request.Namespace,
-		Session:        request.Session,
-		IntentID:       intentID,
-		Repository:     source.Repository,
-		BaseRef:        request.BaseBranch,
-		Branch:         request.Branch,
-		CommitMessage:  request.CommitMessage,
-		AuthorName:     authorName,
-		AuthorEmail:    authorEmail,
-		Image:          source.Image,
-		WorkspaceClaim: source.WorkspaceClaim,
-		Timeout:        request.Timeout,
-	})
-	if err != nil {
-		_, branchExists, branchErr := client.BranchCommitSHA(ctx, repository, request.Branch)
-		if branchErr != nil {
-			return kubernetes.PublisherJobResult{}, errors.Join(err, branchErr)
-		}
-
-		if branchExists {
-			return kubernetes.PublisherJobResult{}, err
-		}
-
-		return kubernetes.PublisherJobResult{}, errors.Join(err, cluster.DeletePublisherJob(ctx, request.Namespace, request.Session))
-	}
-
-	if result.Branch != request.Branch {
-		return kubernetes.PublisherJobResult{}, fmt.Errorf("publisher reported branch %s, want %s", result.Branch, request.Branch)
-	}
-
-	if err := client.WaitForBranchCommit(ctx, repository, request.Branch, result.CommitSHA, 30*time.Second); err != nil {
-		return kubernetes.PublisherJobResult{}, err
-	}
-
-	return result, nil
-}
-
-func createOrRecoverPullRequest(ctx context.Context, client githubClient, repository github.Repository, request Request, result kubernetes.PublisherJobResult) (github.PullRequest, error) {
-	pull, err := client.CreatePullRequest(ctx, repository, request.BaseBranch, request.Branch, result.Title, result.Body, request.Draft)
+func (c *Control) createOrLoad(ctx context.Context, record Record) (Record, error) {
+	created, err := c.repository.Create(ctx, record)
 	if err == nil {
-		return pull, nil
+		return created, nil
 	}
 
-	existingPull, findErr := client.WaitForOpenPullRequest(ctx, repository, request.BaseBranch, request.Branch, 10*time.Second)
-	if findErr != nil {
-		return github.PullRequest{}, errors.Join(err, findErr)
+	if !errors.Is(err, ErrConflict) {
+		return Record{}, err
 	}
 
-	if existingPull == nil {
-		return github.PullRequest{}, err
+	existing, err := c.repository.Get(ctx, record.Session)
+	if err != nil {
+		return Record{}, err
 	}
 
-	return *existingPull, nil
+	if existing.IntentID != record.IntentID {
+		return Record{}, fmt.Errorf("%w: session already has a different publish intent", ErrConflict)
+	}
+
+	return existing, nil
 }
 
-func publishIntentID(request Request, repository string) (string, error) {
-	contents, err := json.Marshal(struct {
-		Namespace     string `json:"namespace"`
-		Session       string `json:"session"`
-		Repository    string `json:"repository"`
-		BaseBranch    string `json:"base"`
-		Branch        string `json:"branch"`
-		CommitMessage string `json:"commitMessage"`
-		Draft         bool   `json:"draft"`
-	}{
-		Namespace:     request.Namespace,
-		Session:       request.Session,
-		Repository:    repository,
-		BaseBranch:    request.BaseBranch,
-		Branch:        request.Branch,
-		CommitMessage: request.CommitMessage,
-		Draft:         request.Draft,
+func (c *Control) establishOwnership(
+	ctx context.Context,
+	record Record,
+	repository github.Repository,
+	client githubClient,
+) (Record, error) {
+	pull, err := client.FindOpenPullRequest(ctx, repository, record.Request.BaseBranch, record.Request.Branch)
+	if err != nil {
+		return Record{}, err
+	}
+
+	_, branchExists, err := client.BranchCommitSHA(ctx, repository, record.Request.Branch)
+	if err != nil {
+		return Record{}, err
+	}
+
+	if pull != nil || branchExists {
+		record.State = StateConflicted
+		record.Failure = fmt.Sprintf("remote branch %s or its pull request existed before publish ownership was established", record.Request.Branch)
+		if _, saveErr := c.save(ctx, record); saveErr != nil {
+			return Record{}, saveErr
+		}
+
+		return Record{}, fmt.Errorf("%w: %s", ErrConflict, record.Failure)
+	}
+
+	record.State = StateReady
+
+	return c.save(ctx, record)
+}
+
+func (c *Control) publishBranch(
+	ctx context.Context,
+	record Record,
+	token string,
+) (Record, error) {
+	authorName, authorEmail := github.CommitAuthor()
+	result, err := c.runtime.RunPublisher(ctx, RuntimeRequest{
+		Session: record.Session, IntentID: record.IntentID, Image: record.Image,
+		Repository: record.Repository, RepositoryCredential: token,
+		BaseRef: record.Request.BaseBranch, Branch: record.Request.Branch,
+		CommitMessage: record.Request.CommitMessage, AuthorName: authorName, AuthorEmail: authorEmail,
+		Timeout: record.Request.Timeout,
 	})
 	if err != nil {
-		return "", fmt.Errorf("encode publish intent: %w", err)
+		return Record{}, err
 	}
 
-	return fmt.Sprintf("%x", sha256.Sum256(contents)), nil
+	if result.Branch != record.Request.Branch || !commitSHAPattern.MatchString(result.CommitSHA) {
+		return Record{}, errors.New("publisher reported an invalid branch or commit")
+	}
+
+	record.CommitSHA = result.CommitSHA
+	record.State = StateBranchPublished
+
+	return c.save(ctx, record)
 }
 
-func pullRequestResult(pull github.PullRequest, branch, commit string) Result {
+func (c *Control) finish(ctx context.Context, record Record) (Result, error) {
+	if err := c.runtime.DeletePublisher(ctx, record.Session); err != nil {
+		return Result{}, fmt.Errorf("pull request created at %s; clean publisher execution: %w", record.PullRequestURL, err)
+	}
+
+	record.State = StateCompleted
+	record, err := c.save(ctx, record)
+	if err != nil {
+		return Result{}, err
+	}
+
+	return recordResult(record), nil
+}
+
+func (c *Control) save(ctx context.Context, record Record) (Record, error) {
+	record.UpdatedAt = c.now().UTC()
+
+	return c.repository.Update(ctx, record)
+}
+
+type pullMetadata struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
+}
+
+func pullRequestMetadata(contents json.RawMessage) (pullMetadata, error) {
+	var metadata pullMetadata
+	if err := json.Unmarshal(contents, &metadata); err != nil {
+		return metadata, fmt.Errorf("decode pull request artifact: %w", err)
+	}
+
+	if strings.TrimSpace(metadata.Title) == "" || strings.TrimSpace(metadata.Body) == "" {
+		return metadata, errors.New("pull request artifact requires a title and body")
+	}
+
+	return metadata, nil
+}
+
+func publishIntentID(request Request, scope, repository string) string {
+	contents, _ := json.Marshal(struct {
+		Scope      string
+		Repository string
+		Request    Request
+	}{Scope: scope, Repository: repository, Request: request})
+
+	return fmt.Sprintf("%x", sha256.Sum256(contents))
+}
+
+func recordResult(record Record) Result {
 	return Result{
-		PullRequestNumber: pull.Number,
-		PullRequestURL:    pull.URL,
-		Branch:            branch,
-		CommitSHA:         commit,
+		PullRequestNumber: record.PullRequestNumber, PullRequestURL: record.PullRequestURL,
+		Branch: record.Request.Branch, CommitSHA: record.CommitSHA,
 	}
 }
 
 // Validate checks whether a request contains the values required to publish.
 func (request Request) Validate() error {
-	if strings.TrimSpace(request.Namespace) == "" {
-		return errors.New("namespace is required")
-	}
-
 	if strings.TrimSpace(request.Session) == "" || strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.CommitMessage) == "" {
 		return errors.New("session name, branch, and commit message are required")
 	}

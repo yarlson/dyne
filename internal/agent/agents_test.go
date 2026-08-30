@@ -3,19 +3,26 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yarlson/dyne/internal/session"
 )
 
 func TestControlStartsSessionFromConfiguredDefinition(t *testing.T) {
-	var received sessionStartRequest
-	sessions := sessionOperationsStub{startSession: func(_ context.Context, request sessionStartRequest) error {
-		received = request
+	var receivedDefinition session.Definition
+	var receivedRequest session.StartRequest
+	sessions := sessionStarterStub{start: func(
+		_ context.Context, definition session.Definition, request session.StartRequest,
+	) (session.StartResult, error) {
+		receivedDefinition = definition
+		receivedRequest = request
 
-		return nil
+		return session.StartResult{Agent: definition.Agent, Name: request.Name, TaskID: request.Name}, nil
 	}}
 	agents, err := newControl(sessions, agentCatalogStub{definition: AgentDefinition{
 		Name:         "implementer",
@@ -27,7 +34,7 @@ func TestControlStartsSessionFromConfiguredDefinition(t *testing.T) {
 		CloneDepth:   1,
 		StorageSize:  "20Gi",
 		Timeout:      time.Hour,
-	}}, Config{Namespace: "coding-agents", Image: "coding-agent:test", TaskTimeout: 2 * time.Hour}, nil)
+	}})
 	require.NoError(t, err)
 
 	result, err := agents.Start(context.Background(), StartRequest{
@@ -41,32 +48,27 @@ func TestControlStartsSessionFromConfiguredDefinition(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, StartResult{Agent: "implementer", Name: "change-123", TaskID: "change-123"}, result)
-	assert.Equal(t, sessionStartRequest{
-		target:       sessionTarget{namespace: "coding-agents", name: "change-123"},
-		image:        "coding-agent:test",
-		storage:      StoragePersistent,
-		repository:   "https://github.com/lokalise/kargo.git",
-		initialRef:   "main",
-		setupCommand: "mise install",
-		prompt:       "fix the failed checks",
-		agentName:    "implementer",
-		instructions: "Implement the smallest safe change.",
-		skills:       []AgentSkill{{Name: "code-review", Contents: "review the change"}},
-		cloneDepth:   1,
-		storageSize:  "20Gi",
-		timeout:      30 * time.Minute,
-	}, received)
+	assert.Equal(t, session.Definition{
+		Agent: "implementer", Storage: session.StoragePersistent,
+		Instructions: "Implement the smallest safe change.",
+		Skills:       []session.Skill{{Name: "code-review", Contents: "review the change"}},
+		SetupCommand: "mise install", CloneDepth: 1, StorageSize: "20Gi", Timeout: time.Hour,
+	}, receivedDefinition)
+	assert.Equal(t, session.StartRequest{
+		Name: "change-123", Repository: "https://github.com/lokalise/kargo.git",
+		InitialRef: "main", Prompt: "fix the failed checks", Timeout: 30 * time.Minute,
+	}, receivedRequest)
 }
 
 func TestControlRejectsUnknownAgentWithoutStartingSession(t *testing.T) {
-	sessions := sessionOperationsStub{startSession: func(context.Context, sessionStartRequest) error {
+	sessions := sessionStarterStub{start: func(
+		context.Context, session.Definition, session.StartRequest,
+	) (session.StartResult, error) {
 		require.FailNow(t, "started a session for an unknown agent")
 
-		return nil
+		return session.StartResult{}, nil
 	}}
-	agents, err := newControl(sessions, agentCatalogStub{}, Config{
-		Namespace: "coding-agents", Image: "coding-agent:test", TaskTimeout: time.Hour,
-	}, nil)
+	agents, err := newControl(sessions, agentCatalogStub{})
 	require.NoError(t, err)
 
 	_, err = agents.Start(context.Background(), StartRequest{Agent: "missing", Name: "change-123"})
@@ -75,63 +77,56 @@ func TestControlRejectsUnknownAgentWithoutStartingSession(t *testing.T) {
 	assert.EqualError(t, err, "agent missing is not configured")
 }
 
-func TestControlHidesSessionIntegrationFailureAndRetainsCause(t *testing.T) {
+func TestControlHidesSessionFailureAndRetainsCause(t *testing.T) {
 	cause := errors.New("list Jobs: private cluster detail")
-	sessions := sessionOperationsStub{startSession: func(context.Context, sessionStartRequest) error { return cause }}
-	agents, err := newControl(sessions, agentCatalogStub{definition: AgentDefinition{
-		Name: "implementer", Storage: StorageEphemeral, Instructions: "Implement the task.", StorageSize: "10Gi", Timeout: time.Hour,
-	}}, Config{Namespace: "coding-agents", Image: "coding-agent:test", TaskTimeout: time.Hour}, nil)
+	sessions := sessionStarterStub{start: func(
+		context.Context, session.Definition, session.StartRequest,
+	) (session.StartResult, error) {
+		return session.StartResult{}, cause
+	}}
+	agents, err := newControl(sessions, agentCatalogStub{definition: AgentDefinition{Name: "implementer"}})
 	require.NoError(t, err)
 
-	_, err = agents.Start(context.Background(), StartRequest{
-		Agent: "implementer", Name: "change-123", InitialRef: "main", Prompt: "fix the failed checks",
-	})
-
+	_, err = agents.Start(context.Background(), StartRequest{Agent: "implementer", Name: "change-123"})
 	assert.Equal(t, ErrorUnavailable, ErrorKindOf(err))
 	assert.EqualError(t, err, "start session failed")
 	assert.ErrorIs(t, err, cause)
 }
 
-func TestControlContinuesSessionWithServerOwnedTaskIdentityAndDefaults(t *testing.T) {
-	var received sessionContinueRequest
-	sessions := sessionOperationsStub{continueSession: func(_ context.Context, request sessionContinueRequest) error {
-		received = request
-
-		return nil
+func TestControlPreservesSessionIntentConflict(t *testing.T) {
+	conflict := fmt.Errorf("session change-123 already exists with different inputs: %w", session.ErrConflict)
+	sessions := sessionStarterStub{start: func(
+		context.Context, session.Definition, session.StartRequest,
+	) (session.StartResult, error) {
+		return session.StartResult{}, conflict
 	}}
-	agents, err := newControl(sessions, agentCatalogStub{}, Config{
-		Namespace: "coding-agents", Image: "coding-agent:test", TaskTimeout: 2 * time.Hour,
-	}, func() (string, error) { return "abc123", nil })
+	agents, err := newControl(sessions, agentCatalogStub{definition: AgentDefinition{
+		Name: "implementer", Storage: StoragePersistent, Instructions: "Implement the change.",
+		StorageSize: "10Gi", Timeout: time.Hour,
+	}})
 	require.NoError(t, err)
 
-	result, err := agents.Continue(context.Background(), ContinueRequest{Name: "change-123", Prompt: "continue the fix"})
-	require.NoError(t, err)
-
-	assert.Equal(t, TaskResult{Name: "change-123", TaskID: "abc123"}, result)
-	assert.Equal(t, sessionContinueRequest{
-		target:  sessionTarget{namespace: "coding-agents", name: "change-123"},
-		taskID:  "abc123",
-		prompt:  "continue the fix",
-		timeout: 2 * time.Hour,
-	}, received)
+	_, err = agents.Start(context.Background(), StartRequest{
+		Agent: "implementer", Name: "change-123", Repository: "https://github.com/lokalise/kargo.git",
+		Prompt: "fix the failed checks",
+	})
+	assert.Equal(t, ErrorConflict, ErrorKindOf(err))
+	assert.EqualError(t, err, conflict.Error())
+	assert.ErrorIs(t, err, session.ErrConflict)
 }
 
 type agentCatalogStub struct {
 	definition AgentDefinition
 }
 
-type sessionOperationsStub struct {
-	sessionOperations
-	startSession    func(context.Context, sessionStartRequest) error
-	continueSession func(context.Context, sessionContinueRequest) error
+type sessionStarterStub struct {
+	start func(context.Context, session.Definition, session.StartRequest) (session.StartResult, error)
 }
 
-func (s sessionOperationsStub) start(ctx context.Context, request sessionStartRequest) error {
-	return s.startSession(ctx, request)
-}
-
-func (s sessionOperationsStub) continueTask(ctx context.Context, request sessionContinueRequest) error {
-	return s.continueSession(ctx, request)
+func (s sessionStarterStub) Start(
+	ctx context.Context, definition session.Definition, request session.StartRequest,
+) (session.StartResult, error) {
+	return s.start(ctx, definition, request)
 }
 
 func (c agentCatalogStub) List() []AgentSummary {

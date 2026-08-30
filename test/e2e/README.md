@@ -1,6 +1,6 @@
 # Live multi-agent workflow E2E test
 
-This test runs a real three-step Codex workflow against the private `lokalise/ratchet-test-service` repository. Two isolated ephemeral reviewers inspect the documentation fix and its validation commands in parallel. A persistent implementation step receives both JSON outputs, fixes one known README link, and becomes the only publishable session. The test publishes a draft pull request, verifies it through GitHub, then closes the pull request and removes its branch, workflow database, sessions, and Kubernetes namespace.
+This test runs a real three-step Codex workflow against the private `lokalise/ratchet-test-service` repository. Two isolated ephemeral reviewers inspect the documentation fix and its validation commands in parallel. A persistent implementation step receives both JSON outputs, fixes one known README link, and becomes the only publishable session. The test publishes a draft pull request, verifies it through GitHub, then closes the pull request and removes its branch, application database, sessions, and Kubernetes namespace.
 
 The test changes live GitHub and Kubernetes state and uses a real Codex account. Do not run it as an ordinary local or CI check.
 

@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yarlson/dyne/internal/session"
 )
 
 type renderedResource struct {
@@ -19,8 +21,9 @@ type renderedResource struct {
 		Annotations map[string]string `json:"annotations"`
 		Labels      map[string]string `json:"labels"`
 	} `json:"metadata"`
-	Data map[string]string `json:"data"`
-	Spec struct {
+	Data       map[string]string `json:"data"`
+	StringData map[string]string `json:"stringData"`
+	Spec       struct {
 		Template struct {
 			Spec struct {
 				Containers []struct {
@@ -54,6 +57,9 @@ type renderedResource struct {
 							Path string `json:"path"`
 						} `json:"items"`
 					} `json:"configMap"`
+					Secret *struct {
+						SecretName string `json:"secretName"`
+					} `json:"secret"`
 				} `json:"volumes"`
 			} `json:"spec"`
 		} `json:"template"`
@@ -62,7 +68,7 @@ type renderedResource struct {
 
 func TestRenderSelectsWorkflowOutputResultContract(t *testing.T) {
 	spec := validSpec()
-	spec.ResultKind = ResultKindWorkflowOutput
+	spec.ResultKind = session.ResultKindWorkflowOutput
 
 	manifest, err := renderSessionManifest(spec)
 	require.NoError(t, err)
@@ -98,27 +104,28 @@ func TestRenderLabelsWorkflowOwnedSessionResources(t *testing.T) {
 func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 	tests := []struct {
 		name          string
-		storage       SessionStorage
+		storage       session.Storage
 		workload      string
 		wantResources []string
 		wantStorage   map[string]string
 	}{
 		{
 			name:     "ephemeral session uses emptyDir",
-			storage:  SessionStorageEphemeral,
+			storage:  session.StorageEphemeral,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
 				"NetworkPolicy/deny-all-ingress",
 			},
 			wantStorage: map[string]string{
-				"session": "ephemeral",
-				"tmp":     "memory",
+				"git-auth": "ephemeral",
+				"session":  "ephemeral",
+				"tmp":      "memory",
 			},
 		},
 		{
 			name:     "persistent session uses one claim",
-			storage:  SessionStoragePersistent,
+			storage:  session.StoragePersistent,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
@@ -126,8 +133,9 @@ func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 				"PersistentVolumeClaim/session-example",
 			},
 			wantStorage: map[string]string{
-				"session": "session-example",
-				"tmp":     "memory",
+				"git-auth": "ephemeral",
+				"session":  "session-example",
+				"tmp":      "memory",
 			},
 		},
 	}
@@ -174,7 +182,7 @@ func TestRenderPackagesAgentInstructionsAndSkills(t *testing.T) {
 	spec := validSpec()
 	spec.AgentName = "reviewer"
 	spec.Instructions = "Review correctness and tests."
-	spec.Skills = []SessionSkill{{
+	spec.Skills = []session.Skill{{
 		Name:     "code-review",
 		Contents: "---\nname: code-review\ndescription: Review code.\n---\n\nReview changed code.\n",
 	}}
@@ -185,7 +193,7 @@ func TestRenderPackagesAgentInstructionsAndSkills(t *testing.T) {
 
 	configuration := resources["ConfigMap/session-example-agent"]
 	assert.True(t, configuration.Immutable)
-	assert.Equal(t, "reviewer", configuration.Metadata.Annotations["dyne.yarlson.dev/agent"])
+	assert.Empty(t, configuration.Metadata.Annotations)
 	assert.Equal(t, "Review correctness and tests.", configuration.Data["instructions"])
 	assert.Equal(t, spec.Skills[0].Contents, configuration.Data["skill-code-review"])
 
@@ -225,23 +233,49 @@ func TestRenderPackagesAgentInstructionsAndSkills(t *testing.T) {
 	}{{Key: "skill-code-review", Path: "code-review/SKILL.md"}}, skills)
 }
 
-func TestRenderContinuationReusesAgentConfiguration(t *testing.T) {
+func TestRenderContinuationProjectsDurableAgentConfiguration(t *testing.T) {
 	spec := validSpec()
 	spec.TaskName = "example-continue-abc123"
 	spec.Resume = true
 	spec.AgentName = "reviewer"
-	spec.Skills = []SessionSkill{{Name: "code-review", Contents: "retained skill"}}
+	spec.Instructions = "Review correctness and tests."
+	spec.Skills = []session.Skill{{Name: "code-review", Contents: "retained skill"}}
 
 	manifest, err := renderContinuationManifest(spec)
 	require.NoError(t, err)
 	resources := decodeRenderedResources(t, manifest)
 
-	assert.NotContains(t, resources, "ConfigMap/session-example-agent")
+	assert.Contains(t, resources, "ConfigMap/session-example-agent")
 	job := resources["Job/example-continue-abc123"]
 	assert.Equal(t, "session-example-agent", renderedStorage(job)["agent-config"])
 	for _, volume := range job.Spec.Template.Spec.Volumes {
 		if volume.Name == "agent-config" {
 			assert.Equal(t, "code-review/SKILL.md", volume.ConfigMap.Items[0].Path)
+		}
+	}
+}
+
+func TestRenderKeepsDefinitionOutOfPVCAndScopesRepositoryCredentialToTask(t *testing.T) {
+	spec := validSpec()
+	spec.Repository = "https://github.com/lokalise/ratchet-test-service"
+	spec.SetupCommand = "make tools"
+	spec.GitCredential = "short-lived-token"
+
+	manifest, err := renderSessionManifest(spec)
+	require.NoError(t, err)
+	resources := decodeRenderedResources(t, manifest)
+
+	claim := resources["PersistentVolumeClaim/session-example"]
+	assert.Empty(t, claim.Metadata.Annotations)
+	credential := resources["Secret/example-git"]
+	assert.Equal(t, "short-lived-token", credential.StringData["token"])
+	assert.Equal(t, "example", credential.Metadata.Labels["coding-agent/task"])
+
+	job := resources["Job/example"]
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.Name == "git-auth" {
+			require.NotNil(t, volume.Secret)
+			assert.Equal(t, "example-git", volume.Secret.SecretName)
 		}
 	}
 }
@@ -299,7 +333,7 @@ func validSpec() sessionManifestSpec {
 		Name:           "example",
 		Namespace:      "coding-agents",
 		Image:          "coding-agent:local",
-		Storage:        SessionStoragePersistent,
+		Storage:        session.StoragePersistent,
 		InitialRef:     "main",
 		Prompt:         "inspect the repository",
 		CloneDepth:     1,

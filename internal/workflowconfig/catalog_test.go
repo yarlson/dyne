@@ -53,7 +53,7 @@ workflows:
 	definition, found := catalog.Find("delivery")
 	require.True(t, found)
 	assert.Equal(t, []string{"security", "tests"}, definition.Steps["implement"].After)
-	assert.Equal(t, 2*time.Hour, definition.Steps["implement"].ResolvedAgent.Timeout)
+	assert.Equal(t, 2*time.Hour, definition.Steps["implement"].SessionDefinition.Timeout)
 }
 
 func TestLoadDefaultsMaxParallelismToOne(t *testing.T) {

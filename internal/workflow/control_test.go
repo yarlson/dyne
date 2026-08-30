@@ -11,20 +11,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/session"
 )
 
 type memoryRepository struct {
 	runs    map[string]Run
-	agents  map[string]agent.AgentDefinition
+	agents  map[string]session.Definition
 	version int64
 }
 
 func newMemoryRepository() *memoryRepository {
-	return &memoryRepository{runs: map[string]Run{}, agents: map[string]agent.AgentDefinition{}}
+	return &memoryRepository{runs: map[string]Run{}, agents: map[string]session.Definition{}}
 }
 
-func (s *memoryRepository) Create(_ context.Context, run Run, agents map[string]agent.AgentDefinition) (Run, error) {
+func (s *memoryRepository) Create(_ context.Context, run Run, agents map[string]session.Definition) (Run, error) {
 	if _, found := s.runs[run.Name]; found {
 		return Run{}, ErrConcurrentUpdate
 	}
@@ -75,10 +75,10 @@ func (s *memoryRepository) Runs(context.Context) ([]Run, error) {
 	return runs, nil
 }
 
-func (s *memoryRepository) Agent(_ context.Context, run, name string) (agent.AgentDefinition, error) {
+func (s *memoryRepository) SessionDefinition(_ context.Context, run, name string) (session.Definition, error) {
 	definition, found := s.agents[run+"/"+name]
 	if !found {
-		return agent.AgentDefinition{}, ErrRunNotFound
+		return session.Definition{}, ErrRunNotFound
 	}
 
 	definition.Skills = slices.Clone(definition.Skills)
@@ -110,24 +110,29 @@ func cloneRun(run Run) Run {
 }
 
 type fakeSessions struct {
-	starts    []agent.StartRequest
-	statuses  map[string]agent.Status
-	artifacts map[string]agent.Artifacts
+	starts    []session.StartRequest
+	statuses  map[string]session.Status
+	artifacts map[string]session.Artifacts
 	deleted   []string
 	destroyed []string
 }
 
-func (s *fakeSessions) StartDefinition(_ context.Context, _ agent.AgentDefinition, request agent.StartRequest) (agent.StartResult, error) {
+func (s *fakeSessions) Start(_ context.Context, definition session.Definition, request session.StartRequest) (session.StartResult, error) {
 	s.starts = append(s.starts, request)
 
-	return agent.StartResult{Name: request.Name, Agent: request.Agent, TaskID: request.Name}, nil
+	return session.StartResult{Name: request.Name, Agent: definition.Agent, TaskID: request.Name}, nil
 }
 
-func (s *fakeSessions) Status(_ context.Context, name string) (agent.Status, error) {
-	return s.statuses[name], nil
+func (s *fakeSessions) Status(_ context.Context, name string) (session.Status, error) {
+	status, exists := s.statuses[name]
+	if !exists {
+		return session.Status{Name: name, TaskID: name, State: session.TaskPending}, nil
+	}
+
+	return status, nil
 }
 
-func (s *fakeSessions) Artifacts(_ context.Context, name string) (agent.Artifacts, error) {
+func (s *fakeSessions) Artifacts(_ context.Context, name string) (session.Artifacts, error) {
 	return s.artifacts[name], nil
 }
 
@@ -155,7 +160,7 @@ func (c definitionCatalog) Find(name string) (Definition, bool) {
 
 func TestReconcileRunsIndependentStepsThenPassesOutputsToDependentStep(t *testing.T) {
 	repository := newMemoryRepository()
-	sessions := &fakeSessions{statuses: map[string]agent.Status{}, artifacts: map[string]agent.Artifacts{}}
+	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}
 	control := newControl(repository, sessions, testCatalog(), func() time.Time { return time.Unix(100, 0).UTC() })
 
 	_, err := control.Start(context.Background(), StartRequest{
@@ -169,7 +174,7 @@ func TestReconcileRunsIndependentStepsThenPassesOutputsToDependentStep(t *testin
 
 	for _, start := range sessions.starts {
 		sessions.statuses[start.Name] = completedStatus(start.Name)
-		sessions.artifacts[start.Name] = agent.Artifacts{
+		sessions.artifacts[start.Name] = session.Artifacts{
 			Outcome:        json.RawMessage(`{"status":"completed","summary":"done","blocker":""}`),
 			WorkflowOutput: json.RawMessage(fmt.Sprintf(`{"source":%q}`, start.WorkflowStep)),
 		}
@@ -183,12 +188,12 @@ func TestReconcileRunsIndependentStepsThenPassesOutputsToDependentStep(t *testin
 	assert.Equal(t, "implement", implementation.WorkflowStep)
 	assert.Contains(t, implementation.Prompt, `"security":{"source":"security"}`)
 	assert.Contains(t, implementation.Prompt, `"tests":{"source":"tests"}`)
-	assert.Equal(t, agent.ResultKindPullRequest, implementation.ResultKind)
+	assert.Equal(t, session.ResultKindPullRequest, implementation.ResultKind)
 }
 
 func TestReconcileSkipsDescendantsAndCompletesIndependentBranch(t *testing.T) {
 	repository := newMemoryRepository()
-	sessions := &fakeSessions{statuses: map[string]agent.Status{}, artifacts: map[string]agent.Artifacts{}}
+	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}
 	control := newControl(repository, sessions, testCatalog(), time.Now)
 	_, err := control.Start(context.Background(), StartRequest{
 		Workflow: "delivery", Name: "change-124", Repository: "https://github.com/example/service.git", Ref: "main", Prompt: "Fix it.",
@@ -200,9 +205,9 @@ func TestReconcileSkipsDescendantsAndCompletesIndependentBranch(t *testing.T) {
 	for _, start := range sessions.starts {
 		sessions.statuses[start.Name] = completedStatus(start.Name)
 		if start.WorkflowStep == "security" {
-			sessions.artifacts[start.Name] = agent.Artifacts{Outcome: json.RawMessage(`{"status":"blocked","summary":"needs policy","blocker":"policy missing"}`)}
+			sessions.artifacts[start.Name] = session.Artifacts{Outcome: json.RawMessage(`{"status":"blocked","summary":"needs policy","blocker":"policy missing"}`)}
 		} else {
-			sessions.artifacts[start.Name] = agent.Artifacts{
+			sessions.artifacts[start.Name] = session.Artifacts{
 				Outcome:        json.RawMessage(`{"status":"completed","summary":"covered","blocker":""}`),
 				WorkflowOutput: json.RawMessage(`{"tests":"covered"}`),
 			}
@@ -219,7 +224,7 @@ func TestReconcileSkipsDescendantsAndCompletesIndependentBranch(t *testing.T) {
 
 func TestReconcileRecoversPersistedStartingStep(t *testing.T) {
 	repository := newMemoryRepository()
-	sessions := &fakeSessions{statuses: map[string]agent.Status{}, artifacts: map[string]agent.Artifacts{}}
+	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}
 	control := newControl(repository, sessions, testCatalog(), time.Now)
 	_, err := control.Start(context.Background(), StartRequest{
 		Workflow: "delivery", Name: "change-125", Repository: "https://github.com/example/service.git", Ref: "main", Prompt: "Fix it.",
@@ -234,7 +239,7 @@ func TestReconcileRecoversPersistedStartingStep(t *testing.T) {
 
 func TestCancelStopsSchedulingAndDeleteDestroysEverySession(t *testing.T) {
 	repository := newMemoryRepository()
-	sessions := &fakeSessions{statuses: map[string]agent.Status{}, artifacts: map[string]agent.Artifacts{}}
+	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}
 	control := newControl(repository, sessions, testCatalog(), time.Now)
 	_, err := control.Start(context.Background(), StartRequest{
 		Workflow: "delivery", Name: "change-126", Repository: "https://github.com/example/service.git", Ref: "main", Prompt: "Fix it.",
@@ -255,20 +260,20 @@ func TestCancelStopsSchedulingAndDeleteDestroysEverySession(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func completedStatus(name string) agent.Status {
-	return agent.Status{Resources: []agent.ResourceStatus{{Kind: "Job", Name: name, State: "Complete"}}}
+func completedStatus(name string) session.Status {
+	return session.Status{Name: name, TaskID: name, State: session.TaskCompleted}
 }
 
 func testCatalog() definitionCatalog {
-	reviewer := agent.AgentDefinition{Name: "reviewer", Storage: agent.StorageEphemeral, Timeout: time.Hour}
-	implementer := agent.AgentDefinition{Name: "implementer", Storage: agent.StoragePersistent, Timeout: time.Hour}
+	reviewer := session.Definition{Agent: "reviewer", Storage: session.StorageEphemeral, Timeout: time.Hour}
+	implementer := session.Definition{Agent: "implementer", Storage: session.StoragePersistent, Timeout: time.Hour}
 
 	return definitionCatalog{"delivery": {
 		Name: "delivery", Description: "Review then implement.", MaxParallelism: 2,
 		Steps: map[string]StepDefinition{
-			"security":  {Name: "security", Agent: "reviewer", Prompt: "Review security.", ResolvedAgent: reviewer},
-			"tests":     {Name: "tests", Agent: "reviewer", Prompt: "Review tests.", ResolvedAgent: reviewer},
-			"implement": {Name: "implement", Agent: "implementer", Prompt: "Implement.", After: []string{"security", "tests"}, Publishable: true, ResolvedAgent: implementer},
+			"security":  {Name: "security", Agent: "reviewer", Prompt: "Review security.", SessionDefinition: reviewer},
+			"tests":     {Name: "tests", Agent: "reviewer", Prompt: "Review tests.", SessionDefinition: reviewer},
+			"implement": {Name: "implement", Agent: "implementer", Prompt: "Implement.", After: []string{"security", "tests"}, Publishable: true, SessionDefinition: implementer},
 		},
 	}}
 }

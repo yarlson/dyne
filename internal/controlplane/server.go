@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/publish"
+	"github.com/yarlson/dyne/internal/session"
 	"github.com/yarlson/dyne/internal/workflow"
 )
 
@@ -19,20 +21,30 @@ const maxRequestBytes = 1 << 20
 type Config struct {
 	// ErrorOutput receives full operation errors that are unsafe to return to clients.
 	ErrorOutput io.Writer
+	// Sessions performs session lifecycle operations.
+	Sessions sessionOperations
+	// Publisher publishes completed persistent sessions.
+	Publisher publishOperations
 	// Workflows enables durable workflow routes when configured.
 	Workflows workflowOperations
 }
 
-type operations interface {
+type agentOperations interface {
 	Agents() []agent.AgentSummary
 	Start(context.Context, agent.StartRequest) (agent.StartResult, error)
-	Continue(context.Context, agent.ContinueRequest) (agent.TaskResult, error)
-	Status(context.Context, string) (agent.Status, error)
-	Artifacts(context.Context, string) (agent.Artifacts, error)
+}
+
+type sessionOperations interface {
+	Continue(context.Context, session.ContinueRequest) (session.TaskResult, error)
+	Status(context.Context, string) (session.Status, error)
+	Artifacts(context.Context, string) (session.Artifacts, error)
 	WriteLogs(context.Context, string, bool, io.Writer) error
 	Delete(context.Context, string) error
 	Destroy(context.Context, string) error
-	Publish(context.Context, agent.PublishRequest) (agent.PublishResult, error)
+}
+
+type publishOperations interface {
+	Publish(context.Context, publish.Request) (publish.Result, error)
 }
 
 type workflowOperations interface {
@@ -45,12 +57,12 @@ type workflowOperations interface {
 }
 
 // New returns the private-network HTTP control plane for one cluster and namespace.
-func New(control operations, config Config) http.Handler {
+func New(agents agentOperations, config Config) http.Handler {
 	if config.ErrorOutput == nil {
 		config.ErrorOutput = io.Discard
 	}
 
-	server := &server{control: control, config: config}
+	server := &server{agents: agents, config: config}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agents", server.listAgents)
 	mux.HandleFunc("POST /v1/agents/{agent}/sessions", server.createAgentSession)
@@ -147,8 +159,8 @@ func (s *server) deleteWorkflowRun(writer http.ResponseWriter, request *http.Req
 }
 
 type server struct {
-	control operations
-	config  Config
+	agents agentOperations
+	config Config
 }
 
 type createAgentSessionRequest struct {
@@ -162,7 +174,7 @@ type createAgentSessionRequest struct {
 func (s *server) listAgents(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, struct {
 		Agents []agent.AgentSummary `json:"agents"`
-	}{Agents: s.control.Agents()})
+	}{Agents: s.agents.Agents()})
 }
 
 func (s *server) createAgentSession(writer http.ResponseWriter, request *http.Request) {
@@ -178,7 +190,7 @@ func (s *server) createAgentSession(writer http.ResponseWriter, request *http.Re
 		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
 	}
 
-	result, err := s.control.Start(request.Context(), agent.StartRequest{
+	result, err := s.agents.Start(request.Context(), agent.StartRequest{
 		Agent:      request.PathValue("agent"),
 		Name:       input.Name,
 		Repository: input.Repository,
@@ -187,7 +199,7 @@ func (s *server) createAgentSession(writer http.ResponseWriter, request *http.Re
 		Timeout:    timeout,
 	})
 	if err != nil {
-		s.writeOperationError(writer, err)
+		s.writeAgentError(writer, err)
 
 		return
 	}
@@ -212,11 +224,11 @@ func (s *server) continueSession(writer http.ResponseWriter, request *http.Reque
 	}
 
 	name := request.PathValue("name")
-	result, err := s.control.Continue(request.Context(), agent.ContinueRequest{
+	result, err := s.config.Sessions.Continue(request.Context(), session.ContinueRequest{
 		Name: name, Prompt: input.Prompt, Timeout: timeout,
 	})
 	if err != nil {
-		s.writeOperationError(writer, err)
+		s.writeSessionError(writer, err)
 
 		return
 	}
@@ -226,23 +238,20 @@ func (s *server) continueSession(writer http.ResponseWriter, request *http.Reque
 
 func (s *server) sessionStatus(writer http.ResponseWriter, request *http.Request) {
 	name := request.PathValue("name")
-	status, err := s.control.Status(request.Context(), name)
+	status, err := s.config.Sessions.Status(request.Context(), name)
 	if err != nil {
-		s.writeOperationError(writer, err)
+		s.writeSessionError(writer, err)
 
 		return
 	}
 
-	writeJSON(writer, http.StatusOK, struct {
-		Name      string                 `json:"name"`
-		Resources []agent.ResourceStatus `json:"resources"`
-	}{Name: name, Resources: status.Resources})
+	writeJSON(writer, http.StatusOK, status)
 }
 
 func (s *server) sessionLogs(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Content-Type", "application/x-ndjson")
 	stream := &trackingResponseWriter{ResponseWriter: writer}
-	err := s.control.WriteLogs(request.Context(), request.PathValue("name"), request.URL.Query().Get("follow") == "true", stream)
+	err := s.config.Sessions.WriteLogs(request.Context(), request.PathValue("name"), request.URL.Query().Get("follow") == "true", stream)
 	if err != nil {
 		if stream.wroteResponse {
 			s.logOperationError(err)
@@ -250,14 +259,14 @@ func (s *server) sessionLogs(writer http.ResponseWriter, request *http.Request) 
 			return
 		}
 
-		s.writeOperationError(writer, err)
+		s.writeSessionError(writer, err)
 	}
 }
 
 func (s *server) sessionArtifacts(writer http.ResponseWriter, request *http.Request) {
-	result, err := s.control.Artifacts(request.Context(), request.PathValue("name"))
+	result, err := s.config.Sessions.Artifacts(request.Context(), request.PathValue("name"))
 	if err != nil {
-		s.writeOperationError(writer, err)
+		s.writeSessionError(writer, err)
 
 		return
 	}
@@ -269,13 +278,13 @@ func (s *server) deleteSession(writer http.ResponseWriter, request *http.Request
 	name := request.PathValue("name")
 	var err error
 	if request.URL.Query().Get("storage") == "delete" {
-		err = s.control.Destroy(request.Context(), name)
+		err = s.config.Sessions.Destroy(request.Context(), name)
 	} else {
-		err = s.control.Delete(request.Context(), name)
+		err = s.config.Sessions.Delete(request.Context(), name)
 	}
 
 	if err != nil {
-		s.writeOperationError(writer, err)
+		s.writeSessionError(writer, err)
 
 		return
 	}
@@ -302,8 +311,8 @@ func (s *server) publishSession(writer http.ResponseWriter, request *http.Reques
 		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
 	}
 
-	result, err := s.control.Publish(request.Context(), agent.PublishRequest{
-		Name:          request.PathValue("name"),
+	result, err := s.config.Publisher.Publish(request.Context(), publish.Request{
+		Session:       request.PathValue("name"),
 		Branch:        input.Branch,
 		BaseBranch:    input.BaseBranch,
 		CommitMessage: input.CommitMessage,
@@ -311,7 +320,7 @@ func (s *server) publishSession(writer http.ResponseWriter, request *http.Reques
 		Timeout:       timeout,
 	})
 	if err != nil {
-		s.writeOperationError(writer, err)
+		s.writePublishError(writer, err)
 
 		return
 	}
@@ -343,7 +352,7 @@ func writeError(writer http.ResponseWriter, status int, err error) {
 	writeJSON(writer, status, map[string]string{"error": err.Error()})
 }
 
-func (s *server) writeOperationError(writer http.ResponseWriter, err error) {
+func (s *server) writeAgentError(writer http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	message := "operation failed"
 	switch agent.ErrorKindOf(err) {
@@ -351,7 +360,49 @@ func (s *server) writeOperationError(writer http.ResponseWriter, err error) {
 		status, message = http.StatusBadRequest, err.Error()
 	case agent.ErrorNotFound:
 		status, message = http.StatusNotFound, err.Error()
+	case agent.ErrorConflict:
+		status, message = http.StatusConflict, err.Error()
 	case agent.ErrorUnavailable:
+		status, message = http.StatusServiceUnavailable, err.Error()
+	}
+
+	if status >= http.StatusInternalServerError {
+		s.logOperationError(err)
+	}
+
+	writeError(writer, status, errors.New(message))
+}
+
+func (s *server) writeSessionError(writer http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	message := "operation failed"
+	switch session.ErrorKindOf(err) {
+	case session.ErrorInvalid:
+		status, message = http.StatusBadRequest, err.Error()
+	case session.ErrorNotFound:
+		status, message = http.StatusNotFound, err.Error()
+	case session.ErrorConflict:
+		status, message = http.StatusConflict, err.Error()
+	case session.ErrorUnavailable:
+		status, message = http.StatusServiceUnavailable, err.Error()
+	}
+
+	if status >= http.StatusInternalServerError {
+		s.logOperationError(err)
+	}
+
+	writeError(writer, status, errors.New(message))
+}
+
+func (s *server) writePublishError(writer http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	message := "operation failed"
+	switch publish.ErrorKindOf(err) {
+	case publish.ErrorInvalid:
+		status, message = http.StatusBadRequest, err.Error()
+	case publish.ErrorConflict:
+		status, message = http.StatusConflict, err.Error()
+	case publish.ErrorUnavailable:
 		status, message = http.StatusServiceUnavailable, err.Error()
 	}
 

@@ -7,25 +7,20 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/yarlson/dyne/internal/session"
 )
 
 const (
-	githubTokenSecretName       = "coding-agent-git-auth"
-	codexAuthSecretName         = "coding-agent-auth"
-	maxAgentConfigBytes         = 900 * 1024
-	sessionImageAnnotation      = "dyne.yarlson.dev/image"
-	sessionRepositoryAnnotation = "dyne.yarlson.dev/repository"
-	sessionInitialRefAnnotation = "dyne.yarlson.dev/initial-ref"
-	sessionSetupAnnotation      = "dyne.yarlson.dev/setup"
-	sessionCloneDepthAnnotation = "dyne.yarlson.dev/clone-depth"
-	sessionAgentAnnotation      = "dyne.yarlson.dev/agent"
+	codexAuthSecretName = "coding-agent-auth"
+	maxAgentConfigBytes = 900 * 1024
 )
 
 type sessionManifestSpec struct {
 	Name           string
 	Namespace      string
 	Image          string
-	Storage        SessionStorage
+	Storage        session.Storage
 	TaskName       string
 	Resume         bool
 	Repository     string
@@ -34,13 +29,14 @@ type sessionManifestSpec struct {
 	Prompt         string
 	AgentName      string
 	Instructions   string
-	Skills         []SessionSkill
+	Skills         []session.Skill
 	CloneDepth     int
 	StorageSize    string
 	TimeoutSeconds int64
-	ResultKind     ResultKind
+	ResultKind     session.ResultKind
 	WorkflowRun    string
 	WorkflowStep   string
+	GitCredential  string
 }
 
 type manifestResource map[string]any
@@ -55,7 +51,7 @@ var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
 func (s sessionManifestSpec) validate(initial bool) error {
 	if s.ResultKind == "" {
-		s.ResultKind = ResultKindPullRequest
+		s.ResultKind = session.ResultKindPullRequest
 	}
 
 	if !dnsLabelPattern.MatchString(s.Name) || len(s.Name) > 40 {
@@ -117,7 +113,7 @@ func (s sessionManifestSpec) validate(initial bool) error {
 			return errors.New("agent name must be a lowercase DNS label no longer than 63 characters")
 		}
 
-		if initial && strings.TrimSpace(s.Instructions) == "" {
+		if strings.TrimSpace(s.Instructions) == "" {
 			return errors.New("agent instructions are required")
 		}
 
@@ -136,13 +132,13 @@ func (s sessionManifestSpec) validate(initial bool) error {
 	}
 
 	switch s.Storage {
-	case SessionStorageEphemeral, SessionStoragePersistent:
+	case session.StorageEphemeral, session.StoragePersistent:
 	default:
 		return fmt.Errorf("unsupported storage %q", s.Storage)
 	}
 
 	switch s.ResultKind {
-	case "", ResultKindPullRequest, ResultKindWorkflowOutput:
+	case "", session.ResultKindPullRequest, session.ResultKindWorkflowOutput:
 	default:
 		return fmt.Errorf("unsupported result kind %q", s.ResultKind)
 	}
@@ -155,7 +151,7 @@ func renderSessionManifest(s sessionManifestSpec) ([]byte, error) {
 }
 
 func renderContinuationManifest(s sessionManifestSpec) ([]byte, error) {
-	if s.Storage != SessionStoragePersistent {
+	if s.Storage != session.StoragePersistent {
 		return nil, errors.New("continuation requires persistent storage")
 	}
 
@@ -172,12 +168,16 @@ func render(s sessionManifestSpec, initial bool) ([]byte, error) {
 	}
 
 	items := []manifestResource{denyIngressPolicy(s.Namespace)}
-	if initial && s.Storage == SessionStoragePersistent {
+	if initial && s.Storage == session.StoragePersistent {
 		items = append(items, persistentVolumeClaim(s))
 	}
 
-	if initial && s.AgentName != "" {
+	if s.AgentName != "" {
 		items = append(items, agentConfigMap(s))
+	}
+
+	if s.GitCredential != "" {
+		items = append(items, repositoryCredentialSecret(s))
 	}
 
 	items = append(items, sessionJob(s))
@@ -209,25 +209,13 @@ func denyIngressPolicy(namespace string) manifestResource {
 }
 
 func persistentVolumeClaim(s sessionManifestSpec) manifestResource {
-	annotations := map[string]any{
-		sessionImageAnnotation:      s.Image,
-		sessionRepositoryAnnotation: s.Repository,
-		sessionInitialRefAnnotation: s.InitialRef,
-		sessionSetupAnnotation:      s.SetupCommand,
-		sessionCloneDepthAnnotation: fmt.Sprintf("%d", s.CloneDepth),
-	}
-	if s.AgentName != "" {
-		annotations[sessionAgentAnnotation] = s.AgentName
-	}
-
 	return manifestResource{
 		"apiVersion": "v1",
 		"kind":       "PersistentVolumeClaim",
 		"metadata": map[string]any{
-			"name":        sessionClaimName(s.Name),
-			"namespace":   s.Namespace,
-			"labels":      sessionLabelsFor(s),
-			"annotations": annotations,
+			"name":      sessionClaimName(s.Name),
+			"namespace": s.Namespace,
+			"labels":    sessionLabelsFor(s),
 		},
 		"spec": map[string]any{
 			"accessModes": []any{"ReadWriteOnce"},
@@ -260,7 +248,7 @@ func sessionJob(s sessionManifestSpec) manifestResource {
 }
 
 func sessionPodTemplate(s sessionManifestSpec) map[string]any {
-	workspaceReadOnly := s.Storage == SessionStorageEphemeral
+	workspaceReadOnly := s.Storage == session.StorageEphemeral
 
 	return map[string]any{
 		"metadata": map[string]any{"labels": taskLabels(s)},
@@ -393,9 +381,9 @@ func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceR
 	}
 }
 
-func resultKind(kind ResultKind) ResultKind {
+func resultKind(kind session.ResultKind) session.ResultKind {
 	if kind == "" {
-		return ResultKindPullRequest
+		return session.ResultKindPullRequest
 	}
 
 	return kind
@@ -419,22 +407,22 @@ func taskName(s sessionManifestSpec) string {
 func sessionDirectoryContainer(s sessionManifestSpec) map[string]any {
 	container := sessionContainer(s, "session-init", nil, false, mountAccess{})
 	container["command"] = []any{"mkdir"}
-	container["args"] = []any{"-p", "/session/workspace", "/session/home", "/session/agent", "/session/logs", "/session/artifacts", "/session/state"}
+	container["args"] = []any{"-p", "/session/workspace", "/session/home", "/session/agent", "/session/logs", "/session/artifacts"}
 	container["volumeMounts"] = []any{map[string]any{"name": "session", "mountPath": "/session"}}
 
 	return container
 }
 
 func sessionVolumes(s sessionManifestSpec) []any {
-	session := map[string]any{"name": "session"}
-	if s.Storage == SessionStorageEphemeral {
-		session["emptyDir"] = map[string]any{"sizeLimit": "7Gi"}
+	sessionVolume := map[string]any{"name": "session"}
+	if s.Storage == session.StorageEphemeral {
+		sessionVolume["emptyDir"] = map[string]any{"sizeLimit": "7Gi"}
 	} else {
-		session["persistentVolumeClaim"] = map[string]any{"claimName": sessionClaimName(s.Name)}
+		sessionVolume["persistentVolumeClaim"] = map[string]any{"claimName": sessionClaimName(s.Name)}
 	}
 
 	volumes := []any{
-		session,
+		sessionVolume,
 		map[string]any{"name": "tmp", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": "1Gi"}},
 		map[string]any{
 			"name": "auth",
@@ -445,18 +433,24 @@ func sessionVolumes(s sessionManifestSpec) []any {
 			},
 		},
 		map[string]any{
-			"name": "git-auth",
-			"secret": map[string]any{
-				"secretName":  githubTokenSecretName,
-				"optional":    true,
-				"defaultMode": 288,
-			},
+			"name":     "git-auth",
+			"emptyDir": map[string]any{},
 		},
 	}
+	if s.GitCredential != "" {
+		volumes[3] = map[string]any{
+			"name": "git-auth",
+			"secret": map[string]any{
+				"secretName":  repositoryCredentialSecretName(s),
+				"defaultMode": 288,
+			},
+		}
+	}
+
 	if len(s.Skills) > 0 {
 		items := make([]any, len(s.Skills))
 		skills := slices.Clone(s.Skills)
-		slices.SortFunc(skills, func(left, right SessionSkill) int {
+		slices.SortFunc(skills, func(left, right session.Skill) int {
 			return strings.Compare(left.Name, right.Name)
 		})
 		for i, skill := range skills {
@@ -489,21 +483,38 @@ func agentConfigMap(s sessionManifestSpec) manifestResource {
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
 		"metadata": map[string]any{
-			"name":        sessionAgentConfigName(s.Name),
-			"namespace":   s.Namespace,
-			"labels":      sessionLabelsFor(s),
-			"annotations": map[string]any{sessionAgentAnnotation: s.AgentName},
+			"name":      sessionAgentConfigName(s.Name),
+			"namespace": s.Namespace,
+			"labels":    sessionLabelsFor(s),
 		},
 		"immutable": true,
 		"data":      data,
 	}
 }
 
+func repositoryCredentialSecret(s sessionManifestSpec) manifestResource {
+	return manifestResource{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      repositoryCredentialSecretName(s),
+			"namespace": s.Namespace,
+			"labels":    taskLabels(s),
+		},
+		"type":       "Opaque",
+		"stringData": map[string]any{"token": s.GitCredential},
+	}
+}
+
+func repositoryCredentialSecretName(s sessionManifestSpec) string {
+	return taskName(s) + "-git"
+}
+
 func agentSkillKey(name string) string {
 	return "skill-" + name
 }
 
-func validateAgentSkills(skills []SessionSkill) error {
+func validateAgentSkills(skills []session.Skill) error {
 	names := make(map[string]struct{}, len(skills))
 	for _, skill := range skills {
 		if !dnsLabelPattern.MatchString(skill.Name) || len(skill.Name) > 63 {

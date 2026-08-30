@@ -16,11 +16,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/publish"
+	"github.com/yarlson/dyne/internal/session"
 	"github.com/yarlson/dyne/internal/workflow"
 )
 
 func TestCreateSessionDoesNotExposeRawSessionContract(t *testing.T) {
-	server := New(operationsStub{}, Config{})
+	server := newTestServer(operationsStub{}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/sessions", strings.NewReader(`{
 		"name":"review",
 		"storage":"persistent",
@@ -36,7 +38,7 @@ func TestCreateSessionDoesNotExposeRawSessionContract(t *testing.T) {
 }
 
 func TestListAgentsReturnsSafeProductSummaries(t *testing.T) {
-	server := New(operationsStub{agents: []agent.AgentSummary{
+	server := newTestServer(operationsStub{agents: []agent.AgentSummary{
 		{Name: "implementer", Description: "Implements focused changes.", Storage: agent.StoragePersistent, Skills: []string{"code-review"}},
 		{Name: "reviewer", Description: "Reviews repository changes.", Storage: agent.StorageEphemeral, Skills: []string{"code-review"}},
 	}}, Config{})
@@ -58,7 +60,7 @@ func TestListAgentsReturnsSafeProductSummaries(t *testing.T) {
 
 func TestCreateAgentSessionDelegatesOnlyClientOwnedInputs(t *testing.T) {
 	var received agent.StartRequest
-	server := New(operationsStub{start: func(_ context.Context, request agent.StartRequest) (agent.StartResult, error) {
+	server := newTestServer(operationsStub{start: func(_ context.Context, request agent.StartRequest) (agent.StartResult, error) {
 		received = request
 
 		return agent.StartResult{Agent: request.Agent, Name: request.Name, TaskID: request.Name}, nil
@@ -100,7 +102,7 @@ func TestWorkflowRoutesDelegateDurableRunOperations(t *testing.T) {
 			return nil
 		},
 	}
-	server := New(operationsStub{}, Config{Workflows: workflows})
+	server := newTestServer(operationsStub{}, Config{Workflows: workflows})
 
 	listResponse := httptest.NewRecorder()
 	server.ServeHTTP(listResponse, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/workflows", nil))
@@ -124,7 +126,7 @@ func TestWorkflowRoutesDelegateDurableRunOperations(t *testing.T) {
 }
 
 func TestCreateAgentSessionReturnsNotFoundForUnknownAgent(t *testing.T) {
-	server := New(&agent.Control{}, Config{})
+	server := New(&agent.Control{}, Config{Sessions: operationsStub{}, Publisher: operationsStub{}})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/agents/missing/sessions", strings.NewReader(`{
 		"name":"change-123",
 		"repository":"https://github.com/lokalise/kargo.git",
@@ -139,11 +141,11 @@ func TestCreateAgentSessionReturnsNotFoundForUnknownAgent(t *testing.T) {
 }
 
 func TestContinueSessionReturnsProductGeneratedTaskID(t *testing.T) {
-	var received agent.ContinueRequest
-	server := New(operationsStub{continueTask: func(_ context.Context, request agent.ContinueRequest) (agent.TaskResult, error) {
+	var received session.ContinueRequest
+	server := newTestServer(operationsStub{continueTask: func(_ context.Context, request session.ContinueRequest) (session.TaskResult, error) {
 		received = request
 
-		return agent.TaskResult{Name: request.Name, TaskID: "abc123"}, nil
+		return session.TaskResult{Name: request.Name, TaskID: "abc123"}, nil
 	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/sessions/review/tasks", strings.NewReader(`{"prompt":"continue the fix"}`))
 	response := httptest.NewRecorder()
@@ -151,15 +153,15 @@ func TestContinueSessionReturnsProductGeneratedTaskID(t *testing.T) {
 	server.ServeHTTP(response, request)
 
 	assert.Equal(t, http.StatusAccepted, response.Code)
-	assert.Equal(t, agent.ContinueRequest{Name: "review", Prompt: "continue the fix"}, received)
+	assert.Equal(t, session.ContinueRequest{Name: "review", Prompt: "continue the fix"}, received)
 	assert.JSONEq(t, `{"name":"review","task_id":"abc123"}`, response.Body.String())
 }
 
 func TestStatusReturnsStableJSON(t *testing.T) {
-	server := New(operationsStub{status: func(_ context.Context, name string) (agent.Status, error) {
+	server := newTestServer(operationsStub{status: func(_ context.Context, name string) (session.Status, error) {
 		assert.Equal(t, "review", name)
 
-		return agent.Status{Resources: []agent.ResourceStatus{{Kind: "Job", Name: "review", Ready: "1/1", State: "Complete"}}}, nil
+		return session.Status{Name: "review", TaskID: "review-next", State: session.TaskCompleted}, nil
 	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/sessions/review", nil)
 	response := httptest.NewRecorder()
@@ -170,15 +172,16 @@ func TestStatusReturnsStableJSON(t *testing.T) {
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
 	assert.Equal(t, "review", body["name"])
-	assert.Len(t, body["resources"], 1)
+	assert.Equal(t, "review-next", body["task_id"])
+	assert.Equal(t, "completed", body["state"])
 }
 
 func TestPublishUsesAgentAuthoredMetadataContract(t *testing.T) {
-	var received agent.PublishRequest
-	server := New(operationsStub{publish: func(_ context.Context, request agent.PublishRequest) (agent.PublishResult, error) {
+	var received publish.Request
+	server := newTestServer(operationsStub{publish: func(_ context.Context, request publish.Request) (publish.Result, error) {
 		received = request
 
-		return agent.PublishResult{PullRequestNumber: 17, PullRequestURL: "https://github.com/lokalise/kargo/pull/17"}, nil
+		return publish.Result{PullRequestNumber: 17, PullRequestURL: "https://github.com/lokalise/kargo/pull/17"}, nil
 	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/sessions/review/publish", strings.NewReader(`{
 		"branch":"yar/review",
@@ -189,16 +192,16 @@ func TestPublishUsesAgentAuthoredMetadataContract(t *testing.T) {
 	server.ServeHTTP(response, request)
 
 	require.Equal(t, http.StatusOK, response.Code)
-	assert.Equal(t, agent.PublishRequest{
-		Name: "review", Branch: "yar/review", CommitMessage: "Review changes", Draft: true, Timeout: 10 * time.Minute,
+	assert.Equal(t, publish.Request{
+		Session: "review", Branch: "yar/review", CommitMessage: "Review changes", Draft: true, Timeout: 10 * time.Minute,
 	}, received)
 	assert.NotContains(t, response.Body.String(), "title")
 }
 
 func TestOperationFailureReturnsSafeServerErrorAndRetainsCause(t *testing.T) {
 	var errorOutput bytes.Buffer
-	server := New(operationsStub{status: func(context.Context, string) (agent.Status, error) {
-		return agent.Status{}, errors.New("list Pods: private cluster detail")
+	server := newTestServer(operationsStub{status: func(context.Context, string) (session.Status, error) {
+		return session.Status{}, errors.New("list Pods: private cluster detail")
 	}}, Config{ErrorOutput: &errorOutput})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/sessions/review", nil)
 	response := httptest.NewRecorder()
@@ -213,7 +216,7 @@ func TestOperationFailureReturnsSafeServerErrorAndRetainsCause(t *testing.T) {
 
 func TestLogFailureAfterStreamingDoesNotAppendJSON(t *testing.T) {
 	var errorOutput bytes.Buffer
-	server := New(operationsStub{writeLogs: func(_ context.Context, _ string, _ bool, output io.Writer) error {
+	server := newTestServer(operationsStub{writeLogs: func(_ context.Context, _ string, _ bool, output io.Writer) error {
 		_, err := io.WriteString(output, "first log line\n")
 		require.NoError(t, err)
 
@@ -232,9 +235,9 @@ func TestLogFailureAfterStreamingDoesNotAppendJSON(t *testing.T) {
 type operationsStub struct {
 	agents       []agent.AgentSummary
 	start        func(context.Context, agent.StartRequest) (agent.StartResult, error)
-	continueTask func(context.Context, agent.ContinueRequest) (agent.TaskResult, error)
-	status       func(context.Context, string) (agent.Status, error)
-	publish      func(context.Context, agent.PublishRequest) (agent.PublishResult, error)
+	continueTask func(context.Context, session.ContinueRequest) (session.TaskResult, error)
+	status       func(context.Context, string) (session.Status, error)
+	publish      func(context.Context, publish.Request) (publish.Result, error)
 	writeLogs    func(context.Context, string, bool, io.Writer) error
 }
 
@@ -275,16 +278,16 @@ func (s operationsStub) Start(ctx context.Context, request agent.StartRequest) (
 	return s.start(ctx, request)
 }
 
-func (s operationsStub) Continue(ctx context.Context, request agent.ContinueRequest) (agent.TaskResult, error) {
+func (s operationsStub) Continue(ctx context.Context, request session.ContinueRequest) (session.TaskResult, error) {
 	return s.continueTask(ctx, request)
 }
 
-func (s operationsStub) Status(ctx context.Context, name string) (agent.Status, error) {
+func (s operationsStub) Status(ctx context.Context, name string) (session.Status, error) {
 	return s.status(ctx, name)
 }
 
-func (s operationsStub) Artifacts(context.Context, string) (agent.Artifacts, error) {
-	return agent.Artifacts{}, nil
+func (s operationsStub) Artifacts(context.Context, string) (session.Artifacts, error) {
+	return session.Artifacts{}, nil
 }
 
 func (s operationsStub) WriteLogs(ctx context.Context, name string, follow bool, output io.Writer) error {
@@ -297,6 +300,13 @@ func (s operationsStub) WriteLogs(ctx context.Context, name string, follow bool,
 func (s operationsStub) Delete(context.Context, string) error  { return nil }
 func (s operationsStub) Destroy(context.Context, string) error { return nil }
 
-func (s operationsStub) Publish(ctx context.Context, request agent.PublishRequest) (agent.PublishResult, error) {
+func (s operationsStub) Publish(ctx context.Context, request publish.Request) (publish.Result, error) {
 	return s.publish(ctx, request)
+}
+
+func newTestServer(operations operationsStub, config Config) http.Handler {
+	config.Sessions = operations
+	config.Publisher = operations
+
+	return New(operations, config)
 }

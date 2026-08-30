@@ -2,8 +2,6 @@ package kubernetes
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -17,199 +15,106 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/yarlson/dyne/internal/publish"
 )
 
 const publishIntentAnnotationKey = "coding-agent/publish-intent"
 
-var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var publisherCommitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// PublishSource describes an eligible session workspace that can be published.
-type PublishSource struct {
-	// Repository is the Git repository configured for the session.
-	Repository string
-	// InitialRef is the Git ref from which the session started.
-	InitialRef string
-	// Image is the agent image used to run the publisher.
-	Image string
-	// WorkspaceClaim is the name of the bound claim containing the source workspace.
-	WorkspaceClaim string
-}
-
-// PublisherJobRequest defines one bounded publisher Job.
-type PublisherJobRequest struct {
-	// Namespace owns the session and publisher resources.
-	Namespace string
-	// Session identifies the source session.
-	Session string
-	// IntentID identifies an idempotent publish attempt.
-	IntentID string
-	// Repository is the remote Git repository URL.
-	Repository string
-	// BaseRef is the trusted remote ref cloned before copying workspace changes.
-	BaseRef string
-	// Branch is the new remote branch created by the publisher.
-	Branch string
-	// CommitMessage is the message used for the workspace commit.
-	CommitMessage string
-	// AuthorName is the Git commit author's name.
-	AuthorName string
-	// AuthorEmail is the Git commit author's email address.
-	AuthorEmail string
-	// Image contains the publisher entrypoint.
-	Image string
-	// WorkspaceClaim is the name of the claim containing the source workspace.
-	WorkspaceClaim string
-	// Timeout bounds the publisher Job and the wait for its result.
-	Timeout time.Duration
-}
-
-// PublisherJobResult identifies the branch and commit pushed by a publisher Job.
-type PublisherJobResult struct {
-	// Branch is the remote branch created by the publisher.
-	Branch string
-	// CommitSHA is the commit verified on the remote branch.
-	CommitSHA string
-	// Title is the validated pull request title written by the coding session.
-	Title string
-	// Body is the validated pull request description written by the coding session.
-	Body string
-}
-
-// SessionPublishSource returns publishing inputs for a completed persistent session.
-func (c *Client) SessionPublishSource(ctx context.Context, namespace, session string) (PublishSource, error) {
-	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(session)})
-	if err != nil {
-		return PublishSource{}, fmt.Errorf("list session Jobs: %w", err)
-	}
-
-	if len(jobs.Items) == 0 {
-		return PublishSource{}, fmt.Errorf("session %s does not exist", session)
-	}
-
-	var latest *batchv1.Job
-	for i := range jobs.Items {
-		job := &jobs.Items[i]
-		if job.Status.Active != 0 {
-			return PublishSource{}, errors.New("session has an active task")
-		}
-
-		if latest == nil || job.CreationTimestamp.After(latest.CreationTimestamp.Time) ||
-			(job.CreationTimestamp.Equal(&latest.CreationTimestamp) && job.Name > latest.Name) {
-			latest = job
-		}
-	}
-
-	if latest.Status.Succeeded == 0 {
-		return PublishSource{}, errors.New("latest session task must complete successfully before publishing")
-	}
-
-	artifacts, err := c.SessionArtifacts(ctx, namespace, session)
-	if err != nil {
-		return PublishSource{}, err
-	}
-
-	var outcome struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(artifacts.Outcome, &outcome); err != nil {
-		return PublishSource{}, fmt.Errorf("decode session outcome: %w", err)
-	}
-
-	if outcome.Status != "completed" {
-		return PublishSource{}, fmt.Errorf("session outcome is %q, want completed", outcome.Status)
-	}
-
-	definition, err := c.retainedSessionDefinition(ctx, namespace, session)
-	if errors.Is(err, errRetainedSessionNotFound) {
-		return PublishSource{}, errors.New("ephemeral sessions cannot be published")
-	}
-
-	if err != nil {
-		return PublishSource{}, err
-	}
-
-	if definition.Repository == "" {
-		return PublishSource{}, errors.New("session repository and base ref are required for publishing")
-	}
-
-	workspaceClaim := sessionClaimName(session)
-
-	return PublishSource{
-		Repository:     definition.Repository,
-		InitialRef:     definition.InitialRef,
-		Image:          definition.Image,
-		WorkspaceClaim: workspaceClaim,
-	}, nil
-}
-
-// GitHubToken returns the token stored in the namespace's GitHub Secret.
-func (c *Client) GitHubToken(ctx context.Context, namespace string) (string, error) {
-	secret, err := c.typed.CoreV1().Secrets(namespace).Get(ctx, githubTokenSecretName, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("get GitHub Secret: %w", err)
-	}
-
-	token := strings.TrimSpace(string(secret.Data["token"]))
-	if token == "" {
-		return "", errors.New("GitHub Secret does not contain a token")
-	}
-
-	return token, nil
-}
-
-// PublisherJobIntent returns the recorded intent ID and whether the publisher Job exists.
-func (c *Client) PublisherJobIntent(ctx context.Context, namespace, session string) (string, bool, error) {
-	job, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(session), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return "", false, nil
-	}
-
-	if err != nil {
-		return "", false, fmt.Errorf("get publisher Job: %w", err)
-	}
-
-	return job.Annotations[publishIntentAnnotationKey], true, nil
-}
-
-// RunPublisherJob creates or resumes the matching publisher Job and waits for its result.
-func (c *Client) RunPublisherJob(ctx context.Context, request PublisherJobRequest) (PublisherJobResult, error) {
+// RunPublisher ensures the correlated publisher Job exists and waits for its result.
+func (c *Client) RunPublisher(ctx context.Context, request publish.RuntimeRequest) (publish.RuntimeResult, error) {
 	if request.Timeout < time.Second {
-		return PublisherJobResult{}, errors.New("publisher timeout must be at least one second")
+		return publish.RuntimeResult{}, errors.New("publisher timeout must be at least one second")
+	}
+
+	if strings.TrimSpace(request.RepositoryCredential) == "" {
+		return publish.RuntimeResult{}, errors.New("publisher repository credential is required")
+	}
+
+	existing, err := c.typed.BatchV1().Jobs(c.namespace).Get(ctx, publisherJobName(request.Session), metav1.GetOptions{})
+	if err == nil && existing.Annotations[publishIntentAnnotationKey] != request.IntentID {
+		return publish.RuntimeResult{}, errors.New("publisher Job belongs to a different publish intent")
+	}
+
+	if err != nil && !apierrors.IsNotFound(err) {
+		return publish.RuntimeResult{}, fmt.Errorf("get publisher Job: %w", err)
+	}
+
+	if err := c.ensurePublisherCredential(ctx, request); err != nil {
+		return publish.RuntimeResult{}, err
 	}
 
 	job, err := c.ensurePublisherJob(ctx, request)
 	if err != nil {
-		return PublisherJobResult{}, err
+		return publish.RuntimeResult{}, err
 	}
 
 	if jobConditionTrue(job, batchv1.JobFailed) {
-		if err := c.deletePublisherJob(ctx, request.Namespace, request.Session); err != nil {
-			return PublisherJobResult{}, err
+		if err := c.deletePublisherJob(ctx, request.Session); err != nil {
+			return publish.RuntimeResult{}, err
 		}
 
 		if _, err := c.createPublisherJob(ctx, request); err != nil {
-			return PublisherJobResult{}, err
+			return publish.RuntimeResult{}, err
 		}
 	}
 
-	return c.waitForPublisherJob(ctx, request.Namespace, request.Session, request.IntentID, request.Timeout)
+	return c.waitForPublisherJob(ctx, request.Session, request.IntentID, request.Timeout)
 }
 
-// DeletePublisherJob removes a session's publisher Job and waits for its Pods to disappear.
-func (c *Client) DeletePublisherJob(ctx context.Context, namespace, session string) error {
-	return c.deletePublisherJob(ctx, namespace, session)
+// DeletePublisher removes one disposable publisher Job and its credential Secret.
+func (c *Client) DeletePublisher(ctx context.Context, sessionName string) error {
+	jobErr := c.deletePublisherJob(ctx, sessionName)
+	secretErr := c.typed.CoreV1().Secrets(c.namespace).Delete(
+		ctx, publisherCredentialName(sessionName), metav1.DeleteOptions{},
+	)
+	if apierrors.IsNotFound(secretErr) {
+		secretErr = nil
+	}
+
+	if secretErr != nil {
+		secretErr = fmt.Errorf("delete publisher credential Secret: %w", secretErr)
+	}
+
+	return errors.Join(jobErr, secretErr)
 }
 
-// WaitForPublisherJob waits for an existing publisher Job with the expected intent ID and returns its result.
-func (c *Client) WaitForPublisherJob(ctx context.Context, namespace, session, intentID string, timeout time.Duration) (PublisherJobResult, error) {
-	return c.waitForPublisherJob(ctx, namespace, session, intentID, timeout)
+func (c *Client) ensurePublisherCredential(ctx context.Context, request publish.RuntimeRequest) error {
+	secrets := c.typed.CoreV1().Secrets(c.namespace)
+	name := publisherCredentialName(request.Session)
+	secret, err := secrets.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err = secrets.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.namespace, Labels: publisherLabels(request.Session)},
+			Type:       corev1.SecretTypeOpaque, Data: map[string][]byte{"token": []byte(request.RepositoryCredential)},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("create publisher credential Secret: %w", err)
+		}
+
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("get publisher credential Secret: %w", err)
+	}
+
+	secret.Data = map[string][]byte{"token": []byte(request.RepositoryCredential)}
+	secret.Labels = publisherLabels(request.Session)
+	if _, err := secrets.Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("update publisher credential Secret: %w", err)
+	}
+
+	return nil
 }
 
-func (c *Client) ensurePublisherJob(ctx context.Context, request PublisherJobRequest) (*batchv1.Job, error) {
-	job, err := c.typed.BatchV1().Jobs(request.Namespace).Get(ctx, publisherJobName(request.Session), metav1.GetOptions{})
+func (c *Client) ensurePublisherJob(ctx context.Context, request publish.RuntimeRequest) (*batchv1.Job, error) {
+	job, err := c.typed.BatchV1().Jobs(c.namespace).Get(ctx, publisherJobName(request.Session), metav1.GetOptions{})
 	if err == nil {
 		if job.Annotations[publishIntentAnnotationKey] != request.IntentID {
-			return nil, errors.New("publisher Job belongs to a different publish request")
+			return nil, errors.New("publisher Job belongs to a different publish intent")
 		}
 
 		return job, nil
@@ -222,9 +127,9 @@ func (c *Client) ensurePublisherJob(ctx context.Context, request PublisherJobReq
 	return c.createPublisherJob(ctx, request)
 }
 
-func (c *Client) createPublisherJob(ctx context.Context, request PublisherJobRequest) (*batchv1.Job, error) {
-	job := publisherJob(request)
-	created, err := c.typed.BatchV1().Jobs(request.Namespace).Create(ctx, job, metav1.CreateOptions{})
+func (c *Client) createPublisherJob(ctx context.Context, request publish.RuntimeRequest) (*batchv1.Job, error) {
+	job := publisherJob(c.namespace, request)
+	created, err := c.typed.BatchV1().Jobs(c.namespace).Create(ctx, job, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
 		return c.ensurePublisherJob(ctx, request)
 	}
@@ -238,10 +143,12 @@ func (c *Client) createPublisherJob(ctx context.Context, request PublisherJobReq
 	return created, nil
 }
 
-func (c *Client) waitForPublisherJob(ctx context.Context, namespace, session, intentID string, timeout time.Duration) (PublisherJobResult, error) {
-	var result PublisherJobResult
+func (c *Client) waitForPublisherJob(
+	ctx context.Context, sessionName, intentID string, timeout time.Duration,
+) (publish.RuntimeResult, error) {
+	var result publish.RuntimeResult
 	err := wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		job, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(session), metav1.GetOptions{})
+		job, err := c.typed.BatchV1().Jobs(c.namespace).Get(ctx, publisherJobName(sessionName), metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -251,28 +158,28 @@ func (c *Client) waitForPublisherJob(ctx context.Context, namespace, session, in
 		}
 
 		if jobConditionTrue(job, batchv1.JobFailed) {
-			return false, c.publisherJobFailure(ctx, namespace, job.Name)
+			return false, c.publisherJobFailure(ctx, job.Name)
 		}
 
 		if !jobConditionTrue(job, batchv1.JobComplete) {
 			return false, nil
 		}
 
-		result, err = c.publisherJobResult(ctx, namespace, job.Name)
+		result, err = c.publisherJobResult(ctx, job.Name)
 
 		return err == nil, err
 	})
 	if err != nil {
-		return PublisherJobResult{}, fmt.Errorf("publish session %s: %w", session, err)
+		return publish.RuntimeResult{}, fmt.Errorf("publish session %s: %w", sessionName, err)
 	}
 
 	return result, nil
 }
 
-func (c *Client) publisherJobResult(ctx context.Context, namespace, jobName string) (PublisherJobResult, error) {
-	pod, err := c.publisherJobPod(ctx, namespace, jobName)
+func (c *Client) publisherJobResult(ctx context.Context, jobName string) (publish.RuntimeResult, error) {
+	pod, err := c.publisherJobPod(ctx, jobName)
 	if err != nil {
-		return PublisherJobResult{}, err
+		return publish.RuntimeResult{}, err
 	}
 
 	for _, status := range pod.Status.ContainerStatuses {
@@ -281,23 +188,23 @@ func (c *Client) publisherJobResult(ctx context.Context, namespace, jobName stri
 		}
 
 		result := parsePublisherJobResult(status.State.Terminated.Message)
-		if result.Branch == "" || !commitSHAPattern.MatchString(result.CommitSHA) || result.Title == "" || result.Body == "" {
-			return PublisherJobResult{}, errors.New("publisher did not report a valid branch, commit, and pull request artifact")
+		if result.Branch == "" || !publisherCommitSHAPattern.MatchString(result.CommitSHA) {
+			return publish.RuntimeResult{}, errors.New("publisher did not report a valid branch and commit")
 		}
 
 		return result, nil
 	}
 
-	return PublisherJobResult{}, errors.New("publisher container has no termination result")
+	return publish.RuntimeResult{}, errors.New("publisher container has no termination result")
 }
 
-func (c *Client) publisherJobFailure(ctx context.Context, namespace, jobName string) error {
-	pod, err := c.publisherJobPod(ctx, namespace, jobName)
+func (c *Client) publisherJobFailure(ctx context.Context, jobName string) error {
+	pod, err := c.publisherJobPod(ctx, jobName)
 	if err != nil {
 		return err
 	}
 
-	contents, logErr := c.typed.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: "publisher"}).Do(ctx).Raw()
+	contents, logErr := c.typed.CoreV1().Pods(c.namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: "publisher"}).Do(ctx).Raw()
 	if logErr != nil {
 		return fmt.Errorf("publisher Job failed; read logs: %w", logErr)
 	}
@@ -314,8 +221,8 @@ func (c *Client) publisherJobFailure(ctx context.Context, namespace, jobName str
 	return errors.New(message)
 }
 
-func (c *Client) publisherJobPod(ctx context.Context, namespace, jobName string) (*corev1.Pod, error) {
-	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+func (c *Client) publisherJobPod(ctx context.Context, jobName string) (*corev1.Pod, error) {
+	pods, err := c.typed.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set{"job-name": jobName}.AsSelector().String(),
 	})
 	if err != nil {
@@ -329,8 +236,8 @@ func (c *Client) publisherJobPod(ctx context.Context, namespace, jobName string)
 	return &pods.Items[0], nil
 }
 
-func (c *Client) deletePublisherJob(ctx context.Context, namespace, session string) error {
-	err := c.typed.BatchV1().Jobs(namespace).Delete(ctx, publisherJobName(session), metav1.DeleteOptions{
+func (c *Client) deletePublisherJob(ctx context.Context, sessionName string) error {
+	err := c.typed.BatchV1().Jobs(c.namespace).Delete(ctx, publisherJobName(sessionName), metav1.DeleteOptions{
 		PropagationPolicy: new(metav1.DeletePropagationBackground),
 	})
 	if apierrors.IsNotFound(err) {
@@ -342,14 +249,13 @@ func (c *Client) deletePublisherJob(ctx context.Context, namespace, session stri
 	}
 
 	return wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		jobName := publisherJobName(session)
-		_, jobErr := c.typed.BatchV1().Jobs(namespace).Get(ctx, jobName, metav1.GetOptions{})
+		_, jobErr := c.typed.BatchV1().Jobs(c.namespace).Get(ctx, publisherJobName(sessionName), metav1.GetOptions{})
 		if jobErr != nil && !apierrors.IsNotFound(jobErr) {
 			return false, jobErr
 		}
 
-		pods, podErr := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: labels.Set{"job-name": jobName}.AsSelector().String(),
+		pods, podErr := c.typed.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labels.Set{"job-name": publisherJobName(sessionName)}.AsSelector().String(),
 		})
 		if podErr != nil {
 			return false, podErr
@@ -359,52 +265,37 @@ func (c *Client) deletePublisherJob(ctx context.Context, namespace, session stri
 	})
 }
 
-func publisherJob(request PublisherJobRequest) *batchv1.Job {
-	labels := map[string]string{
-		"app.kubernetes.io/name":       "coding-agent",
-		"app.kubernetes.io/managed-by": "dyne",
-		"coding-agent/session":         request.Session,
-		"coding-agent/component":       "publisher",
-	}
+func publisherJob(namespace string, request publish.RuntimeRequest) *batchv1.Job {
+	jobLabels := publisherLabels(request.Session)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        publisherJobName(request.Session),
-			Namespace:   request.Namespace,
-			Labels:      labels,
+			Name: publisherJobName(request.Session), Namespace: namespace, Labels: jobLabels,
 			Annotations: map[string]string{publishIntentAnnotationKey: request.IntentID},
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:          new(int32(0)),
-			ActiveDeadlineSeconds: new(int64(request.Timeout.Seconds())),
+			BackoffLimit: new(int32(0)), ActiveDeadlineSeconds: new(int64(request.Timeout.Seconds())),
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: jobLabels},
 				Spec: corev1.PodSpec{
-					AutomountServiceAccountToken: new(false),
-					RestartPolicy:                corev1.RestartPolicyNever,
+					AutomountServiceAccountToken: new(false), RestartPolicy: corev1.RestartPolicyNever,
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: new(true),
-						RunAsUser:    new(int64(1000)),
-						RunAsGroup:   new(int64(1000)),
-						FSGroup:      new(int64(1000)),
-						SeccompProfile: &corev1.SeccompProfile{
-							Type: corev1.SeccompProfileTypeRuntimeDefault,
-						},
+						RunAsNonRoot: new(true), RunAsUser: new(int64(1000)), RunAsGroup: new(int64(1000)),
+						FSGroup:        new(int64(1000)),
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{publisherContainer(request)},
 					Volumes: []corev1.Volume{
 						{
 							Name: "workspace",
 							VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-								ClaimName: request.WorkspaceClaim,
-								ReadOnly:  true,
+								ClaimName: sessionClaimName(request.Session), ReadOnly: true,
 							}},
 						},
 						{
 							Name: "artifacts",
 							VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-								ClaimName: request.WorkspaceClaim,
-								ReadOnly:  true,
+								ClaimName: sessionClaimName(request.Session), ReadOnly: true,
 							}},
 						},
 						{Name: "publish", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resourceQuantity("4Gi"))}}},
@@ -412,8 +303,7 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 						{
 							Name: "git-auth",
 							VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-								SecretName:  githubTokenSecretName,
-								DefaultMode: new(int32(0o440)),
+								SecretName: publisherCredentialName(request.Session), DefaultMode: new(int32(0o440)),
 							}},
 						},
 					},
@@ -423,13 +313,10 @@ func publisherJob(request PublisherJobRequest) *batchv1.Job {
 	}
 }
 
-func publisherContainer(request PublisherJobRequest) corev1.Container {
+func publisherContainer(request publish.RuntimeRequest) corev1.Container {
 	return corev1.Container{
-		Name:            "publisher",
-		Image:           request.Image,
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Args:            []string{"publish"},
-		WorkingDir:      "/workspace",
+		Name: "publisher", Image: request.Image, ImagePullPolicy: corev1.PullIfNotPresent,
+		Args: []string{"publish"}, WorkingDir: "/workspace",
 		Env: []corev1.EnvVar{
 			{Name: "PUBLISH_REPOSITORY", Value: request.Repository},
 			{Name: "PUBLISH_BASE", Value: request.BaseRef},
@@ -439,19 +326,16 @@ func publisherContainer(request PublisherJobRequest) corev1.Container {
 			{Name: "PUBLISH_AUTHOR_EMAIL", Value: request.AuthorEmail},
 		},
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: new(false),
-			ReadOnlyRootFilesystem:   new(true),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			AllowPrivilegeEscalation: new(false), ReadOnlyRootFilesystem: new(true),
+			Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:              resourceQuantity("250m"),
-				corev1.ResourceMemory:           resourceQuantity("512Mi"),
+				corev1.ResourceCPU: resourceQuantity("250m"), corev1.ResourceMemory: resourceQuantity("512Mi"),
 				corev1.ResourceEphemeralStorage: resourceQuantity("512Mi"),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:              resourceQuantity("2"),
-				corev1.ResourceMemory:           resourceQuantity("4Gi"),
+				corev1.ResourceCPU: resourceQuantity("2"), corev1.ResourceMemory: resourceQuantity("4Gi"),
 				corev1.ResourceEphemeralStorage: resourceQuantity("6Gi"),
 			},
 		},
@@ -465,22 +349,18 @@ func publisherContainer(request PublisherJobRequest) corev1.Container {
 	}
 }
 
-func publisherJobName(session string) string {
-	return session + "-publish"
-}
-
-func jobConditionTrue(job *batchv1.Job, conditionType batchv1.JobConditionType) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == conditionType && condition.Status == corev1.ConditionTrue {
-			return true
-		}
+func publisherLabels(sessionName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name": "coding-agent", "app.kubernetes.io/managed-by": "dyne",
+		"coding-agent/session": sessionName, "coding-agent/component": "publisher",
 	}
-
-	return false
 }
 
-func parsePublisherJobResult(message string) PublisherJobResult {
-	var result PublisherJobResult
+func publisherJobName(sessionName string) string        { return sessionName + "-publish" }
+func publisherCredentialName(sessionName string) string { return sessionName + "-publish-git" }
+
+func parsePublisherJobResult(message string) publish.RuntimeResult {
+	var result publish.RuntimeResult
 	for line := range strings.SplitSeq(message, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
@@ -492,22 +372,10 @@ func parsePublisherJobResult(message string) PublisherJobResult {
 			result.Branch = value
 		case "commit":
 			result.CommitSHA = value
-		case "title":
-			decoded, err := base64.StdEncoding.DecodeString(value)
-			if err == nil {
-				result.Title = string(decoded)
-			}
-		case "body":
-			decoded, err := base64.StdEncoding.DecodeString(value)
-			if err == nil {
-				result.Body = string(decoded)
-			}
 		}
 	}
 
 	return result
 }
 
-func resourceQuantity(value string) resource.Quantity {
-	return resource.MustParse(value)
-}
+func resourceQuantity(value string) resource.Quantity { return resource.MustParse(value) }

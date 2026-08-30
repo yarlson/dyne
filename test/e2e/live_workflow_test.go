@@ -29,8 +29,11 @@ import (
 
 	"github.com/yarlson/dyne/internal/agent"
 	dynegithub "github.com/yarlson/dyne/internal/github"
+	dynekubernetes "github.com/yarlson/dyne/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/publish"
+	"github.com/yarlson/dyne/internal/session"
+	"github.com/yarlson/dyne/internal/storage"
 	"github.com/yarlson/dyne/internal/workflow"
-	workflowstorage "github.com/yarlson/dyne/internal/workflow/storage"
 )
 
 const (
@@ -106,7 +109,7 @@ func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) 
 	workflowArtifacts, err := environment.workflows.Artifacts(environment.context, environment.run)
 	require.NoError(t, err)
 	require.NotEmpty(t, workflowArtifacts.PublishableSession)
-	artifacts, err := environment.agents.Artifacts(environment.context, workflowArtifacts.PublishableSession)
+	artifacts, err := environment.sessions.Artifacts(environment.context, workflowArtifacts.PublishableSession)
 	require.NoError(t, err)
 	var outcome taskOutcome
 	require.NoError(t, json.Unmarshal(artifacts.Outcome, &outcome))
@@ -121,8 +124,8 @@ func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) 
 	require.NotEmpty(t, pullArtifact.Title)
 	require.NotEmpty(t, pullArtifact.Body)
 
-	result, err := environment.agents.Publish(environment.context, agent.PublishRequest{
-		Name:          workflowArtifacts.PublishableSession,
+	result, err := environment.publisher.Publish(environment.context, publish.Request{
+		Session:       workflowArtifacts.PublishableSession,
 		Branch:        environment.branch,
 		BaseBranch:    testRepositoryBase,
 		CommitMessage: "docs: fix environment documentation link",
@@ -136,7 +139,8 @@ func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) 
 
 type liveTestEnvironment struct {
 	context    context.Context
-	agents     *agent.Control
+	sessions   *session.Control
+	publisher  *publish.Control
 	workflows  *workflow.Control
 	kubernetes clientset.Interface
 	github     *gh.Client
@@ -161,9 +165,10 @@ func newLiveTestEnvironment(t *testing.T) liveTestEnvironment {
 	testContext, cancel := context.WithTimeout(context.Background(), sessionTimeout)
 	t.Cleanup(cancel)
 
-	kubernetesClient := newKubernetesClient(t, config.contextName)
+	output := &bytes.Buffer{}
 	suffix := randomSuffix(t)
 	namespace := "dyne-e2e-" + suffix
+	kubernetesClient, runtime := newKubernetesClients(t, config.contextName, namespace, output)
 	run := "ratchet-" + suffix
 	branch := "dyne/e2e-readme-link-" + suffix
 	createSessionNamespace(t, testContext, kubernetesClient, namespace)
@@ -174,19 +179,21 @@ func newLiveTestEnvironment(t *testing.T) liveTestEnvironment {
 	require.NoError(t, err)
 	registerGitHubCleanup(t, config.githubApp, branch)
 
-	output := &bytes.Buffer{}
-	agentControl, err := agent.Connect(testContext, agent.Config{
-		Connection:  agent.Connection{ContextName: config.contextName},
-		Namespace:   namespace,
-		Image:       config.image,
-		TaskTimeout: taskTimeout,
-	}, output, config.githubApp, liveAgentCatalog())
+	database, err := storage.Open(testContext, "sqlite:"+t.TempDir()+"/dyne.db")
 	require.NoError(t, err)
-	repository, err := workflowstorage.Open(testContext, "sqlite:"+t.TempDir()+"/workflows.db")
+	sessionControl, err := session.New(session.Config{
+		Repository: database.Sessions(), Runtime: runtime, RepositoryAuth: config.githubApp,
+		Image: config.image, TaskTimeout: taskTimeout,
+	})
+	require.NoError(t, err)
+	publisher, err := publish.New(publish.Config{
+		Sessions: sessionControl, Repository: database.Publications(), Runtime: runtime,
+		RepositoryAuth: config.githubApp,
+	})
 	require.NoError(t, err)
 	workflowControl, err := workflow.New(workflow.Config{
-		Repository: repository, ErrorOutput: output,
-	}, agentControl, liveWorkflowCatalog())
+		Repository: database.Workflows(), ErrorOutput: output,
+	}, sessionControl, liveWorkflowCatalog())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		current, getErr := workflowControl.Get(context.Background(), run)
@@ -196,11 +203,11 @@ func newLiveTestEnvironment(t *testing.T) liveTestEnvironment {
 		}
 
 		_ = workflowControl.Delete(context.Background(), run)
-		require.NoError(t, repository.Close())
+		require.NoError(t, database.Close())
 	})
 
 	return liveTestEnvironment{
-		context: testContext, agents: agentControl, workflows: workflowControl,
+		context: testContext, sessions: sessionControl, publisher: publisher, workflows: workflowControl,
 		kubernetes: kubernetesClient, github: githubClient, output: output,
 		namespace: namespace, run: run, branch: branch,
 	}
@@ -271,14 +278,14 @@ func liveWorkflowCatalog() workflowCatalog {
 		Name: "documentation-fix", Description: "Inspect and implement one documentation fix.", MaxParallelism: 2,
 		Steps: map[string]workflow.StepDefinition{
 			"inspect-documentation": {
-				Name: "inspect-documentation", Agent: "reviewer", Prompt: inspectDocumentationPrompt, ResolvedAgent: reviewer,
+				Name: "inspect-documentation", Agent: "reviewer", Prompt: inspectDocumentationPrompt, SessionDefinition: reviewer.SessionDefinition(),
 			},
 			"inspect-validation": {
-				Name: "inspect-validation", Agent: "reviewer", Prompt: inspectValidationPrompt, ResolvedAgent: reviewer,
+				Name: "inspect-validation", Agent: "reviewer", Prompt: inspectValidationPrompt, SessionDefinition: reviewer.SessionDefinition(),
 			},
 			"implement": {
 				Name: "implement", Agent: "implementer", Prompt: fixDocumentationLinkPrompt,
-				After: []string{"inspect-documentation", "inspect-validation"}, Publishable: true, ResolvedAgent: implementer,
+				After: []string{"inspect-documentation", "inspect-validation"}, Publishable: true, SessionDefinition: implementer.SessionDefinition(),
 			},
 		},
 	}}
@@ -325,7 +332,9 @@ func createCodexSecret(t *testing.T, ctx context.Context, client clientset.Inter
 	require.NoError(t, err)
 }
 
-func newKubernetesClient(t *testing.T, contextName string) clientset.Interface {
+func newKubernetesClients(
+	t *testing.T, contextName, namespace string, output io.Writer,
+) (clientset.Interface, *dynekubernetes.Client) {
 	t.Helper()
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
@@ -334,8 +343,10 @@ func newKubernetesClient(t *testing.T, contextName string) clientset.Interface {
 
 	client, err := clientset.NewForConfig(config)
 	require.NoError(t, err)
+	runtime, err := dynekubernetes.NewForConfig(config, dynekubernetes.Config{Namespace: namespace, Output: output})
+	require.NoError(t, err)
 
-	return client
+	return client, runtime
 }
 
 func newGitHubClient(ctx context.Context, app *dynegithub.App) (*gh.Client, error) {
@@ -394,7 +405,7 @@ func (environment liveTestEnvironment) logWorkflowLogs(t *testing.T, run workflo
 	t.Helper()
 	for _, step := range run.Steps {
 		var logs bytes.Buffer
-		if err := environment.agents.WriteLogs(environment.context, step.Session, false, &logs); err != nil {
+		if err := environment.sessions.WriteLogs(environment.context, step.Session, false, &logs); err != nil {
 			t.Logf("read workflow step %s logs: %v", step.Name, err)
 
 			continue
@@ -452,7 +463,7 @@ func containerStateDescription(status corev1.ContainerStatus) string {
 	return "unknown"
 }
 
-func (environment liveTestEnvironment) requireDraftPullRequest(t *testing.T, result agent.PublishResult, artifact pullRequestArtifact) {
+func (environment liveTestEnvironment) requireDraftPullRequest(t *testing.T, result publish.Result, artifact pullRequestArtifact) {
 	t.Helper()
 	require.Positive(t, result.PullRequestNumber)
 	assert.Equal(t, environment.branch, result.Branch)

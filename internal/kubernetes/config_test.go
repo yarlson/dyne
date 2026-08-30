@@ -3,7 +3,6 @@ package kubernetes
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -136,14 +135,4 @@ func TestLoadConnectionConfigReturnsUnexpectedInClusterFailure(t *testing.T) {
 	_, err := loadConnectionConfig(context.Background(), ConnectionConfig{}, loaders)
 	require.ErrorIs(t, err, inClusterFailure)
 	assert.ErrorContains(t, err, "load in-cluster Kubernetes configuration")
-}
-
-func TestNewForConfigRequiresServerOwnedConfiguration(t *testing.T) {
-	_, err := NewForConfig(nil, io.Discard)
-	require.EqualError(t, err, "kubernetes configuration is required")
-
-	config := &rest.Config{Host: "https://cluster.example"}
-	client, err := NewForConfig(config, io.Discard)
-	require.NoError(t, err)
-	assert.NotNil(t, client)
 }

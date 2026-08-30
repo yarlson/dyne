@@ -21,8 +21,11 @@ import (
 	"github.com/yarlson/dyne/internal/agentconfig"
 	"github.com/yarlson/dyne/internal/controlplane"
 	dynegithub "github.com/yarlson/dyne/internal/github"
+	"github.com/yarlson/dyne/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/publish"
+	"github.com/yarlson/dyne/internal/session"
+	"github.com/yarlson/dyne/internal/storage"
 	"github.com/yarlson/dyne/internal/workflow"
-	workflowstorage "github.com/yarlson/dyne/internal/workflow/storage"
 	"github.com/yarlson/dyne/internal/workflowconfig"
 )
 
@@ -82,8 +85,8 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 	set := flag.NewFlagSet("server", flag.ContinueOnError)
 	set.SetOutput(stderr)
 	listenAddress := set.String("listen", "127.0.0.1:8080", "HTTP listen address")
-	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace owned by this server")
-	image := set.String("image", agent.DefaultImage, "coding-agent image")
+	namespace := set.String("namespace", kubernetes.DefaultNamespace, "Kubernetes namespace owned by this server")
+	image := set.String("image", kubernetes.DefaultImage, "coding-agent image")
 	storageSize := set.String("storage-size", "10Gi", "persistent session claim size")
 	taskTimeout := set.Duration("task-timeout", 2*time.Hour, "default task deadline")
 	kubeconfig := set.String("kubeconfig", "", "kubeconfig file")
@@ -96,7 +99,7 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 	githubPrivateKeyFile := set.String("github-private-key-file", "", "GitHub App private key file")
 	agentsFile := set.String("agents-file", "", "agent definitions YAML file")
 	workflowsFile := set.String("workflows-file", "", "workflow definitions YAML file")
-	databaseURL := set.String("database-url", defaultDatabaseURL(), "workflow database URL")
+	databaseURL := set.String("database-url", defaultDatabaseURL(), "application database URL")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
@@ -140,32 +143,66 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 		return err
 	}
 
-	control, err := agent.Connect(ctx, agent.Config{
-		Connection: agent.Connection{
-			KubeconfigPath: *kubeconfig,
-			ContextName:    *contextName,
-			EKSCluster:     *eksCluster,
-			AWSRegion:      *awsRegion,
-			AWSRoleARN:     *awsRoleARN,
-		},
-		Namespace: *namespace, Image: *image, TaskTimeout: *taskTimeout,
-	}, io.Discard, githubApp, agents)
+	restConfig, err := kubernetes.LoadConnectionConfig(ctx, kubernetes.ConnectionConfig{
+		KubeconfigPath: *kubeconfig,
+		ContextName:    *contextName,
+		EKSCluster:     *eksCluster,
+		AWSRegion:      *awsRegion,
+		AWSRoleARN:     *awsRoleARN,
+	})
 	if err != nil {
 		return err
 	}
 
-	serverConfig := controlplane.Config{ErrorOutput: stderr}
+	runtime, err := kubernetes.NewForConfig(restConfig, kubernetes.Config{
+		Namespace: *namespace, Output: io.Discard,
+	})
+	if err != nil {
+		return err
+	}
+
+	database, err := storage.Open(ctx, *databaseURL)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := database.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("close storage: %w", err))
+		}
+	}()
+
+	sessions, err := session.New(session.Config{
+		Repository: database.Sessions(), Runtime: runtime, RepositoryAuth: githubApp,
+		Image: *image, TaskTimeout: *taskTimeout,
+	})
+	if err != nil {
+		return err
+	}
+
+	agentsControl, err := agent.New(sessions, agents)
+	if err != nil {
+		return err
+	}
+
+	publisher, err := publish.New(publish.Config{
+		Sessions: sessions, Repository: database.Publications(), Runtime: runtime, RepositoryAuth: githubApp,
+	})
+	if err != nil {
+		return err
+	}
+
+	serverConfig := controlplane.Config{ErrorOutput: stderr, Sessions: sessions, Publisher: publisher}
+	if err := sessions.ReconcileDeletions(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "reconcile session deletions: %v\n", err)
+	}
+
 	if workflows != nil {
-		repository, err := workflowstorage.Open(ctx, *databaseURL)
+		workflowControl, err := workflow.New(workflow.Config{
+			Repository: database.Workflows(), ErrorOutput: stderr,
+		}, sessions, workflows)
 		if err != nil {
 			return err
-		}
-
-		workflowControl, err := workflow.New(workflow.Config{
-			Repository: repository, ErrorOutput: stderr,
-		}, control, workflows)
-		if err != nil {
-			return errors.Join(err, repository.Close())
 		}
 
 		workflowContext, stopWorkflows := context.WithCancel(ctx)
@@ -173,9 +210,6 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 		defer func() {
 			stopWorkflows()
 			<-workflowDone
-			if err := repository.Close(); err != nil {
-				result = errors.Join(result, fmt.Errorf("close workflow storage: %w", err))
-			}
 		}()
 		serverConfig.Workflows = workflowControl
 		go func() {
@@ -184,7 +218,7 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 		}()
 	}
 
-	handler := controlplane.New(control, serverConfig)
+	handler := controlplane.New(agentsControl, serverConfig)
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listenAddress)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listenAddress, err)

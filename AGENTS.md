@@ -33,13 +33,16 @@ Before implementation, report the existing pattern, how the change will follow i
 
 ## Architecture
 
-`internal/agent` is the entrypoint-neutral product boundary. The HTTP server uses its requests and results instead of lower-level Kubernetes, GitHub, publishing, or manifest types.
+`internal/session`, `internal/publish`, `internal/workflow`, and `internal/agent` are entrypoint-neutral product boundaries. The HTTP server uses their requests and results instead of Kubernetes or external SDK types.
 
 - `cmd/dyne` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
 - `internal/controlplane` owns the private HTTP contract for sessions, tasks, logs, artifacts, publishing, and deletion.
-- `internal/agent` owns configured agent and session operations and translates lower-level results into entrypoint-neutral contracts.
-- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; session resource validation and rendering; Kubernetes API operations; resource status; retained definitions; and publisher Jobs.
-- `internal/publish` owns publish eligibility, intent identity, branch ownership, retry recovery, pull-request sequencing, and publisher cleanup.
+- `internal/agent` owns configured agent definitions and resolves them into immutable session definitions.
+- `internal/session` owns session lifecycle policy, validation, concurrency, repository credential refresh, and publish eligibility.
+- `internal/workflow` owns durable multi-session orchestration, dependency scheduling, cancellation, and run artifacts.
+- `internal/publish` owns publish intent identity, branch ownership, retry recovery, pull-request sequencing, and publisher cleanup.
+- `internal/storage` owns the SQLite and PostgreSQL connection, schema, and repositories for session, workflow, and publish state.
+- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; resource validation and rendering; Kubernetes API operations; and session and publisher Job execution. It implements the runtime contracts owned by `internal/session` and `internal/publish`.
 - `internal/github` owns GitHub App installation authentication, supported repository URLs, commit identity, branch visibility, and pull-request operations.
 - `container/` owns the runtime image and entrypoint. It prepares workspaces, runs bounded Codex tasks, validates result artifacts, and publishes through a clean clone.
 
@@ -49,12 +52,25 @@ Keep dependencies directional:
 cmd/dyne -> internal/controlplane
 cmd/dyne -> internal/github
 cmd/dyne -> internal/agent
+cmd/dyne -> internal/session
+cmd/dyne -> internal/publish
+cmd/dyne -> internal/workflow
+cmd/dyne -> internal/kubernetes
+cmd/dyne -> internal/storage
 internal/controlplane -> internal/agent
+internal/controlplane -> internal/session
+internal/controlplane -> internal/publish
+internal/controlplane -> internal/workflow
 internal/agentconfig -> internal/agent
-internal/agent -> internal/kubernetes
-internal/agent -> internal/publish
-internal/publish -> internal/kubernetes
+internal/agent -> internal/session
+internal/workflow -> internal/session
+internal/publish -> internal/session
 internal/publish -> internal/github
+internal/storage -> internal/session
+internal/storage -> internal/publish
+internal/storage -> internal/workflow
+internal/kubernetes -> internal/session
+internal/kubernetes -> internal/publish
 ```
 
 Do not bypass an owning module. Keep external SDK types inside their integration package and translate them at the boundary.
@@ -62,7 +78,7 @@ Do not bypass an owning module. Keep external SDK types inside their integration
 ## Product and trust invariants
 
 - Ephemeral sessions use temporary storage and cannot continue or publish.
-- Persistent sessions retain workspace, tool-home, Codex state, artifacts, and their immutable definition on one PVC.
+- Persistent sessions retain workspace, tool-home, Codex state, and artifacts on one PVC. SQL retains their immutable definition, task history, and validated results.
 - Every initial or continued task is a bounded Job. Only one task may be active per persistent session.
 - `delete` removes compute resources and retains persistent storage.
 - `delete --storage` removes compute resources and persistent storage.

@@ -2,124 +2,66 @@ package kubernetes
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"sort"
-	"strconv"
 	"strings"
 
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
-	"k8s.io/client-go/util/retry"
 )
 
-const fieldManagerName = "dyne"
+const (
+	fieldManagerName = "dyne"
+	// DefaultNamespace is the namespace used when the server flag is omitted.
+	DefaultNamespace = "coding-agents"
+	// DefaultImage is the coding-session image used when the server flag is omitted.
+	DefaultImage = "coding-agent:local"
+)
 
-var errRetainedSessionNotFound = errors.New("retained session does not exist")
-
-// Client applies and manages coding-agent resources through the Kubernetes API.
+// Client projects session and publisher executions into Kubernetes.
 type Client struct {
-	typed   clientset.Interface
-	dynamic dynamic.Interface
-	mapper  meta.RESTMapper
-	stdout  io.Writer
+	typed     clientset.Interface
+	dynamic   dynamic.Interface
+	mapper    meta.RESTMapper
+	stdout    io.Writer
+	namespace string
 }
 
-type sessionDefinition struct {
-	Image        string
-	Repository   string
-	InitialRef   string
-	SetupCommand string
-	AgentName    string
-	Skills       []SessionSkill
-	CloneDepth   int
+// Config contains Kubernetes deployment settings.
+type Config struct {
+	Namespace string
+	Output    io.Writer
 }
 
-// SessionStorage controls whether Kubernetes retains session state after its task Pod is removed.
-type SessionStorage string
-
-const (
-	// SessionStorageEphemeral uses Pod-owned temporary storage for one disposable task.
-	SessionStorageEphemeral SessionStorage = "ephemeral"
-	// SessionStoragePersistent retains workspace, tool, and agent state on one claim.
-	SessionStoragePersistent SessionStorage = "persistent"
-)
-
-// ResultKind selects the artifact required when a task completes.
-type ResultKind string
-
-const (
-	// ResultKindPullRequest requires pull request metadata for completed work.
-	ResultKindPullRequest ResultKind = "pull-request"
-	// ResultKindWorkflowOutput requires bounded JSON output for a workflow dependency.
-	ResultKindWorkflowOutput ResultKind = "workflow-output"
-)
-
-// SessionSkill contains one instruction-only Codex skill mounted into a session.
-type SessionSkill struct {
-	// Name identifies the skill inside the Codex skill directory.
-	Name string
-	// Contents is the complete SKILL.md file.
-	Contents string
-}
-
-// SessionRequest contains the validated inputs used to create one session workload.
-type SessionRequest struct {
-	Name           string
-	Namespace      string
-	Image          string
-	Storage        SessionStorage
-	Repository     string
-	InitialRef     string
-	SetupCommand   string
-	Prompt         string
-	AgentName      string
-	Instructions   string
-	Skills         []SessionSkill
-	CloneDepth     int
-	StorageSize    string
-	TimeoutSeconds int64
-	ResultKind     ResultKind
-	WorkflowRun    string
-	WorkflowStep   string
-}
-
-// ContinuationRequest contains the new task inputs for one retained session.
-type ContinuationRequest struct {
-	Name           string
-	TaskName       string
-	Namespace      string
-	Prompt         string
-	TimeoutSeconds int64
-}
-
-// NewForConfig returns a client that uses server-owned Kubernetes credentials.
-func NewForConfig(config *rest.Config, stdout io.Writer) (*Client, error) {
-	if config == nil {
+// NewForConfig creates a runtime using server-owned Kubernetes credentials.
+func NewForConfig(restConfig *rest.Config, config Config) (*Client, error) {
+	if restConfig == nil {
 		return nil, errors.New("kubernetes configuration is required")
 	}
 
-	typed, err := clientset.NewForConfig(config)
+	if !dnsLabelPattern.MatchString(config.Namespace) || len(config.Namespace) > 63 {
+		return nil, errors.New("namespace must be a lowercase DNS label no longer than 63 characters")
+	}
+
+	if config.Output == nil {
+		return nil, errors.New("output stream is required")
+	}
+
+	typed, err := clientset.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create Kubernetes client: %w", err)
 	}
 
-	dynamicClient, err := dynamic.NewForConfig(config)
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create Kubernetes dynamic client: %w", err)
 	}
@@ -127,12 +69,13 @@ func NewForConfig(config *rest.Config, stdout io.Writer) (*Client, error) {
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(typed.Discovery()))
 
 	return &Client{
-		typed:   typed,
-		dynamic: dynamicClient,
-		mapper:  mapper,
-		stdout:  stdout,
+		typed: typed, dynamic: dynamicClient, mapper: mapper,
+		stdout: config.Output, namespace: config.Namespace,
 	}, nil
 }
+
+// Scope identifies the namespace owned by this runtime.
+func (c *Client) Scope() string { return c.namespace }
 
 func (c *Client) apply(ctx context.Context, manifest []byte) error {
 	var list unstructured.UnstructuredList
@@ -147,294 +90,6 @@ func (c *Client) apply(ctx context.Context, manifest []byte) error {
 	}
 
 	return nil
-}
-
-// CreateSession renders and applies one initial session workload.
-func (c *Client) CreateSession(ctx context.Context, request SessionRequest) error {
-	manifest, err := request.manifest()
-	if err != nil {
-		return err
-	}
-
-	return c.apply(ctx, manifest)
-}
-
-// Validate checks whether a request can describe an initial session workload.
-func (request SessionRequest) Validate() error {
-	_, err := request.manifest()
-
-	return err
-}
-
-func (request SessionRequest) manifest() ([]byte, error) {
-	return renderSessionManifest(sessionManifestSpec{
-		Name:           request.Name,
-		Namespace:      request.Namespace,
-		Image:          request.Image,
-		Storage:        request.Storage,
-		Repository:     request.Repository,
-		InitialRef:     request.InitialRef,
-		SetupCommand:   request.SetupCommand,
-		Prompt:         request.Prompt,
-		AgentName:      request.AgentName,
-		Instructions:   request.Instructions,
-		Skills:         request.Skills,
-		CloneDepth:     request.CloneDepth,
-		StorageSize:    request.StorageSize,
-		TimeoutSeconds: request.TimeoutSeconds,
-		ResultKind:     request.ResultKind,
-		WorkflowRun:    request.WorkflowRun,
-		WorkflowStep:   request.WorkflowStep,
-	})
-}
-
-// ContinueSession renders and applies one task against retained session state.
-func (c *Client) ContinueSession(ctx context.Context, request ContinuationRequest) error {
-	definition, err := c.persistentSessionDefinition(ctx, request.Namespace, request.Name)
-	if err != nil {
-		return err
-	}
-
-	manifest, err := renderContinuationManifest(sessionManifestSpec{
-		Name:           request.Name,
-		TaskName:       request.TaskName,
-		Namespace:      request.Namespace,
-		Image:          definition.Image,
-		Storage:        SessionStoragePersistent,
-		Repository:     definition.Repository,
-		InitialRef:     definition.InitialRef,
-		SetupCommand:   definition.SetupCommand,
-		Prompt:         request.Prompt,
-		AgentName:      definition.AgentName,
-		Skills:         definition.Skills,
-		CloneDepth:     definition.CloneDepth,
-		TimeoutSeconds: request.TimeoutSeconds,
-		Resume:         true,
-	})
-	if err != nil {
-		return err
-	}
-
-	return c.apply(ctx, manifest)
-}
-
-// CheckSessionAvailable returns an error when retained resources already own the session name.
-func (c *Client) CheckSessionAvailable(ctx context.Context, namespace, name string) error {
-	selector := sessionSelector(name)
-	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return fmt.Errorf("check session Jobs: %w", err)
-	}
-
-	claims, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return fmt.Errorf("check session PersistentVolumeClaims: %w", err)
-	}
-
-	configMaps, err := c.typed.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return fmt.Errorf("check session ConfigMaps: %w", err)
-	}
-
-	if len(jobs.Items) > 0 || len(claims.Items) > 0 || len(configMaps.Items) > 0 {
-		return fmt.Errorf("session %s already exists", name)
-	}
-
-	return nil
-}
-
-// CheckWorkflowSessionOwnership accepts an existing session only when every retained resource belongs to the step.
-func (c *Client) CheckWorkflowSessionOwnership(ctx context.Context, namespace, name, run, step string) error {
-	selector := sessionSelector(name)
-	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return fmt.Errorf("check workflow session Jobs: %w", err)
-	}
-
-	claims, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return fmt.Errorf("check workflow session PersistentVolumeClaims: %w", err)
-	}
-
-	configMaps, err := c.typed.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return fmt.Errorf("check workflow session ConfigMaps: %w", err)
-	}
-
-	owned := func(resourceLabels map[string]string) bool {
-		return resourceLabels["coding-agent/workflow-run"] == run && resourceLabels["coding-agent/workflow-step"] == step
-	}
-
-	count := 0
-	for i := range jobs.Items {
-		count++
-		if !owned(jobs.Items[i].Labels) {
-			return fmt.Errorf("session %s is not owned by workflow run %s step %s", name, run, step)
-		}
-	}
-
-	for i := range claims.Items {
-		count++
-		if !owned(claims.Items[i].Labels) {
-			return fmt.Errorf("session %s is not owned by workflow run %s step %s", name, run, step)
-		}
-	}
-
-	for i := range configMaps.Items {
-		count++
-		if !owned(configMaps.Items[i].Labels) {
-			return fmt.Errorf("session %s is not owned by workflow run %s step %s", name, run, step)
-		}
-	}
-
-	if count == 0 {
-		return fmt.Errorf("workflow session %s has no retained resources", name)
-	}
-
-	return nil
-}
-
-// SetGitHubToken stores the short-lived repository credential used by clone and publisher workloads.
-func (c *Client) SetGitHubToken(ctx context.Context, namespace, token string) error {
-	if strings.TrimSpace(token) == "" {
-		return errors.New("GitHub installation token is required")
-	}
-
-	secrets := c.typed.CoreV1().Secrets(namespace)
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		secret, err := secrets.Get(ctx, githubTokenSecretName, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			_, err = secrets.Create(ctx, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: githubTokenSecretName, Namespace: namespace},
-				Type:       corev1.SecretTypeOpaque,
-				Data:       map[string][]byte{"token": []byte(token)},
-			}, metav1.CreateOptions{})
-
-			return err
-		}
-
-		if err != nil {
-			return err
-		}
-
-		if secret.Data == nil {
-			secret.Data = make(map[string][]byte)
-		}
-
-		secret.Data["token"] = []byte(token)
-		_, err = secrets.Update(ctx, secret, metav1.UpdateOptions{})
-
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("store GitHub installation token: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Client) persistentSessionDefinition(ctx context.Context, namespace, name string) (sessionDefinition, error) {
-	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(name)})
-	if err != nil {
-		return sessionDefinition{}, fmt.Errorf("list session Jobs: %w", err)
-	}
-
-	for i := range jobs.Items {
-		if jobs.Items[i].Status.Active > 0 {
-			return sessionDefinition{}, fmt.Errorf("session %s already has an active task", name)
-		}
-	}
-
-	publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
-	if err == nil && !jobConditionTrue(publisher, batchv1.JobComplete) && !jobConditionTrue(publisher, batchv1.JobFailed) {
-		return sessionDefinition{}, fmt.Errorf("session %s has an active publisher", name)
-	}
-
-	if err != nil && !apierrors.IsNotFound(err) {
-		return sessionDefinition{}, fmt.Errorf("check publisher Job: %w", err)
-	}
-
-	return c.retainedSessionDefinition(ctx, namespace, name)
-}
-
-func (c *Client) retainedSessionDefinition(ctx context.Context, namespace, name string) (sessionDefinition, error) {
-	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionClaimName(name), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return sessionDefinition{}, fmt.Errorf("%w: get session PersistentVolumeClaim: %w", errRetainedSessionNotFound, err)
-	}
-
-	if err != nil {
-		return sessionDefinition{}, fmt.Errorf("get session PersistentVolumeClaim: %w", err)
-	}
-
-	if claim.Status.Phase != corev1.ClaimBound {
-		return sessionDefinition{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
-	}
-
-	cloneDepth, err := strconv.Atoi(claim.Annotations[sessionCloneDepthAnnotation])
-	if err != nil || cloneDepth < 0 {
-		return sessionDefinition{}, errors.New("session has an invalid clone depth")
-	}
-
-	image := claim.Annotations[sessionImageAnnotation]
-	initialRef := claim.Annotations[sessionInitialRefAnnotation]
-	if image == "" || initialRef == "" {
-		return sessionDefinition{}, errors.New("session PersistentVolumeClaim has an incomplete definition")
-	}
-
-	agentName := claim.Annotations[sessionAgentAnnotation]
-	var skills []SessionSkill
-	if agentName != "" {
-		configuration, err := c.typed.CoreV1().ConfigMaps(namespace).Get(ctx, sessionAgentConfigName(name), metav1.GetOptions{})
-		if err != nil {
-			return sessionDefinition{}, fmt.Errorf("get agent ConfigMap: %w", err)
-		}
-
-		skills, err = retainedAgentSkills(configuration, agentName)
-		if err != nil {
-			return sessionDefinition{}, err
-		}
-	}
-
-	return sessionDefinition{
-		Image:        image,
-		Repository:   claim.Annotations[sessionRepositoryAnnotation],
-		InitialRef:   initialRef,
-		SetupCommand: claim.Annotations[sessionSetupAnnotation],
-		AgentName:    agentName,
-		Skills:       skills,
-		CloneDepth:   cloneDepth,
-	}, nil
-}
-
-func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]SessionSkill, error) {
-	if configuration.Immutable == nil || !*configuration.Immutable || configuration.Annotations[sessionAgentAnnotation] != agentName {
-		return nil, errors.New("agent ConfigMap has an invalid definition")
-	}
-
-	if strings.TrimSpace(configuration.Data["instructions"]) == "" {
-		return nil, errors.New("agent ConfigMap has an incomplete definition")
-	}
-
-	skills := make([]SessionSkill, 0, len(configuration.Data)-1)
-	for key, contents := range configuration.Data {
-		name, found := strings.CutPrefix(key, "skill-")
-		if !found {
-			if key != "instructions" {
-				return nil, fmt.Errorf("agent ConfigMap has unsupported key %q", key)
-			}
-
-			continue
-		}
-
-		skills = append(skills, SessionSkill{Name: name, Contents: contents})
-	}
-
-	sort.Slice(skills, func(i, j int) bool {
-		return skills[i].Name < skills[j].Name
-	})
-
-	return skills, nil
 }
 
 func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstructured) error {
@@ -463,8 +118,7 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	}
 
 	if _, err := resourceClient.Patch(ctx, resource.GetName(), types.ApplyPatchType, contents, metav1.PatchOptions{
-		FieldManager: fieldManagerName,
-		Force:        new(true),
+		FieldManager: fieldManagerName, Force: new(true),
 	}); err != nil {
 		return fmt.Errorf("apply %s %s: %w", resource.GetKind(), resource.GetName(), err)
 	}
@@ -472,299 +126,4 @@ func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstr
 	_, _ = fmt.Fprintf(c.stdout, "%s/%s applied\n", strings.ToLower(resource.GetKind()), resource.GetName())
 
 	return nil
-}
-
-// ResourceStatus describes the readiness and state of one Kubernetes resource.
-type ResourceStatus struct {
-	// Kind identifies the resource type.
-	Kind string
-	// Name identifies the resource.
-	Name string
-	// Ready reports current readiness against the desired count.
-	Ready string
-	// State reports the resource lifecycle state.
-	State string
-}
-
-// TaskArtifacts contains the validated result files reported by the latest task Pod.
-type TaskArtifacts struct {
-	// Outcome is the task's completed, blocked, or failed result.
-	Outcome json.RawMessage
-	// PullRequest is the proposed pull request metadata for completed work.
-	PullRequest json.RawMessage
-	// WorkflowOutput is the bounded JSON result passed to dependent workflow steps.
-	WorkflowOutput json.RawMessage
-}
-
-// SessionStatus returns the workloads, Pods, and claims owned by a session.
-func (c *Client) SessionStatus(ctx context.Context, namespace, session string) ([]ResourceStatus, error) {
-	selector := sessionSelector(session)
-	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return nil, fmt.Errorf("list Jobs: %w", err)
-	}
-
-	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return nil, fmt.Errorf("list Pods: %w", err)
-	}
-
-	claims, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return nil, fmt.Errorf("list PersistentVolumeClaims: %w", err)
-	}
-
-	resources := make([]ResourceStatus, 0, len(jobs.Items)+len(pods.Items)+len(claims.Items))
-	for i := range jobs.Items {
-		resources = append(resources, jobResourceStatus(&jobs.Items[i]))
-	}
-
-	for i := range pods.Items {
-		resources = append(resources, podResourceStatus(&pods.Items[i]))
-	}
-
-	for i := range claims.Items {
-		resources = append(resources, ResourceStatus{
-			Kind:  "PersistentVolumeClaim",
-			Name:  claims.Items[i].Name,
-			Ready: "-",
-			State: string(claims.Items[i].Status.Phase),
-		})
-	}
-
-	return resources, nil
-}
-
-func (c *Client) streamPodLogs(ctx context.Context, namespace, pod, container string, follow bool, output io.Writer) (result error) {
-	stream, err := c.typed.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
-		Container: container,
-		Follow:    follow,
-	}).Stream(ctx)
-	if err != nil {
-		return fmt.Errorf("open logs for Pod %s: %w", pod, err)
-	}
-
-	defer func() {
-		if err := stream.Close(); err != nil {
-			result = errors.Join(result, fmt.Errorf("close logs for Pod %s: %w", pod, err))
-		}
-	}()
-	if _, err := io.Copy(output, stream); err != nil {
-		return fmt.Errorf("stream logs for Pod %s: %w", pod, err)
-	}
-
-	return nil
-}
-
-// WriteSessionLogs writes logs from the newest agent attempt for one session.
-func (c *Client) WriteSessionLogs(ctx context.Context, namespace, session string, follow bool, output io.Writer) error {
-	pod, err := c.newestSessionPod(ctx, namespace, session)
-	if err != nil {
-		return err
-	}
-
-	return c.streamPodLogs(ctx, namespace, pod.Name, "agent", follow, output)
-}
-
-// DeleteSession removes a session's compute resources and retains its persistent claims.
-func (c *Client) DeleteSession(ctx context.Context, namespace, name string) error {
-	return c.deleteSession(ctx, namespace, name, false)
-}
-
-// DestroySession removes a session's compute resources and persistent claims.
-func (c *Client) DestroySession(ctx context.Context, namespace, name string) error {
-	return c.deleteSession(ctx, namespace, name, true)
-}
-
-func (c *Client) deleteSession(ctx context.Context, namespace, name string, deleteStorage bool) error {
-	if err := c.deletePublisherJob(ctx, namespace, name); err != nil {
-		return err
-	}
-
-	if err := c.deleteSessionWorkloads(ctx, namespace, name); err != nil {
-		return err
-	}
-
-	if !deleteStorage {
-		_, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionClaimName(name), metav1.GetOptions{})
-		if err == nil {
-			return nil
-		}
-
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("check session PersistentVolumeClaim: %w", err)
-		}
-	}
-
-	if err := c.deleteAgentConfig(ctx, namespace, name); err != nil {
-		return err
-	}
-
-	if !deleteStorage {
-		return nil
-	}
-
-	claim := sessionClaimName(name)
-	if err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, claim, metav1.DeleteOptions{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-
-		return fmt.Errorf("delete PersistentVolumeClaim %s: %w", claim, err)
-	}
-
-	_, _ = fmt.Fprintf(c.stdout, "persistentvolumeclaim/%s deleted\n", claim)
-
-	return nil
-}
-
-func (c *Client) deleteAgentConfig(ctx context.Context, namespace, session string) error {
-	name := sessionAgentConfigName(session)
-	if err := c.typed.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-
-		return fmt.Errorf("delete ConfigMap %s: %w", name, err)
-	}
-
-	_, _ = fmt.Fprintf(c.stdout, "configmap/%s deleted\n", name)
-
-	return nil
-}
-
-func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name string) error {
-	options := metav1.DeleteOptions{PropagationPolicy: new(metav1.DeletePropagationBackground)}
-	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionSelector(name)})
-	if err != nil {
-		return fmt.Errorf("list session Jobs for deletion: %w", err)
-	}
-
-	var deleteErrors []error
-	for i := range jobs.Items {
-		jobName := jobs.Items[i].Name
-		err := c.typed.BatchV1().Jobs(namespace).Delete(ctx, jobName, options)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-
-		if err != nil {
-			deleteErrors = append(deleteErrors, fmt.Errorf("delete Job %s: %w", jobName, err))
-
-			continue
-		}
-
-		_, _ = fmt.Fprintf(c.stdout, "job/%s deleted\n", jobName)
-	}
-
-	return errors.Join(deleteErrors...)
-}
-
-// SessionArtifacts returns the result files reported by the newest terminated task Pod.
-func (c *Client) SessionArtifacts(ctx context.Context, namespace, session string) (TaskArtifacts, error) {
-	pod, err := c.newestSessionPod(ctx, namespace, session)
-	if err != nil {
-		return TaskArtifacts{}, err
-	}
-
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name != "agent" || status.State.Terminated == nil {
-			continue
-		}
-
-		return parseTaskArtifacts(status.State.Terminated.Message)
-	}
-
-	return TaskArtifacts{}, fmt.Errorf("session Pod %s has no terminated agent result", pod.Name)
-}
-
-func parseTaskArtifacts(message string) (TaskArtifacts, error) {
-	var result TaskArtifacts
-	for line := range strings.SplitSeq(message, "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-
-		contents, err := base64.StdEncoding.DecodeString(value)
-		if err != nil || !json.Valid(contents) {
-			return TaskArtifacts{}, fmt.Errorf("task artifact %s is invalid", key)
-		}
-
-		switch key {
-		case "outcome":
-			result.Outcome = contents
-		case "pull-request":
-			result.PullRequest = contents
-		case "workflow-output":
-			result.WorkflowOutput = contents
-		}
-	}
-
-	if len(result.Outcome) == 0 {
-		return TaskArtifacts{}, errors.New("task did not report an outcome artifact")
-	}
-
-	return result, nil
-}
-
-func (c *Client) newestSessionPod(ctx context.Context, namespace, session string) (*corev1.Pod, error) {
-	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(session)})
-	if err != nil {
-		return nil, fmt.Errorf("list session %s Pods: %w", session, err)
-	}
-
-	if len(pods.Items) == 0 {
-		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, session)
-	}
-
-	sort.Slice(pods.Items, func(i, j int) bool {
-		if pods.Items[i].CreationTimestamp.Equal(&pods.Items[j].CreationTimestamp) {
-			return pods.Items[i].Name > pods.Items[j].Name
-		}
-
-		return pods.Items[i].CreationTimestamp.After(pods.Items[j].CreationTimestamp.Time)
-	})
-
-	return &pods.Items[0], nil
-}
-
-func sessionSelector(session string) string {
-	return labels.Set{"coding-agent/session": session}.AsSelector().String()
-}
-
-func sessionTaskSelector(session string) string {
-	return sessionSelector(session) + ",coding-agent/component!=publisher"
-}
-
-func jobResourceStatus(job *batchv1.Job) ResourceStatus {
-	status := "Running"
-	if job.Status.Succeeded > 0 {
-		status = "Complete"
-	} else if job.Status.Failed > 0 {
-		status = "Failed"
-	} else if job.Status.Active == 0 {
-		status = "Pending"
-	}
-
-	return ResourceStatus{Kind: "Job", Name: job.Name, Ready: fmt.Sprintf("%d/1", job.Status.Succeeded), State: status}
-}
-
-func podResourceStatus(pod *corev1.Pod) ResourceStatus {
-	ready := "0/1"
-	if podReady(pod) {
-		ready = "1/1"
-	}
-
-	return ResourceStatus{Kind: "Pod", Name: pod.Name, Ready: ready, State: string(pod.Status.Phase)}
-}
-
-func podReady(pod *corev1.Pod) bool {
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-
-	return false
 }

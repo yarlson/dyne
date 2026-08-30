@@ -7,26 +7,38 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
-	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/session"
+	"github.com/yarlson/dyne/internal/storage/sql"
 	"github.com/yarlson/dyne/internal/workflow"
-	"github.com/yarlson/dyne/internal/workflow/storage/sql"
 )
 
-// Repository owns durable workflow runs and immutable agent snapshots.
-type Repository struct {
+// WorkflowRepository owns durable workflow runs and immutable agent snapshots.
+type WorkflowRepository struct {
 	database *stdsql.DB
 	queries  *sql.Queries
 }
 
-// Close releases the database connection.
-func (r *Repository) Close() error {
-	return r.database.Close()
+type sessionSnapshot struct {
+	Name         string
+	Storage      session.Storage
+	Instructions string
+	Skills       []session.Skill
+	SetupCommand string
+	CloneDepth   int
+	StorageSize  string
+	Timeout      time.Duration
+}
+
+// Workflows returns the workflow aggregate repository.
+func (d *Database) Workflows() *WorkflowRepository {
+	return &WorkflowRepository{database: d.database, queries: d.queries}
 }
 
 // Create atomically inserts one run and all resolved agent definitions.
-func (r *Repository) Create(
-	ctx context.Context, run workflow.Run, agents map[string]agent.AgentDefinition,
+func (r *WorkflowRepository) Create(
+	ctx context.Context, run workflow.Run, definitions map[string]session.Definition,
 ) (workflow.Run, error) {
 	contents, err := json.Marshal(run)
 	if err != nil {
@@ -46,14 +58,14 @@ func (r *Repository) Create(
 		return workflow.Run{}, fmt.Errorf("create workflow run %s: %w", run.Name, err)
 	}
 
-	names := make([]string, 0, len(agents))
-	for name := range agents {
+	names := make([]string, 0, len(definitions))
+	for name := range definitions {
 		names = append(names, name)
 	}
 
 	slices.Sort(names)
 	for _, name := range names {
-		definition, err := json.Marshal(agents[name])
+		definition, err := encodeSessionDefinition(definitions[name])
 		if err != nil {
 			return workflow.Run{}, fmt.Errorf("encode workflow run %s agent %s: %w", run.Name, name, err)
 		}
@@ -75,7 +87,7 @@ func (r *Repository) Create(
 }
 
 // Update replaces a run only when its optimistic version is current.
-func (r *Repository) Update(ctx context.Context, run workflow.Run) (workflow.Run, error) {
+func (r *WorkflowRepository) Update(ctx context.Context, run workflow.Run) (workflow.Run, error) {
 	contents, err := json.Marshal(run)
 	if err != nil {
 		return workflow.Run{}, fmt.Errorf("encode workflow run %s: %w", run.Name, err)
@@ -98,7 +110,7 @@ func (r *Repository) Update(ctx context.Context, run workflow.Run) (workflow.Run
 }
 
 // Run returns one durable workflow run.
-func (r *Repository) Run(ctx context.Context, name string) (workflow.Run, error) {
+func (r *WorkflowRepository) Run(ctx context.Context, name string) (workflow.Run, error) {
 	value, err := r.queries.GetRun(ctx, name)
 	if errors.Is(err, stdsql.ErrNoRows) {
 		return workflow.Run{}, workflow.ErrRunNotFound
@@ -112,7 +124,7 @@ func (r *Repository) Run(ctx context.Context, name string) (workflow.Run, error)
 }
 
 // Runs returns every durable workflow run in name order.
-func (r *Repository) Runs(ctx context.Context) ([]workflow.Run, error) {
+func (r *WorkflowRepository) Runs(ctx context.Context) ([]workflow.Run, error) {
 	rows, err := r.queries.ListRuns(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list workflow runs: %w", err)
@@ -129,33 +141,54 @@ func (r *Repository) Runs(ctx context.Context) ([]workflow.Run, error) {
 	return result, nil
 }
 
-// Agent returns one resolved immutable agent definition.
-func (r *Repository) Agent(ctx context.Context, run, agentName string) (agent.AgentDefinition, error) {
+// SessionDefinition returns one resolved immutable session definition.
+func (r *WorkflowRepository) SessionDefinition(ctx context.Context, run, agentName string) (session.Definition, error) {
 	contents, err := r.queries.GetAgentSnapshot(ctx, sql.GetAgentSnapshotParams{
 		RunName: run, AgentName: agentName,
 	})
 	if errors.Is(err, stdsql.ErrNoRows) {
-		return agent.AgentDefinition{}, workflow.ErrRunNotFound
+		return session.Definition{}, workflow.ErrRunNotFound
 	}
 
 	if err != nil {
-		return agent.AgentDefinition{}, fmt.Errorf("get workflow run %s agent %s snapshot: %w", run, agentName, err)
+		return session.Definition{}, fmt.Errorf("get workflow run %s agent %s snapshot: %w", run, agentName, err)
 	}
 
-	var definition agent.AgentDefinition
-	if err := json.Unmarshal(contents, &definition); err != nil {
-		return agent.AgentDefinition{}, fmt.Errorf("decode workflow run %s agent %s snapshot: %w", run, agentName, err)
+	definition, err := decodeSessionDefinition(contents)
+	if err != nil {
+		return session.Definition{}, fmt.Errorf("decode workflow run %s agent %s snapshot: %w", run, agentName, err)
 	}
 
-	if definition.Name != agentName {
-		return agent.AgentDefinition{}, fmt.Errorf("workflow run %s agent %s snapshot has an invalid name", run, agentName)
+	if definition.Agent != agentName {
+		return session.Definition{}, fmt.Errorf("workflow run %s agent %s snapshot has an invalid name", run, agentName)
 	}
 
 	return definition, nil
 }
 
+func encodeSessionDefinition(definition session.Definition) ([]byte, error) {
+	return json.Marshal(sessionSnapshot{
+		Name: definition.Agent, Storage: definition.Storage, Instructions: definition.Instructions,
+		Skills: definition.Skills, SetupCommand: definition.SetupCommand, CloneDepth: definition.CloneDepth,
+		StorageSize: definition.StorageSize, Timeout: definition.Timeout,
+	})
+}
+
+func decodeSessionDefinition(contents []byte) (session.Definition, error) {
+	var snapshot sessionSnapshot
+	if err := json.Unmarshal(contents, &snapshot); err != nil {
+		return session.Definition{}, err
+	}
+
+	return session.Definition{
+		Agent: snapshot.Name, Storage: snapshot.Storage, Instructions: snapshot.Instructions,
+		Skills: snapshot.Skills, SetupCommand: snapshot.SetupCommand, CloneDepth: snapshot.CloneDepth,
+		StorageSize: snapshot.StorageSize, Timeout: snapshot.Timeout,
+	}, nil
+}
+
 // Delete removes one run and its snapshots in one database change.
-func (r *Repository) Delete(ctx context.Context, name string) error {
+func (r *WorkflowRepository) Delete(ctx context.Context, name string) error {
 	deleted, err := r.queries.DeleteRun(ctx, name)
 	if err != nil {
 		return fmt.Errorf("delete workflow run %s: %w", name, err)

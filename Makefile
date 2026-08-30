@@ -31,11 +31,11 @@ test-race: ## Run all Go tests with the race detector
 	go test -race ./...
 
 .PHONY: generate
-generate: require-sqlc ## Generate typed workflow database access
+generate: require-sqlc ## Generate typed database access
 	sqlc generate
 
 .PHONY: sqlc-check
-sqlc-check: require-sqlc ## Check generated workflow database access
+sqlc-check: require-sqlc ## Check generated database access
 	sqlc diff
 
 .PHONY: integration-test

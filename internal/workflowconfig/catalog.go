@@ -207,7 +207,7 @@ func loadStep(name string, raw stepFile, agents agent.AgentCatalog) (workflow.St
 
 	return workflow.StepDefinition{
 		Name: name, Agent: raw.Agent, Prompt: raw.Prompt, After: slices.Clone(raw.After),
-		Publishable: raw.Publishable, ResolvedAgent: definition,
+		Publishable: raw.Publishable, SessionDefinition: definition.SessionDefinition(),
 	}, nil
 }
 

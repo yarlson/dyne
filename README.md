@@ -4,7 +4,7 @@ dyne is a small HTTP control plane for coding-agent Jobs and durable multi-agent
 
 ## Runtime model
 
-Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, artifacts, and session definition. A continuation is another Job mounted to the same PVC. An agent-backed session also owns an immutable ConfigMap containing its developer instructions and selected instruction-only skills.
+Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, and artifacts. A continuation is another Job mounted to the same PVC. SQL stores the immutable session definition and task history. Kubernetes ConfigMaps and Jobs are runtime projections of that durable state.
 
 A workflow is an immutable directed acyclic graph of isolated sessions. Steps never share a workspace or PVC. Dependency steps return bounded JSON outputs that dyne stores in SQL and includes in the direct dependent step's prompt. Independent ready steps can run concurrently up to the workflow's configured limit. At most one persistent leaf is publishable; all other steps are ephemeral findings.
 
@@ -12,15 +12,15 @@ This keeps recovery simple:
 
 - Kubernetes replaces a failed task Pod. Persistent work written before the failure remains on the PVC.
 - A new `dyne task` continues the retained Codex thread and workspace after a task completes or fails.
-- The PVC stores the immutable session definition, so continuation still works after the old Jobs are deleted or the dyne server restarts.
-- `dyne delete` removes Jobs and keeps a persistent session's PVC and agent configuration. `dyne delete --storage` also deletes retained state.
-- SQLite stores workflow state for a local server. PostgreSQL stores the same state in production. SQL transactions retain run intent, resolved agent snapshots, step results, cancellation, and cleanup progress across server restarts.
+- SQL stores the immutable session definition, tasks, validated results, and deletion progress, so continuation still works after old Kubernetes resources are deleted or the dyne server restarts.
+- `dyne delete` removes Kubernetes runtime resources and keeps a persistent session's SQL record and PVC. `dyne delete --storage` also deletes that durable state.
+- SQLite stores product state for a local server. PostgreSQL stores the same state in production. SQL transactions retain session, workflow, and publish intent and progress across server restarts.
 
 The namespace must already exist and enforce the security policy appropriate for the cluster. Codex credentials must already exist in a Secret named `coding-agent-auth`. The Secret can contain `auth.json` or `CODEX_API_KEY`. Repository credentials are not stored there.
 
 ## Security boundary
 
-The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations. Agent definitions, instructions, skills, setup commands, and task prompts must not contain secrets. Principals allowed to read the server files, workflow database, ConfigMaps, or Pod specifications can read those values.
+The agent Pod has no service-account token and never receives GitHub credentials. The server places each short-lived GitHub App installation token in a task- or publisher-scoped Secret and mounts it only into the clone init container or publisher Job. The server refreshes the token before clone and publish operations and removes the Secret with its runtime resources. Agent definitions, instructions, skills, setup commands, and task prompts must not contain secrets. Principals allowed to read the server files, application database, ConfigMaps, or Pod specifications can read those values.
 
 Agent Pods run as UID/GID 1000 with a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, no privilege escalation, bounded resources, and denied ingress. The agent can still access the network and its Codex credential. dyne is intended for trusted repositories in a private cluster, not hostile multi-tenant execution.
 
@@ -71,7 +71,7 @@ Example with EKS and an assumed role:
   --github-private-key-file /secure/dyne-app.pem
 ```
 
-`--workflows-file` is optional. Without it, the server does not open workflow storage or expose workflow routes. `--database-url` accepts `sqlite:path`, `postgres://...`, or `postgresql://...`; `DYNE_DATABASE_URL` supplies the default flag value. The server prepares and versions the SQL schema at startup. Use a local SQLite file for one local process and an externally managed PostgreSQL database for a production server.
+`--workflows-file` is optional. Without it, the server does not expose workflow routes. The application database is still required for session and publish state. `--database-url` accepts `sqlite:path`, `postgres://...`, or `postgresql://...`; `DYNE_DATABASE_URL` supplies the default flag value. The server prepares and versions the SQL schema at startup. Use a local SQLite file for one local process and an externally managed PostgreSQL database for a production server.
 
 ## Define agents
 
@@ -188,7 +188,7 @@ The selected agent definition controls storage and setup. Sessions created from 
 
 A task can finish as completed, blocked, or failed. A blocked result is valid and must identify the blocker; dyne does not turn missing information or a sandbox limitation into false success.
 
-The agent writes `outcome.json` for every successful invocation. A completed standalone or publishable task also writes `pull-request.json` with a title and description. A completed non-publishable workflow step writes a bounded `workflow-output.json` object instead. The harness validates the selected result contract, enforces the Kubernetes termination-message limit, and asks the same Codex thread to recreate invalid files once. Persistent session files remain on the PVC; workflow outputs are copied into SQL before dyne deletes completed ephemeral sessions.
+The agent writes `outcome.json` for every successful invocation. A completed standalone or publishable task also writes `pull-request.json` with a title and description. A completed non-publishable workflow step writes a bounded `workflow-output.json` object instead. The harness validates the selected result contract, enforces the Kubernetes termination-message limit, and asks the same Codex thread to recreate invalid files once. dyne copies every validated result into SQL before it reports the task as complete. Persistent session files also remain on the PVC.
 
 Publishing is explicit:
 

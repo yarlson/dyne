@@ -12,11 +12,17 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 
-	"github.com/yarlson/dyne/internal/workflow/storage/sql"
+	"github.com/yarlson/dyne/internal/storage/sql"
 )
 
-// Open connects to SQLite or PostgreSQL and prepares the workflow schema.
-func Open(ctx context.Context, databaseURL string) (*Repository, error) {
+// Database owns one SQL connection pool and its aggregate repositories.
+type Database struct {
+	database *stdsql.DB
+	queries  *sql.Queries
+}
+
+// Open connects to SQLite or PostgreSQL and prepares the application schema.
+func Open(ctx context.Context, databaseURL string) (*Database, error) {
 	driver, dataSource, err := connection(databaseURL)
 	if err != nil {
 		return nil, err
@@ -30,7 +36,7 @@ func Open(ctx context.Context, databaseURL string) (*Repository, error) {
 
 	database, err := stdsql.Open(driver, dataSource)
 	if err != nil {
-		return nil, fmt.Errorf("open workflow database: %w", err)
+		return nil, fmt.Errorf("open database: %w", err)
 	}
 
 	if driver == "sqlite" {
@@ -40,7 +46,7 @@ func Open(ctx context.Context, databaseURL string) (*Repository, error) {
 	if err := database.PingContext(ctx); err != nil {
 		_ = database.Close()
 
-		return nil, fmt.Errorf("connect to workflow database: %w", err)
+		return nil, fmt.Errorf("connect to database: %w", err)
 	}
 
 	if err := applySchema(ctx, database, driver); err != nil {
@@ -49,15 +55,18 @@ func Open(ctx context.Context, databaseURL string) (*Repository, error) {
 		return nil, err
 	}
 
-	return &Repository{database: database, queries: sql.New(database)}, nil
+	return &Database{database: database, queries: sql.New(database)}, nil
 }
+
+// Close releases the database connection pool.
+func (d *Database) Close() error { return d.database.Close() }
 
 func connection(databaseURL string) (string, string, error) {
 	switch {
 	case strings.HasPrefix(databaseURL, "sqlite:"):
 		location := strings.TrimPrefix(databaseURL, "sqlite:")
 		if location == "" {
-			return "", "", errors.New("SQLite workflow database path is required")
+			return "", "", errors.New("SQLite database path is required")
 		}
 
 		if location == ":memory:" {
@@ -78,7 +87,7 @@ func connection(databaseURL string) (string, string, error) {
 	case strings.HasPrefix(databaseURL, "postgres://"), strings.HasPrefix(databaseURL, "postgresql://"):
 		return "pgx", databaseURL, nil
 	default:
-		return "", "", errors.New("unsupported workflow database URL; use sqlite: or postgres://")
+		return "", "", errors.New("unsupported database URL; use sqlite: or postgres://")
 	}
 }
 
@@ -92,22 +101,22 @@ func protectSQLiteFile(databaseURL string) error {
 	location, _, _ = strings.Cut(location, "?")
 	path, err := url.PathUnescape(location)
 	if err != nil {
-		return fmt.Errorf("decode SQLite workflow database path: %w", err)
+		return fmt.Errorf("decode SQLite database path: %w", err)
 	}
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("create SQLite workflow database: %w", err)
+		return fmt.Errorf("create SQLite database: %w", err)
 	}
 
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 
-		return fmt.Errorf("protect SQLite workflow database: %w", err)
+		return fmt.Errorf("protect SQLite database: %w", err)
 	}
 
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("close SQLite workflow database: %w", err)
+		return fmt.Errorf("close SQLite database: %w", err)
 	}
 
 	return nil

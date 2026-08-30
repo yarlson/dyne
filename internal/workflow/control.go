@@ -15,13 +15,13 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/session"
 )
 
 type sessionOperations interface {
-	StartDefinition(context.Context, agent.AgentDefinition, agent.StartRequest) (agent.StartResult, error)
-	Status(context.Context, string) (agent.Status, error)
-	Artifacts(context.Context, string) (agent.Artifacts, error)
+	Start(context.Context, session.Definition, session.StartRequest) (session.StartResult, error)
+	Status(context.Context, string) (session.Status, error)
+	Artifacts(context.Context, string) (session.Artifacts, error)
 	Delete(context.Context, string) error
 	Destroy(context.Context, string) error
 }
@@ -53,9 +53,9 @@ type Config struct {
 }
 
 // New creates durable workflow control with explicit session and storage dependencies.
-func New(config Config, sessions *agent.Control, catalog Catalog) (*Control, error) {
+func New(config Config, sessions *session.Control, catalog Catalog) (*Control, error) {
 	if sessions == nil {
-		return nil, errors.New("agent control is required")
+		return nil, errors.New("session control is required")
 	}
 
 	if config.Repository == nil {
@@ -127,7 +127,7 @@ func (c *Control) Start(ctx context.Context, request StartRequest) (Run, error) 
 		}
 	}
 
-	created, err := c.repository.Create(ctx, run, resolvedAgents(definition))
+	created, err := c.repository.Create(ctx, run, resolvedSessions(definition))
 	if err != nil {
 		if existing, getErr := c.repository.Run(ctx, request.Name); getErr == nil {
 			if existing.Intent == intent {
@@ -365,13 +365,13 @@ func (c *Control) validateStart(request StartRequest) (Definition, error) {
 	return definition, nil
 }
 
-func resolvedAgents(definition Definition) map[string]agent.AgentDefinition {
-	agents := make(map[string]agent.AgentDefinition)
+func resolvedSessions(definition Definition) map[string]session.Definition {
+	definitions := make(map[string]session.Definition)
 	for _, step := range definition.Steps {
-		agents[step.Agent] = step.ResolvedAgent
+		definitions[step.Agent] = step.SessionDefinition
 	}
 
-	return agents
+	return definitions
 }
 
 func (c *Control) startPersistedSteps(ctx context.Context, run *Run) ([]string, error) {
@@ -382,18 +382,18 @@ func (c *Control) startPersistedSteps(ctx context.Context, run *Run) ([]string, 
 			continue
 		}
 
-		definition, err := c.repository.Agent(ctx, run.Name, step.Agent)
+		definition, err := c.repository.SessionDefinition(ctx, run.Name, step.Agent)
 		if err != nil {
 			return nil, fmt.Errorf("read workflow run %s agent %s snapshot: %w", run.Name, step.Agent, err)
 		}
 
-		resultKind := agent.ResultKindWorkflowOutput
+		resultKind := session.ResultKindWorkflowOutput
 		if step.Publishable {
-			resultKind = agent.ResultKindPullRequest
+			resultKind = session.ResultKindPullRequest
 		}
 
-		_, err = c.sessions.StartDefinition(ctx, definition, agent.StartRequest{
-			Agent: step.Agent, Name: step.Session, Repository: run.Repository, InitialRef: run.Ref,
+		_, err = c.sessions.Start(ctx, definition, session.StartRequest{
+			Name: step.Session, Repository: run.Repository, InitialRef: run.Ref,
 			Prompt: workflowStepPrompt(*run, step), ResultKind: resultKind,
 			WorkflowRun: run.Name, WorkflowStep: step.Name,
 		})
@@ -446,14 +446,13 @@ func (c *Control) observeRunningSteps(ctx context.Context, run *Run) (bool, erro
 			return false, fmt.Errorf("read workflow run %s step %s status: %w", run.Name, step.Name, err)
 		}
 
-		jobState := taskJobState(status)
-		if jobState == "" || jobState == "Pending" || jobState == "Running" {
+		if status.State == session.TaskPending || status.State == session.TaskRunning {
 			continue
 		}
 
 		now := c.now().UTC()
 		step.FinishedAt = &now
-		if jobState == "Failed" {
+		if status.State == session.TaskFailed || status.State == session.TaskCanceled {
 			step.State = StepFailed
 			step.Summary = "agent session failed"
 			run.Steps[name] = step
@@ -615,7 +614,7 @@ func deriveRunState(run *Run) {
 	run.State = state
 }
 
-func applyStepArtifacts(step *Step, artifacts agent.Artifacts) error {
+func applyStepArtifacts(step *Step, artifacts session.Artifacts) error {
 	var outcome struct {
 		Status  string `json:"status"`
 		Summary string `json:"summary"`
@@ -704,16 +703,6 @@ func workflowSessionName(run, step string) string {
 	digest := sha256.Sum256([]byte(step))
 
 	return run + "-" + hex.EncodeToString(digest[:4])
-}
-
-func taskJobState(status agent.Status) string {
-	for _, resource := range status.Resources {
-		if resource.Kind == "Job" {
-			return resource.State
-		}
-	}
-
-	return ""
 }
 
 func terminal(state State) bool {

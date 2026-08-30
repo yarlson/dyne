@@ -5,35 +5,38 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/session"
 	"github.com/yarlson/dyne/internal/workflow"
 )
 
-func TestRepositoryCreatesRunAndSnapshotsAtomically(t *testing.T) {
-	repository := openTestRepository(t)
-	defer func() { require.NoError(t, repository.Close()) }()
+func TestRepositoryCreatesWorkflowRunAndSnapshotsAtomically(t *testing.T) {
+	database := openTestDatabase(t)
+	defer func() { require.NoError(t, database.Close()) }()
+	repository := database.Workflows()
 	ctx := context.Background()
 
 	created, err := repository.Create(ctx, workflow.Run{
 		Version: "v1", Name: "delivery-123", State: workflow.StatePending,
-	}, map[string]agent.AgentDefinition{
-		"reviewer": {Name: "reviewer", Instructions: "review"},
+	}, map[string]session.Definition{
+		"reviewer": {Agent: "reviewer", Instructions: "review"},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), created.Revision)
 
-	definition, err := repository.Agent(ctx, "delivery-123", "reviewer")
+	definition, err := repository.SessionDefinition(ctx, "delivery-123", "reviewer")
 	require.NoError(t, err)
 	assert.Equal(t, "review", definition.Instructions)
 }
 
 func TestRepositoryRejectsStaleRunUpdate(t *testing.T) {
-	repository := openTestRepository(t)
-	defer func() { require.NoError(t, repository.Close()) }()
+	database := openTestDatabase(t)
+	defer func() { require.NoError(t, database.Close()) }()
+	repository := database.Workflows()
 	ctx := context.Background()
 	created, err := repository.Create(ctx, workflow.Run{
 		Version: "v1", Name: "delivery-123", State: workflow.StatePending,
@@ -56,24 +59,45 @@ func TestRepositoryRejectsStaleRunUpdate(t *testing.T) {
 }
 
 func TestRepositoryDeletesRunAndSnapshotsTogether(t *testing.T) {
-	repository := openTestRepository(t)
-	defer func() { require.NoError(t, repository.Close()) }()
+	database := openTestDatabase(t)
+	defer func() { require.NoError(t, database.Close()) }()
+	repository := database.Workflows()
 	ctx := context.Background()
-	_, err := repository.Create(ctx, workflow.Run{Version: "v1", Name: "delivery-123"}, map[string]agent.AgentDefinition{
-		"reviewer": {Name: "reviewer"},
+	_, err := repository.Create(ctx, workflow.Run{Version: "v1", Name: "delivery-123"}, map[string]session.Definition{
+		"reviewer": {Agent: "reviewer"},
 	})
 	require.NoError(t, err)
 
 	require.NoError(t, repository.Delete(ctx, "delivery-123"))
 	_, err = repository.Run(ctx, "delivery-123")
 	assert.ErrorIs(t, err, workflow.ErrRunNotFound)
-	_, err = repository.Agent(ctx, "delivery-123", "reviewer")
+	_, err = repository.SessionDefinition(ctx, "delivery-123", "reviewer")
 	assert.ErrorIs(t, err, workflow.ErrRunNotFound)
+}
+
+func TestRepositoryReadsEstablishedAgentSnapshotShape(t *testing.T) {
+	database := openTestDatabase(t)
+	defer func() { require.NoError(t, database.Close()) }()
+	repository := database.Workflows()
+	ctx := context.Background()
+	_, err := repository.Create(ctx, workflow.Run{Version: "v1", Name: "delivery-123"}, nil)
+	require.NoError(t, err)
+	_, err = database.database.ExecContext(ctx, `
+		INSERT INTO workflow_agent_snapshots (run_name, agent_name, contents)
+		VALUES (?, ?, ?)
+	`, "delivery-123", "reviewer", []byte(`{"Name":"reviewer","Storage":"ephemeral","Instructions":"review","Timeout":3600000000000}`))
+	require.NoError(t, err)
+
+	definition, err := repository.SessionDefinition(ctx, "delivery-123", "reviewer")
+	require.NoError(t, err)
+	assert.Equal(t, session.Definition{
+		Agent: "reviewer", Storage: session.StorageEphemeral, Instructions: "review", Timeout: time.Hour,
+	}, definition)
 }
 
 func TestOpenRejectsUnsupportedURL(t *testing.T) {
 	_, err := Open(context.Background(), "mysql://localhost/dyne")
-	require.ErrorContains(t, err, "unsupported workflow database URL")
+	require.ErrorContains(t, err, "unsupported database URL")
 }
 
 func TestOpenProtectsLocalFileAndReappliesNoSchemaChanges(t *testing.T) {
@@ -91,10 +115,10 @@ func TestOpenProtectsLocalFileAndReappliesNoSchemaChanges(t *testing.T) {
 	require.NoError(t, repository.Close())
 }
 
-func openTestRepository(t *testing.T) *Repository {
+func openTestDatabase(t *testing.T) *Database {
 	t.Helper()
-	repository, err := Open(context.Background(), "sqlite::memory:")
+	database, err := Open(context.Background(), "sqlite::memory:")
 	require.NoError(t, err)
 
-	return repository
+	return database
 }

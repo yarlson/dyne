@@ -6,7 +6,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/session"
 )
 
 // ErrorKind classifies a workflow operation failure for entrypoints.
@@ -146,12 +146,12 @@ type Definition struct {
 
 // StepDefinition is one isolated agent session in a workflow graph.
 type StepDefinition struct {
-	Name          string
-	Agent         string
-	Prompt        string
-	After         []string
-	Publishable   bool
-	ResolvedAgent agent.AgentDefinition
+	Name              string
+	Agent             string
+	Prompt            string
+	After             []string
+	Publishable       bool
+	SessionDefinition session.Definition
 }
 
 // Summary contains workflow metadata safe to return to clients.
@@ -174,7 +174,7 @@ func CloneDefinition(definition Definition) Definition {
 	clone.Steps = make(map[string]StepDefinition, len(definition.Steps))
 	for name, step := range definition.Steps {
 		step.After = slices.Clone(step.After)
-		step.ResolvedAgent.Skills = slices.Clone(step.ResolvedAgent.Skills)
+		step.SessionDefinition.Skills = slices.Clone(step.SessionDefinition.Skills)
 		clone.Steps[name] = step
 	}
 
