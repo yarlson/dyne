@@ -4,6 +4,8 @@ GOLANGCI_LINT_VERSION_NUMBER := $(patsubst v%,%,$(GOLANGCI_LINT_VERSION))
 DOCKER_CONTEXT ?= colima-codex-k8s
 IMAGE ?= coding-agent:local
 
+-include test/e2e/local.mk
+
 .DEFAULT_GOAL := help
 
 .PHONY: help

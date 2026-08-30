@@ -24,15 +24,22 @@ gh repo view lokalise/ratchet-test-service \
 
 ## GitHub App configuration
 
-Use a dedicated test App. Its installation must include `lokalise/ratchet-test-service` and grant these repository permissions:
+The existing `lokalise-kargo` App is installed for all Lokalise repositories, including `ratchet-test-service`. Its installation grants the required repository permissions:
 
 - Contents: Read and write
 - Pull requests: Read and write
 
-Set the App slug, then use `gh` to get the App ID and the Lokalise installation ID:
+Use its verified App and installation IDs:
 
 ```bash
-APP_SLUG=your-app-slug
+E2E_GITHUB_APP_ID=155561
+E2E_GITHUB_INSTALLATION_ID=21035177
+```
+
+You can verify the current IDs and permissions with `gh`:
+
+```bash
+APP_SLUG=lokalise-kargo
 
 gh api "apps/$APP_SLUG" \
   --jq '{app_id: .id, slug: .slug, owner: .owner.login, permissions: .permissions}'
@@ -45,24 +52,28 @@ If the installation command returns `403`, ask a Lokalise organization owner to 
 
 For a selected-repositories installation, open the installation settings shown by its `html_url` and confirm that `ratchet-test-service` is selected. A normal `gh` OAuth token cannot call `GET /repos/lokalise/ratchet-test-service/installation`; GitHub requires an App-signed JSON Web Token for that endpoint.
 
-GitHub does not return an App private key through the API. Use an existing `.pem` file from the App owner, or ask the App owner to generate a private key in the App settings. Store it outside the repository and restrict its file permissions:
+GitHub does not return an App private key through the API. Use an existing `.pem` file from the App owner, or ask the App owner to generate a private key in the App settings. Keep it outside tracked paths. The `test/e2e` folder is supported because its PEM files are ignored. Restrict the key's file permissions:
 
 ```bash
-chmod 600 /secure/dyne-test-app.pem
+chmod 600 test/e2e/lokalise-kargo.YYYY-MM-DD.private-key.pem
 ```
 
 ## Run the test
 
-Replace the example IDs and private-key path with the values for the dedicated test App:
+Create the ignored local Make configuration:
 
 ```bash
-make e2e-test \
-  KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof \
-  DOCKER_CONTEXT=colima-codex-proof \
-  E2E_CODEX_AUTH_FILE="$HOME/.codex/auth.json" \
-  E2E_GITHUB_APP_ID=123 \
-  E2E_GITHUB_INSTALLATION_ID=456 \
-  E2E_GITHUB_PRIVATE_KEY_FILE=/secure/dyne-test-app.pem
+cp test/e2e/local.mk.example test/e2e/local.mk
 ```
+
+Edit `test/e2e/local.mk` so `E2E_GITHUB_PRIVATE_KEY_FILE` names your downloaded `lokalise-kargo` `.pem` file. The local configuration and E2E PEM files are ignored by Git.
+
+Run the test from the repository root:
+
+```bash
+make e2e-test
+```
+
+Command-line Make variables override `test/e2e/local.mk` when you need a one-off value.
 
 The test stops before starting a session if the expected broken link on `main` has changed. Normal cleanup closes the draft pull request, deletes the `dyne/e2e-readme-link-*` branch, and deletes the unique `dyne-e2e-*` namespace. A hard process or machine failure can interrupt cleanup, so check GitHub and Kubernetes for those prefixes after an interrupted run.

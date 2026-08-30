@@ -1,3 +1,5 @@
 .idea/
 /dyne
 /coverage.out
+/test/e2e/local.mk
+/test/e2e/*.pem

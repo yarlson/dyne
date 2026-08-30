@@ -54,8 +54,11 @@ const (
 
 const liveSetupCommand = `set -euo pipefail
 mise use --global --pin node@24.17.0
-corepack enable
+mkdir -p "${HOME}/.local/bin"
+export PATH="${MISE_DATA_DIR}/shims:${HOME}/.local/bin:${PATH}"
+corepack enable --install-directory "${HOME}/.local/bin" pnpm
 corepack install --global pnpm@11.9.0
+printf 'export PATH="%s/shims:%s/.local/bin:$PATH"\n' "${MISE_DATA_DIR}" "${HOME}" > "${HOME}/.bash_profile"
 pnpm install --frozen-lockfile --ignore-scripts`
 
 const fixDocumentationLinkPrompt = `Fix only the empty Markdown link labeled "environment variable configuration" in README.md. Change it from [environment variable configuration]() to [environment variable configuration](./docs/environment-variables.md). Do not modify package versions, CHANGELOG.md, dependencies, production code, or any other line. Run pnpm run build, pnpm run lint, and git diff --check. If any required check cannot pass, report the exact blocker instead of claiming completion.`
@@ -89,7 +92,10 @@ func TestCodingSessionFixesPrivateRepositoryAndPublishesDraftPullRequest(t *test
 	require.NoError(t, err)
 	var outcome taskOutcome
 	require.NoError(t, json.Unmarshal(artifacts.Outcome, &outcome))
-	require.Equal(t, "completed", outcome.Status)
+	if outcome.Status != "completed" {
+		environment.logSessionLogs(t)
+	}
+	require.Equal(t, "completed", outcome.Status, "summary=%q blocker=%q", outcome.Summary, outcome.Blocker)
 	assert.NotEmpty(t, outcome.Summary)
 	assert.Empty(t, outcome.Blocker)
 	var pullArtifact pullRequestArtifact
@@ -297,16 +303,72 @@ func (environment liveTestEnvironment) requireJobSucceeded(t *testing.T) {
 		return jobConditionTrue(job, batchv1.JobComplete), nil
 	})
 	if err != nil {
-		var logs bytes.Buffer
-		if logErr := environment.control.WriteLogs(environment.context, environment.session, false, &logs); logErr != nil {
-			t.Logf("read coding-session logs: %v", logErr)
-		} else {
-			t.Logf("coding-session logs:\n%s", logs.String())
-		}
+		environment.logPodDiagnostics(t)
+		environment.logSessionLogs(t)
 		t.Logf("coding-session output:\n%s", environment.output.String())
 	}
 
 	require.NoError(t, err)
+}
+
+func (environment liveTestEnvironment) logSessionLogs(t *testing.T) {
+	t.Helper()
+	var logs bytes.Buffer
+	if err := environment.control.WriteLogs(environment.context, environment.session, false, &logs); err != nil {
+		t.Logf("read coding-session logs: %v", err)
+
+		return
+	}
+
+	t.Logf("coding-session logs:\n%s", logs.String())
+}
+
+func (environment liveTestEnvironment) logPodDiagnostics(t *testing.T) {
+	t.Helper()
+	pods, err := environment.kubernetes.CoreV1().Pods(environment.namespace).List(environment.context, metav1.ListOptions{})
+	if !assert.NoError(t, err, "list failed Job Pods") {
+		return
+	}
+
+	for _, pod := range pods.Items {
+		t.Logf("Pod %s phase=%s reason=%s message=%s", pod.Name, pod.Status.Phase, pod.Status.Reason, pod.Status.Message)
+		for _, status := range pod.Status.InitContainerStatuses {
+			t.Logf("Pod %s init container %s: %s", pod.Name, status.Name, containerStateDescription(status))
+			environment.logPodContainer(t, pod.Name, status.Name)
+		}
+		for _, status := range pod.Status.ContainerStatuses {
+			t.Logf("Pod %s container %s: %s", pod.Name, status.Name, containerStateDescription(status))
+			environment.logPodContainer(t, pod.Name, status.Name)
+		}
+	}
+}
+
+func (environment liveTestEnvironment) logPodContainer(t *testing.T, pod, container string) {
+	t.Helper()
+	logs, err := environment.kubernetes.CoreV1().Pods(environment.namespace).GetLogs(pod, &corev1.PodLogOptions{
+		Container: container,
+	}).DoRaw(environment.context)
+	if err != nil {
+		t.Logf("read Pod %s container %s logs: %v", pod, container, err)
+
+		return
+	}
+
+	t.Logf("Pod %s container %s logs:\n%s", pod, container, logs)
+}
+
+func containerStateDescription(status corev1.ContainerStatus) string {
+	if terminated := status.State.Terminated; terminated != nil {
+		return fmt.Sprintf("terminated with exit code %d, reason=%s, message=%s", terminated.ExitCode, terminated.Reason, terminated.Message)
+	}
+	if waiting := status.State.Waiting; waiting != nil {
+		return fmt.Sprintf("waiting, reason=%s, message=%s", waiting.Reason, waiting.Message)
+	}
+	if status.State.Running != nil {
+		return "running"
+	}
+
+	return "unknown"
 }
 
 func jobConditionTrue(job *batchv1.Job, conditionType batchv1.JobConditionType) bool {
@@ -387,14 +449,20 @@ func registerGitHubCleanup(t *testing.T, app *dynegithub.App, branch string) {
 		}
 
 		_, err = client.Git.DeleteRef(ctx, testRepositoryOwner, testRepositoryName, "heads/"+branch)
-		assert.True(t, err == nil || isGitHubNotFound(err), "delete E2E branch %s: %v", branch, err)
+		assert.True(t, err == nil || isGitHubMissingRef(err), "delete E2E branch %s: %v", branch, err)
 	})
 }
 
-func isGitHubNotFound(err error) bool {
+func isGitHubMissingRef(err error) bool {
 	var responseError *gh.ErrorResponse
+	if !errors.As(err, &responseError) || responseError.Response == nil {
+		return false
+	}
+	if responseError.Response.StatusCode == http.StatusNotFound {
+		return true
+	}
 
-	return errors.As(err, &responseError) && responseError.Response != nil && responseError.Response.StatusCode == http.StatusNotFound
+	return responseError.Response.StatusCode == http.StatusUnprocessableEntity && responseError.Message == "Reference does not exist"
 }
 
 func registerNamespaceCleanup(t *testing.T, client clientset.Interface, namespace string) {

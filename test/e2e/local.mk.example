@@ -1,0 +1,6 @@
+DOCKER_CONTEXT := colima-codex-proof
+KUBERNETES_INTEGRATION_CONTEXT := colima-codex-proof
+E2E_CODEX_AUTH_FILE := $(HOME)/.codex/auth.json
+E2E_GITHUB_APP_ID := 155561
+E2E_GITHUB_INSTALLATION_ID := 21035177
+E2E_GITHUB_PRIVATE_KEY_FILE := $(CURDIR)/test/e2e/lokalise-kargo.YYYY-MM-DD.private-key.pem
