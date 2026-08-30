@@ -13,6 +13,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/yarlson/airlock/internal/sessionmanifest"
 )
 
 func TestSessionPublishSourceReturnsCompletedUpdateWorkspace(t *testing.T) {
@@ -33,6 +35,42 @@ func TestSessionPublishSourceReturnsCompletedUpdateWorkspace(t *testing.T) {
 		WorkspaceClaim: "session-review",
 	}
 	assert.Equal(t, want, source)
+}
+
+func TestSessionPublishSourceUsesRetainedDefinitionInsteadOfWorkloadEnvironment(t *testing.T) {
+	pod := publishableSessionPod("persistent")
+	pod.Spec.Containers[0].Image = "stale-image"
+	pod.Spec.Containers[0].Env[1].Value = "https://github.com/example/stale.git"
+	pod.Spec.Containers[0].Env[2].Value = "stale-ref"
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "review-first", Namespace: "coding-agents", Labels: map[string]string{"coding-agent/session": "review"}},
+		Spec:       batchv1.JobSpec{Template: pod},
+		Status:     batchv1.JobStatus{Succeeded: 1},
+	}
+	client := &Client{typed: fake.NewClientset(job, boundWorkspaceClaim(), completedTaskPod())}
+
+	source, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
+	require.NoError(t, err)
+	assert.Equal(t, PublishSource{
+		Repository:     "https://github.com/lokalise/kargo.git",
+		InitialRef:     "main",
+		Image:          "coding-agent:test",
+		WorkspaceClaim: "session-review",
+	}, source)
+}
+
+func TestSessionPublishSourceReportsMissingRetainedAgentDefinition(t *testing.T) {
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "review-first", Namespace: "coding-agents", Labels: map[string]string{"coding-agent/session": "review"}},
+		Status:     batchv1.JobStatus{Succeeded: 1},
+	}
+	claim := boundWorkspaceClaim()
+	claim.Annotations[sessionmanifest.SessionAgentAnnotation] = "implementer"
+	client := &Client{typed: fake.NewClientset(job, claim, completedTaskPod())}
+
+	_, err := client.SessionPublishSource(context.Background(), "coding-agents", "review")
+	require.ErrorContains(t, err, "get agent ConfigMap")
+	assert.NotContains(t, err.Error(), "ephemeral")
 }
 
 func TestSessionPublishSourceRejectsActiveTask(t *testing.T) {
@@ -215,8 +253,16 @@ func publishableSessionPod(storage string) corev1.PodTemplateSpec {
 
 func boundWorkspaceClaim() *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "session-review", Namespace: "coding-agents"},
-		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "session-review", Namespace: "coding-agents",
+			Annotations: map[string]string{
+				"airlock.yarlson.dev/image":       "coding-agent:test",
+				"airlock.yarlson.dev/repository":  "https://github.com/lokalise/kargo.git",
+				"airlock.yarlson.dev/initial-ref": "main",
+				"airlock.yarlson.dev/clone-depth": "1",
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 	}
 }
 

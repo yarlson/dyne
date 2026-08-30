@@ -32,6 +32,8 @@ import (
 
 const fieldManagerName = "airlock"
 
+var errRetainedSessionNotFound = errors.New("retained session does not exist")
+
 // Client applies and manages coding-agent resources through the Kubernetes API.
 type Client struct {
 	typed   clientset.Interface
@@ -40,32 +42,41 @@ type Client struct {
 	stdout  io.Writer
 }
 
-// SessionDefinition contains the retained inputs needed to continue a persistent session.
-type SessionDefinition struct {
-	// Image runs the session task.
-	Image string
-	// Repository is the Git repository stored in the workspace.
-	Repository string
-	// InitialRef is the session's original Git ref.
-	InitialRef string
-	// SetupCommand prepares the retained workspace before each task.
+type sessionDefinition struct {
+	Image        string
+	Repository   string
+	InitialRef   string
 	SetupCommand string
-	// AgentName identifies the retained agent configuration when one was used.
-	AgentName string
-	// Skills contains the retained instruction-only Codex skills.
-	Skills []sessionmanifest.AgentSkill
-	// CloneDepth is the Git history depth used for the initial clone.
-	CloneDepth int
+	AgentName    string
+	Skills       []sessionmanifest.AgentSkill
+	CloneDepth   int
 }
 
-// New returns a client configured from the standard kubeconfig loading rules.
-func New(contextName string, stdout io.Writer) (*Client, error) {
-	config, err := loadKubeconfig("", contextName)
-	if err != nil {
-		return nil, err
-	}
+// SessionRequest contains the validated inputs used to create one session workload.
+type SessionRequest struct {
+	Name           string
+	Namespace      string
+	Image          string
+	Storage        sessionmanifest.Storage
+	Repository     string
+	InitialRef     string
+	SetupCommand   string
+	Prompt         string
+	AgentName      string
+	Instructions   string
+	Skills         []sessionmanifest.AgentSkill
+	CloneDepth     int
+	StorageSize    string
+	TimeoutSeconds int64
+}
 
-	return NewForConfig(config, stdout)
+// ContinuationRequest contains the new task inputs for one retained session.
+type ContinuationRequest struct {
+	Name           string
+	TaskName       string
+	Namespace      string
+	Prompt         string
+	TimeoutSeconds int64
 }
 
 // NewForConfig returns a client that uses server-owned Kubernetes credentials.
@@ -94,8 +105,7 @@ func NewForConfig(config *rest.Config, stdout io.Writer) (*Client, error) {
 	}, nil
 }
 
-// Apply applies every resource in a Kubernetes List manifest using server-side apply.
-func (c *Client) Apply(ctx context.Context, manifest []byte) error {
+func (c *Client) apply(ctx context.Context, manifest []byte) error {
 	var list unstructured.UnstructuredList
 	if err := json.Unmarshal(manifest, &list); err != nil {
 		return fmt.Errorf("decode resource list: %w", err)
@@ -108,6 +118,72 @@ func (c *Client) Apply(ctx context.Context, manifest []byte) error {
 	}
 
 	return nil
+}
+
+// CreateSession renders and applies one initial session workload.
+func (c *Client) CreateSession(ctx context.Context, request SessionRequest) error {
+	manifest, err := request.manifest()
+	if err != nil {
+		return err
+	}
+
+	return c.apply(ctx, manifest)
+}
+
+// Validate checks whether a request can describe an initial session workload.
+func (request SessionRequest) Validate() error {
+	_, err := request.manifest()
+
+	return err
+}
+
+func (request SessionRequest) manifest() ([]byte, error) {
+	return sessionmanifest.Render(sessionmanifest.Spec{
+		Name:           request.Name,
+		Namespace:      request.Namespace,
+		Image:          request.Image,
+		Storage:        request.Storage,
+		Repository:     request.Repository,
+		InitialRef:     request.InitialRef,
+		SetupCommand:   request.SetupCommand,
+		Prompt:         request.Prompt,
+		AgentName:      request.AgentName,
+		Instructions:   request.Instructions,
+		Skills:         request.Skills,
+		CloneDepth:     request.CloneDepth,
+		StorageSize:    request.StorageSize,
+		TimeoutSeconds: request.TimeoutSeconds,
+	})
+}
+
+// ContinueSession renders and applies one task against retained session state.
+func (c *Client) ContinueSession(ctx context.Context, request ContinuationRequest) error {
+	definition, err := c.persistentSessionDefinition(ctx, request.Namespace, request.Name)
+	if err != nil {
+		return err
+	}
+
+	manifest, err := sessionmanifest.RenderContinuation(sessionmanifest.Spec{
+		Name:           request.Name,
+		TaskName:       request.TaskName,
+		Namespace:      request.Namespace,
+		Image:          definition.Image,
+		Storage:        sessionmanifest.StoragePersistent,
+		Repository:     definition.Repository,
+		InitialRef:     definition.InitialRef,
+		SetupCommand:   definition.SetupCommand,
+		Prompt:         request.Prompt,
+		AgentName:      definition.AgentName,
+		Skills:         definition.Skills,
+		CloneDepth:     definition.CloneDepth,
+		TimeoutSeconds: request.TimeoutSeconds,
+		Resume:         true,
+	})
+	if err != nil {
+		return err
+	}
+
+	return c.apply(ctx, manifest)
 }
 
 // CheckSessionAvailable returns an error when retained resources already own the session name.
@@ -174,67 +250,74 @@ func (c *Client) SetGitHubToken(ctx context.Context, namespace, token string) er
 	return nil
 }
 
-// PersistentSessionDefinition returns continuation inputs after confirming that no task is active.
-func (c *Client) PersistentSessionDefinition(ctx context.Context, namespace, name string) (SessionDefinition, error) {
+func (c *Client) persistentSessionDefinition(ctx context.Context, namespace, name string) (sessionDefinition, error) {
 	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: sessionTaskSelector(name)})
 	if err != nil {
-		return SessionDefinition{}, fmt.Errorf("list session Jobs: %w", err)
+		return sessionDefinition{}, fmt.Errorf("list session Jobs: %w", err)
 	}
 
 	for i := range jobs.Items {
 		if jobs.Items[i].Status.Active > 0 {
-			return SessionDefinition{}, fmt.Errorf("session %s already has an active task", name)
+			return sessionDefinition{}, fmt.Errorf("session %s already has an active task", name)
 		}
 	}
 
 	publisher, err := c.typed.BatchV1().Jobs(namespace).Get(ctx, publisherJobName(name), metav1.GetOptions{})
 	if err == nil && !jobConditionTrue(publisher, batchv1.JobComplete) && !jobConditionTrue(publisher, batchv1.JobFailed) {
-		return SessionDefinition{}, fmt.Errorf("session %s has an active publisher", name)
+		return sessionDefinition{}, fmt.Errorf("session %s has an active publisher", name)
 	}
 
 	if err != nil && !apierrors.IsNotFound(err) {
-		return SessionDefinition{}, fmt.Errorf("check publisher Job: %w", err)
+		return sessionDefinition{}, fmt.Errorf("check publisher Job: %w", err)
 	}
 
+	return c.retainedSessionDefinition(ctx, namespace, name)
+}
+
+func (c *Client) retainedSessionDefinition(ctx context.Context, namespace, name string) (sessionDefinition, error) {
 	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, sessionmanifest.SessionClaimName(name), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return sessionDefinition{}, fmt.Errorf("%w: get session PersistentVolumeClaim: %w", errRetainedSessionNotFound, err)
+	}
+
 	if err != nil {
-		return SessionDefinition{}, fmt.Errorf("get session PersistentVolumeClaim: %w", err)
+		return sessionDefinition{}, fmt.Errorf("get session PersistentVolumeClaim: %w", err)
 	}
 
 	if claim.Status.Phase != corev1.ClaimBound {
-		return SessionDefinition{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
+		return sessionDefinition{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
 	}
 
-	cloneDepth, err := strconv.Atoi(claim.Annotations["airlock.yarlson.dev/clone-depth"])
+	cloneDepth, err := strconv.Atoi(claim.Annotations[sessionmanifest.SessionCloneDepthAnnotation])
 	if err != nil || cloneDepth < 0 {
-		return SessionDefinition{}, errors.New("session has an invalid clone depth")
+		return sessionDefinition{}, errors.New("session has an invalid clone depth")
 	}
 
-	image := claim.Annotations["airlock.yarlson.dev/image"]
-	initialRef := claim.Annotations["airlock.yarlson.dev/initial-ref"]
+	image := claim.Annotations[sessionmanifest.SessionImageAnnotation]
+	initialRef := claim.Annotations[sessionmanifest.SessionInitialRefAnnotation]
 	if image == "" || initialRef == "" {
-		return SessionDefinition{}, errors.New("session PersistentVolumeClaim has an incomplete definition")
+		return sessionDefinition{}, errors.New("session PersistentVolumeClaim has an incomplete definition")
 	}
 
-	agentName := claim.Annotations["airlock.yarlson.dev/agent"]
+	agentName := claim.Annotations[sessionmanifest.SessionAgentAnnotation]
 	var skills []sessionmanifest.AgentSkill
 	if agentName != "" {
 		configuration, err := c.typed.CoreV1().ConfigMaps(namespace).Get(ctx, sessionmanifest.SessionAgentConfigName(name), metav1.GetOptions{})
 		if err != nil {
-			return SessionDefinition{}, fmt.Errorf("get agent ConfigMap: %w", err)
+			return sessionDefinition{}, fmt.Errorf("get agent ConfigMap: %w", err)
 		}
 
 		skills, err = retainedAgentSkills(configuration, agentName)
 		if err != nil {
-			return SessionDefinition{}, err
+			return sessionDefinition{}, err
 		}
 	}
 
-	return SessionDefinition{
+	return sessionDefinition{
 		Image:        image,
-		Repository:   claim.Annotations["airlock.yarlson.dev/repository"],
+		Repository:   claim.Annotations[sessionmanifest.SessionRepositoryAnnotation],
 		InitialRef:   initialRef,
-		SetupCommand: claim.Annotations["airlock.yarlson.dev/setup"],
+		SetupCommand: claim.Annotations[sessionmanifest.SessionSetupAnnotation],
 		AgentName:    agentName,
 		Skills:       skills,
 		CloneDepth:   cloneDepth,
@@ -242,7 +325,7 @@ func (c *Client) PersistentSessionDefinition(ctx context.Context, namespace, nam
 }
 
 func retainedAgentSkills(configuration *corev1.ConfigMap, agentName string) ([]sessionmanifest.AgentSkill, error) {
-	if configuration.Immutable == nil || !*configuration.Immutable || configuration.Annotations["airlock.yarlson.dev/agent"] != agentName {
+	if configuration.Immutable == nil || !*configuration.Immutable || configuration.Annotations[sessionmanifest.SessionAgentAnnotation] != agentName {
 		return nil, errors.New("agent ConfigMap has an invalid definition")
 	}
 
@@ -367,8 +450,7 @@ func (c *Client) SessionStatus(ctx context.Context, namespace, session string) (
 	return resources, nil
 }
 
-// StreamPodLogs writes one container's logs to the supplied output.
-func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container string, follow bool, output io.Writer) (result error) {
+func (c *Client) streamPodLogs(ctx context.Context, namespace, pod, container string, follow bool, output io.Writer) (result error) {
 	stream, err := c.typed.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
 		Container: container,
 		Follow:    follow,
@@ -387,6 +469,16 @@ func (c *Client) StreamPodLogs(ctx context.Context, namespace, pod, container st
 	}
 
 	return nil
+}
+
+// WriteSessionLogs writes logs from the newest agent attempt for one session.
+func (c *Client) WriteSessionLogs(ctx context.Context, namespace, session string, follow bool, output io.Writer) error {
+	pod, err := c.newestSessionPod(ctx, namespace, session)
+	if err != nil {
+		return err
+	}
+
+	return c.streamPodLogs(ctx, namespace, pod.Name, "agent", follow, output)
 }
 
 // DeleteSession removes a session's compute resources and retains its persistent claims.
@@ -481,16 +573,6 @@ func (c *Client) deleteSessionWorkloads(ctx context.Context, namespace, name str
 	}
 
 	return errors.Join(deleteErrors...)
-}
-
-// NewestPodName returns the name of the newest Pod owned by a session.
-func (c *Client) NewestPodName(ctx context.Context, namespace, session string) (string, error) {
-	pod, err := c.newestSessionPod(ctx, namespace, session)
-	if err != nil {
-		return "", err
-	}
-
-	return pod.Name, nil
 }
 
 // SessionArtifacts returns the result files reported by the newest terminated task Pod.

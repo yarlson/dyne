@@ -2,8 +2,6 @@ package controlplane
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,44 +9,36 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/yarlson/airlock/internal/agentconfig"
-	"github.com/yarlson/airlock/pkg/agentsandbox"
+	"github.com/yarlson/airlock/internal/agent"
 )
 
 const maxRequestBytes = 1 << 20
 
-// Config contains the single-cluster defaults owned by one control-plane server.
+// Config contains HTTP server dependencies.
 type Config struct {
-	// Namespace owns every session managed by this server.
-	Namespace string
-	// Image is the default coding-agent image.
-	Image string
-	// TaskTimeout is the default Job deadline.
-	TaskTimeout time.Duration
-	// Agents contains the reusable agent definitions available to clients.
-	Agents *agentconfig.Catalog
+	// ErrorOutput receives full operation errors that are unsafe to return to clients.
+	ErrorOutput io.Writer
 }
 
 type operations interface {
-	Start(context.Context, agentsandbox.StartRequest) error
-	Continue(context.Context, agentsandbox.ContinueRequest) error
-	Status(context.Context, agentsandbox.Target) (agentsandbox.Status, error)
-	Artifacts(context.Context, agentsandbox.Target) (agentsandbox.Artifacts, error)
-	WriteLogs(context.Context, agentsandbox.LogRequest, io.Writer) error
-	Delete(context.Context, agentsandbox.Target) error
-	Destroy(context.Context, agentsandbox.Target) error
-	Publish(context.Context, agentsandbox.PublishRequest) (agentsandbox.PublishResult, error)
+	Agents() []agent.AgentSummary
+	Start(context.Context, agent.StartRequest) (agent.StartResult, error)
+	Continue(context.Context, agent.ContinueRequest) (agent.TaskResult, error)
+	Status(context.Context, string) (agent.Status, error)
+	Artifacts(context.Context, string) (agent.Artifacts, error)
+	WriteLogs(context.Context, string, bool, io.Writer) error
+	Delete(context.Context, string) error
+	Destroy(context.Context, string) error
+	Publish(context.Context, agent.PublishRequest) (agent.PublishResult, error)
 }
 
-type taskIDGenerator func() (string, error)
-
 // New returns the private-network HTTP control plane for one cluster and namespace.
-func New(control operations, config Config, newTaskID taskIDGenerator) http.Handler {
-	if newTaskID == nil {
-		newTaskID = randomTaskID
+func New(control operations, config Config) http.Handler {
+	if config.ErrorOutput == nil {
+		config.ErrorOutput = io.Discard
 	}
 
-	server := &server{control: control, config: config, newTaskID: newTaskID}
+	server := &server{control: control, config: config}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agents", server.listAgents)
 	mux.HandleFunc("POST /v1/agents/{agent}/sessions", server.createAgentSession)
@@ -63,9 +53,8 @@ func New(control operations, config Config, newTaskID taskIDGenerator) http.Hand
 }
 
 type server struct {
-	control   operations
-	config    Config
-	newTaskID taskIDGenerator
+	control operations
+	config  Config
 }
 
 type createAgentSessionRequest struct {
@@ -78,19 +67,11 @@ type createAgentSessionRequest struct {
 
 func (s *server) listAgents(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, struct {
-		Agents []agentconfig.Summary `json:"agents"`
-	}{Agents: s.config.Agents.List()})
+		Agents []agent.AgentSummary `json:"agents"`
+	}{Agents: s.control.Agents()})
 }
 
 func (s *server) createAgentSession(writer http.ResponseWriter, request *http.Request) {
-	agentName := request.PathValue("agent")
-	definition, found := s.config.Agents.Find(agentName)
-	if !found {
-		writeError(writer, http.StatusNotFound, fmt.Errorf("agent %s is not configured", agentName))
-
-		return
-	}
-
 	var input createAgentSessionRequest
 	if err := decodeJSON(writer, request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, err)
@@ -98,39 +79,26 @@ func (s *server) createAgentSession(writer http.ResponseWriter, request *http.Re
 		return
 	}
 
-	if input.InitialRef == "" {
-		input.InitialRef = "main"
-	}
-
-	timeout := definition.Timeout
+	var timeout time.Duration
 	if input.TimeoutSeconds != nil {
 		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
 	}
 
-	err := s.control.Start(request.Context(), agentsandbox.StartRequest{
-		Target:       agentsandbox.Target{Namespace: s.config.Namespace, Name: input.Name},
-		Image:        s.config.Image,
-		Storage:      agentsandbox.Storage(definition.Storage),
-		Repository:   input.Repository,
-		InitialRef:   input.InitialRef,
-		SetupCommand: definition.SetupCommand,
-		Prompt:       input.Prompt,
-		AgentName:    definition.Name,
-		Instructions: definition.Instructions,
-		Skills:       sandboxSkills(definition.Skills),
-		CloneDepth:   definition.CloneDepth,
-		StorageSize:  definition.StorageSize,
-		Timeout:      timeout,
+	result, err := s.control.Start(request.Context(), agent.StartRequest{
+		Agent:      request.PathValue("agent"),
+		Name:       input.Name,
+		Repository: input.Repository,
+		InitialRef: input.InitialRef,
+		Prompt:     input.Prompt,
+		Timeout:    timeout,
 	})
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		s.writeOperationError(writer, err)
 
 		return
 	}
 
-	writeJSON(writer, http.StatusAccepted, map[string]string{
-		"agent": definition.Name, "name": input.Name, "task_id": input.Name,
-	})
+	writeJSON(writer, http.StatusAccepted, result)
 }
 
 func (s *server) continueSession(writer http.ResponseWriter, request *http.Request) {
@@ -144,67 +112,58 @@ func (s *server) continueSession(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	taskID, err := s.newTaskID()
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, err)
-
-		return
-	}
-
-	timeout := s.config.TaskTimeout
+	var timeout time.Duration
 	if input.TimeoutSeconds != nil {
 		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
 	}
 
 	name := request.PathValue("name")
-	err = s.control.Continue(request.Context(), agentsandbox.ContinueRequest{
-		Target:  agentsandbox.Target{Namespace: s.config.Namespace, Name: name},
-		TaskID:  taskID,
-		Prompt:  input.Prompt,
-		Timeout: timeout,
+	result, err := s.control.Continue(request.Context(), agent.ContinueRequest{
+		Name: name, Prompt: input.Prompt, Timeout: timeout,
 	})
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		s.writeOperationError(writer, err)
 
 		return
 	}
 
-	writeJSON(writer, http.StatusAccepted, map[string]string{"name": name, "task_id": taskID})
+	writeJSON(writer, http.StatusAccepted, result)
 }
 
 func (s *server) sessionStatus(writer http.ResponseWriter, request *http.Request) {
 	name := request.PathValue("name")
-	status, err := s.control.Status(request.Context(), agentsandbox.Target{Namespace: s.config.Namespace, Name: name})
+	status, err := s.control.Status(request.Context(), name)
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		s.writeOperationError(writer, err)
 
 		return
 	}
 
 	writeJSON(writer, http.StatusOK, struct {
-		Name      string                        `json:"name"`
-		Resources []agentsandbox.ResourceStatus `json:"resources"`
+		Name      string                 `json:"name"`
+		Resources []agent.ResourceStatus `json:"resources"`
 	}{Name: name, Resources: status.Resources})
 }
 
 func (s *server) sessionLogs(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Content-Type", "application/x-ndjson")
-	err := s.control.WriteLogs(request.Context(), agentsandbox.LogRequest{
-		Target: agentsandbox.Target{Namespace: s.config.Namespace, Name: request.PathValue("name")},
-		Follow: request.URL.Query().Get("follow") == "true",
-	}, writer)
+	stream := &trackingResponseWriter{ResponseWriter: writer}
+	err := s.control.WriteLogs(request.Context(), request.PathValue("name"), request.URL.Query().Get("follow") == "true", stream)
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		if stream.wroteResponse {
+			s.logOperationError(err)
+
+			return
+		}
+
+		s.writeOperationError(writer, err)
 	}
 }
 
 func (s *server) sessionArtifacts(writer http.ResponseWriter, request *http.Request) {
-	result, err := s.control.Artifacts(request.Context(), agentsandbox.Target{
-		Namespace: s.config.Namespace,
-		Name:      request.PathValue("name"),
-	})
+	result, err := s.control.Artifacts(request.Context(), request.PathValue("name"))
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		s.writeOperationError(writer, err)
 
 		return
 	}
@@ -213,16 +172,16 @@ func (s *server) sessionArtifacts(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *server) deleteSession(writer http.ResponseWriter, request *http.Request) {
-	target := agentsandbox.Target{Namespace: s.config.Namespace, Name: request.PathValue("name")}
+	name := request.PathValue("name")
 	var err error
 	if request.URL.Query().Get("storage") == "delete" {
-		err = s.control.Destroy(request.Context(), target)
+		err = s.control.Destroy(request.Context(), name)
 	} else {
-		err = s.control.Delete(request.Context(), target)
+		err = s.control.Delete(request.Context(), name)
 	}
 
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		s.writeOperationError(writer, err)
 
 		return
 	}
@@ -249,8 +208,8 @@ func (s *server) publishSession(writer http.ResponseWriter, request *http.Reques
 		timeout = time.Duration(*input.TimeoutSeconds) * time.Second
 	}
 
-	result, err := s.control.Publish(request.Context(), agentsandbox.PublishRequest{
-		Target:        agentsandbox.Target{Namespace: s.config.Namespace, Name: request.PathValue("name")},
+	result, err := s.control.Publish(request.Context(), agent.PublishRequest{
+		Name:          request.PathValue("name"),
 		Branch:        input.Branch,
 		BaseBranch:    input.BaseBranch,
 		CommitMessage: input.CommitMessage,
@@ -258,7 +217,7 @@ func (s *server) publishSession(writer http.ResponseWriter, request *http.Reques
 		Timeout:       timeout,
 	})
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err)
+		s.writeOperationError(writer, err)
 
 		return
 	}
@@ -290,24 +249,50 @@ func writeError(writer http.ResponseWriter, status int, err error) {
 	writeJSON(writer, status, map[string]string{"error": err.Error()})
 }
 
-func randomTaskID() (string, error) {
-	contents := make([]byte, 6)
-	if _, err := rand.Read(contents); err != nil {
-		return "", err
+func (s *server) writeOperationError(writer http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	message := "operation failed"
+	switch agent.ErrorKindOf(err) {
+	case agent.ErrorInvalid:
+		status, message = http.StatusBadRequest, err.Error()
+	case agent.ErrorNotFound:
+		status, message = http.StatusNotFound, err.Error()
+	case agent.ErrorUnavailable:
+		status, message = http.StatusServiceUnavailable, err.Error()
 	}
 
-	return hex.EncodeToString(contents), nil
+	if status >= http.StatusInternalServerError {
+		s.logOperationError(err)
+	}
+
+	writeError(writer, status, errors.New(message))
 }
 
-func sandboxSkills(skills []agentconfig.Skill) []agentsandbox.AgentSkill {
-	if len(skills) == 0 {
-		return nil
+func (s *server) logOperationError(err error) {
+	detail := errors.Unwrap(err)
+	if detail == nil {
+		detail = err
 	}
 
-	result := make([]agentsandbox.AgentSkill, len(skills))
-	for i, skill := range skills {
-		result[i] = agentsandbox.AgentSkill{Name: skill.Name, Contents: skill.Contents}
-	}
+	_, _ = fmt.Fprintf(s.config.ErrorOutput, "control-plane operation failed: %v\n", detail)
+}
 
-	return result
+type trackingResponseWriter struct {
+	http.ResponseWriter
+	wroteResponse bool
+}
+
+func (w *trackingResponseWriter) WriteHeader(status int) {
+	w.wroteResponse = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *trackingResponseWriter) Write(contents []byte) (int, error) {
+	w.wroteResponse = true
+
+	return w.ResponseWriter.Write(contents)
+}
+
+func (w *trackingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

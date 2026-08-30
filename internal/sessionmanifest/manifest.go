@@ -18,6 +18,18 @@ const (
 	GitHubTokenSecretName = "coding-agent-git-auth"
 	codexAuthSecretName   = "coding-agent-auth"
 	maxAgentConfigBytes   = 900 * 1024
+	// SessionImageAnnotation stores the image in a retained session definition.
+	SessionImageAnnotation = "airlock.yarlson.dev/image"
+	// SessionRepositoryAnnotation stores the repository in a retained session definition.
+	SessionRepositoryAnnotation = "airlock.yarlson.dev/repository"
+	// SessionInitialRefAnnotation stores the initial ref in a retained session definition.
+	SessionInitialRefAnnotation = "airlock.yarlson.dev/initial-ref"
+	// SessionSetupAnnotation stores the setup command in a retained session definition.
+	SessionSetupAnnotation = "airlock.yarlson.dev/setup"
+	// SessionCloneDepthAnnotation stores the clone depth in a retained session definition.
+	SessionCloneDepthAnnotation = "airlock.yarlson.dev/clone-depth"
+	// SessionAgentAnnotation stores the configured agent name in retained resources.
+	SessionAgentAnnotation = "airlock.yarlson.dev/agent"
 )
 
 // Storage controls whether a session retains state after its task Pod is removed.
@@ -220,14 +232,14 @@ func denyIngressPolicy(namespace string) resource {
 
 func persistentVolumeClaim(s Spec) resource {
 	annotations := map[string]any{
-		"airlock.yarlson.dev/image":       s.Image,
-		"airlock.yarlson.dev/repository":  s.Repository,
-		"airlock.yarlson.dev/initial-ref": s.InitialRef,
-		"airlock.yarlson.dev/setup":       s.SetupCommand,
-		"airlock.yarlson.dev/clone-depth": fmt.Sprintf("%d", s.CloneDepth),
+		SessionImageAnnotation:      s.Image,
+		SessionRepositoryAnnotation: s.Repository,
+		SessionInitialRefAnnotation: s.InitialRef,
+		SessionSetupAnnotation:      s.SetupCommand,
+		SessionCloneDepthAnnotation: fmt.Sprintf("%d", s.CloneDepth),
 	}
 	if s.AgentName != "" {
-		annotations["airlock.yarlson.dev/agent"] = s.AgentName
+		annotations[SessionAgentAnnotation] = s.AgentName
 	}
 
 	return resource{
@@ -494,7 +506,7 @@ func agentConfigMap(s Spec) resource {
 			"name":        SessionAgentConfigName(s.Name),
 			"namespace":   s.Namespace,
 			"labels":      sessionLabels(s.Name),
-			"annotations": map[string]any{"airlock.yarlson.dev/agent": s.AgentName},
+			"annotations": map[string]any{SessionAgentAnnotation: s.AgentName},
 		},
 		"immutable": true,
 		"data":      data,

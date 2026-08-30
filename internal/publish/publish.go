@@ -277,19 +277,19 @@ func pullRequestResult(pull github.PullRequest, branch, commit string) Result {
 // Validate checks whether a request contains the values required to publish.
 func (request Request) Validate() error {
 	if strings.TrimSpace(request.Namespace) == "" {
-		return errors.New("--namespace is required")
+		return errors.New("namespace is required")
 	}
 
 	if strings.TrimSpace(request.Session) == "" || strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.CommitMessage) == "" {
-		return errors.New("publish requires --name, --branch, and --commit-message")
+		return errors.New("session name, branch, and commit message are required")
 	}
 
 	if request.Branch != strings.TrimSpace(request.Branch) {
-		return errors.New("--branch must not start or end with whitespace")
+		return errors.New("branch must not start or end with whitespace")
 	}
 
 	if request.Timeout < time.Second {
-		return errors.New("--timeout must be at least one second")
+		return errors.New("timeout must be at least one second")
 	}
 
 	return nil

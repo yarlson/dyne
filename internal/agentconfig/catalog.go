@@ -12,6 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
+
+	"github.com/yarlson/airlock/internal/agent"
 )
 
 const maxAgentConfigBytes = 900 * 1024
@@ -24,51 +26,9 @@ type Defaults struct {
 	TaskTimeout time.Duration
 }
 
-// Skill contains one instruction-only Codex skill.
-type Skill struct {
-	// Name identifies the skill inside the Codex skill directory.
-	Name string
-	// Contents is the complete SKILL.md file.
-	Contents string
-}
-
-// Definition is one validated agent template.
-type Definition struct {
-	// Name identifies the agent in API paths and retained session state.
-	Name string
-	// Description is safe metadata shown by the agents endpoint.
-	Description string
-	// Storage selects ephemeral or persistent session storage.
-	Storage string
-	// Instructions become the session's Codex developer instructions.
-	Instructions string
-	// Skills contains validated instruction-only Codex skills.
-	Skills []Skill
-	// SetupCommand runs during repository setup.
-	SetupCommand string
-	// CloneDepth controls the initial repository clone depth.
-	CloneDepth int
-	// StorageSize is the PVC capacity for persistent sessions.
-	StorageSize string
-	// Timeout is the default maximum task duration.
-	Timeout time.Duration
-}
-
-// Summary is the safe agent metadata returned to clients.
-type Summary struct {
-	// Name identifies the agent in API paths.
-	Name string `json:"name"`
-	// Description explains the agent's configured purpose.
-	Description string `json:"description"`
-	// Storage reports whether sessions are ephemeral or persistent.
-	Storage string `json:"storage"`
-	// Skills lists configured skill names without exposing their contents.
-	Skills []string `json:"skills,omitempty"`
-}
-
 // Catalog provides immutable agent definitions loaded at server startup.
 type Catalog struct {
-	definitions map[string]Definition
+	definitions map[string]agent.AgentDefinition
 }
 
 type catalogFile struct {
@@ -126,7 +86,7 @@ func Load(path string, defaults Defaults) (*Catalog, error) {
 		return nil, fmt.Errorf("resolve agents file directory: %w", err)
 	}
 
-	definitions := make(map[string]Definition, len(source.Agents))
+	definitions := make(map[string]agent.AgentDefinition, len(source.Agents))
 	for name, raw := range source.Agents {
 		definition, err := loadDefinition(directory, name, raw, defaults)
 		if err != nil {
@@ -140,12 +100,12 @@ func Load(path string, defaults Defaults) (*Catalog, error) {
 }
 
 // List returns safe agent summaries sorted by name.
-func (c *Catalog) List() []Summary {
+func (c *Catalog) List() []agent.AgentSummary {
 	if c == nil {
-		return []Summary{}
+		return []agent.AgentSummary{}
 	}
 
-	summaries := make([]Summary, 0, len(c.definitions))
+	summaries := make([]agent.AgentSummary, 0, len(c.definitions))
 	for _, definition := range c.definitions {
 		skillNames := make([]string, len(definition.Skills))
 		for i, skill := range definition.Skills {
@@ -153,12 +113,12 @@ func (c *Catalog) List() []Summary {
 		}
 
 		slices.Sort(skillNames)
-		summaries = append(summaries, Summary{
+		summaries = append(summaries, agent.AgentSummary{
 			Name: definition.Name, Description: definition.Description, Storage: definition.Storage, Skills: skillNames,
 		})
 	}
 
-	slices.SortFunc(summaries, func(left, right Summary) int {
+	slices.SortFunc(summaries, func(left, right agent.AgentSummary) int {
 		return strings.Compare(left.Name, right.Name)
 	})
 
@@ -166,9 +126,9 @@ func (c *Catalog) List() []Summary {
 }
 
 // Find returns one agent definition by name.
-func (c *Catalog) Find(name string) (Definition, bool) {
+func (c *Catalog) Find(name string) (agent.AgentDefinition, bool) {
 	if c == nil {
-		return Definition{}, false
+		return agent.AgentDefinition{}, false
 	}
 
 	definition, found := c.definitions[name]
@@ -177,25 +137,25 @@ func (c *Catalog) Find(name string) (Definition, bool) {
 	return definition, found
 }
 
-func loadDefinition(directory, name string, raw agentDefinition, defaults Defaults) (Definition, error) {
+func loadDefinition(directory, name string, raw agentDefinition, defaults Defaults) (agent.AgentDefinition, error) {
 	if messages := validation.IsDNS1123Label(name); len(messages) > 0 {
-		return Definition{}, fmt.Errorf("name must be a lowercase DNS label: %s", strings.Join(messages, ", "))
+		return agent.AgentDefinition{}, fmt.Errorf("name must be a lowercase DNS label: %s", strings.Join(messages, ", "))
 	}
 
 	if strings.TrimSpace(raw.Description) == "" {
-		return Definition{}, errors.New("description is required")
+		return agent.AgentDefinition{}, errors.New("description is required")
 	}
 
 	if strings.TrimSpace(raw.Instructions) == "" {
-		return Definition{}, errors.New("instructions are required")
+		return agent.AgentDefinition{}, errors.New("instructions are required")
 	}
 
 	if raw.Storage != "ephemeral" && raw.Storage != "persistent" {
-		return Definition{}, fmt.Errorf("unsupported storage %q", raw.Storage)
+		return agent.AgentDefinition{}, fmt.Errorf("unsupported storage %q", raw.Storage)
 	}
 
 	if raw.Storage == "ephemeral" && raw.StorageSize != "" {
-		return Definition{}, errors.New("storage_size is only valid for persistent agents")
+		return agent.AgentDefinition{}, errors.New("storage_size is only valid for persistent agents")
 	}
 
 	cloneDepth := 1
@@ -204,7 +164,7 @@ func loadDefinition(directory, name string, raw agentDefinition, defaults Defaul
 	}
 
 	if cloneDepth < 0 {
-		return Definition{}, errors.New("clone_depth cannot be negative")
+		return agent.AgentDefinition{}, errors.New("clone_depth cannot be negative")
 	}
 
 	storageSize := raw.StorageSize
@@ -213,26 +173,26 @@ func loadDefinition(directory, name string, raw agentDefinition, defaults Defaul
 	}
 
 	if _, err := resource.ParseQuantity(storageSize); err != nil {
-		return Definition{}, fmt.Errorf("parse storage_size: %w", err)
+		return agent.AgentDefinition{}, fmt.Errorf("parse storage_size: %w", err)
 	}
 
 	timeout := defaults.TaskTimeout
 	if raw.Timeout != "" {
 		parsed, err := time.ParseDuration(raw.Timeout)
 		if err != nil {
-			return Definition{}, fmt.Errorf("parse timeout: %w", err)
+			return agent.AgentDefinition{}, fmt.Errorf("parse timeout: %w", err)
 		}
 
 		timeout = parsed
 	}
 
 	if timeout <= 0 {
-		return Definition{}, errors.New("timeout must be greater than zero")
+		return agent.AgentDefinition{}, errors.New("timeout must be greater than zero")
 	}
 
 	skills, err := loadSkills(directory, raw.Skills)
 	if err != nil {
-		return Definition{}, err
+		return agent.AgentDefinition{}, err
 	}
 
 	size := len(raw.Instructions)
@@ -241,13 +201,13 @@ func loadDefinition(directory, name string, raw agentDefinition, defaults Defaul
 	}
 
 	if size > maxAgentConfigBytes {
-		return Definition{}, fmt.Errorf("instructions and skills exceed %d bytes", maxAgentConfigBytes)
+		return agent.AgentDefinition{}, fmt.Errorf("instructions and skills exceed %d bytes", maxAgentConfigBytes)
 	}
 
-	return Definition{
+	return agent.AgentDefinition{
 		Name:         name,
 		Description:  raw.Description,
-		Storage:      raw.Storage,
+		Storage:      agent.Storage(raw.Storage),
 		Instructions: raw.Instructions,
 		Skills:       skills,
 		SetupCommand: raw.SetupCommand,
@@ -269,8 +229,8 @@ func validateDefaults(defaults Defaults) error {
 	return nil
 }
 
-func loadSkills(directory string, paths []string) ([]Skill, error) {
-	skills := make([]Skill, 0, len(paths))
+func loadSkills(directory string, paths []string) ([]agent.AgentSkill, error) {
+	skills := make([]agent.AgentSkill, 0, len(paths))
 	names := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
 		skill, err := loadSkill(directory, path)
@@ -289,55 +249,55 @@ func loadSkills(directory string, paths []string) ([]Skill, error) {
 	return skills, nil
 }
 
-func loadSkill(directory, relativePath string) (Skill, error) {
+func loadSkill(directory, relativePath string) (agent.AgentSkill, error) {
 	if relativePath == "" || filepath.IsAbs(relativePath) {
-		return Skill{}, fmt.Errorf("skill path %q must be relative", relativePath)
+		return agent.AgentSkill{}, fmt.Errorf("skill path %q must be relative", relativePath)
 	}
 
 	cleanPath := filepath.Clean(relativePath)
 	if cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
-		return Skill{}, fmt.Errorf("skill path %q must stay within the agents file directory", relativePath)
+		return agent.AgentSkill{}, fmt.Errorf("skill path %q must stay within the agents file directory", relativePath)
 	}
 
 	if filepath.Base(cleanPath) != "SKILL.md" {
-		return Skill{}, fmt.Errorf("skill path %q must identify SKILL.md", relativePath)
+		return agent.AgentSkill{}, fmt.Errorf("skill path %q must identify SKILL.md", relativePath)
 	}
 
 	path := filepath.Join(directory, cleanPath)
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return Skill{}, fmt.Errorf("resolve skill path %q: %w", relativePath, err)
+		return agent.AgentSkill{}, fmt.Errorf("resolve skill path %q: %w", relativePath, err)
 	}
 
 	absoluteResolved, err := filepath.Abs(resolved)
 	if err != nil {
-		return Skill{}, fmt.Errorf("resolve skill path %q: %w", relativePath, err)
+		return agent.AgentSkill{}, fmt.Errorf("resolve skill path %q: %w", relativePath, err)
 	}
 
 	if absoluteResolved != path {
-		return Skill{}, fmt.Errorf("skill path %q must not contain symlinks", relativePath)
+		return agent.AgentSkill{}, fmt.Errorf("skill path %q must not contain symlinks", relativePath)
 	}
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return Skill{}, fmt.Errorf("stat skill path %q: %w", relativePath, err)
+		return agent.AgentSkill{}, fmt.Errorf("stat skill path %q: %w", relativePath, err)
 	}
 
 	if !info.Mode().IsRegular() {
-		return Skill{}, fmt.Errorf("skill path %q must be a regular file", relativePath)
+		return agent.AgentSkill{}, fmt.Errorf("skill path %q must be a regular file", relativePath)
 	}
 
 	contents, err := readBoundedFile(path, maxAgentConfigBytes)
 	if err != nil {
-		return Skill{}, fmt.Errorf("read skill %q: %w", relativePath, err)
+		return agent.AgentSkill{}, fmt.Errorf("read skill %q: %w", relativePath, err)
 	}
 
 	metadata, err := parseSkillMetadata(contents)
 	if err != nil {
-		return Skill{}, fmt.Errorf("parse skill %q: %w", relativePath, err)
+		return agent.AgentSkill{}, fmt.Errorf("parse skill %q: %w", relativePath, err)
 	}
 
-	return Skill{Name: metadata.Name, Contents: string(contents)}, nil
+	return agent.AgentSkill{Name: metadata.Name, Contents: string(contents)}, nil
 }
 
 func parseSkillMetadata(contents []byte) (skillMetadata, error) {

@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yarlson/airlock/internal/agent"
 )
 
 func TestLoadResolvesAgentDefinitionsAndSkillFiles(t *testing.T) {
@@ -39,19 +41,19 @@ agents:
 	catalog, err := Load(path, Defaults{StorageSize: "10Gi", TaskTimeout: 2 * time.Hour})
 	require.NoError(t, err)
 
-	assert.Equal(t, []Summary{
+	assert.Equal(t, []agent.AgentSummary{
 		{Name: "implementer", Description: "Implements focused changes.", Storage: "persistent", Skills: []string{}},
 		{Name: "reviewer", Description: "Reviews repository changes.", Storage: "ephemeral", Skills: []string{"code-review"}},
 	}, catalog.List())
 
 	reviewer, found := catalog.Find("reviewer")
 	require.True(t, found)
-	assert.Equal(t, Definition{
+	assert.Equal(t, agent.AgentDefinition{
 		Name:         "reviewer",
 		Description:  "Reviews repository changes.",
 		Storage:      "ephemeral",
 		Instructions: "Review correctness, security, and tests.",
-		Skills:       []Skill{{Name: "code-review", Contents: skillContents}},
+		Skills:       []agent.AgentSkill{{Name: "code-review", Contents: skillContents}},
 		CloneDepth:   1,
 		StorageSize:  "10Gi",
 		Timeout:      2 * time.Hour,
@@ -67,7 +69,7 @@ agents:
 
 func TestNilCatalogBehavesAsEmpty(t *testing.T) {
 	var catalog *Catalog
-	assert.Equal(t, []Summary{}, catalog.List())
+	assert.Equal(t, []agent.AgentSummary{}, catalog.List())
 	_, found := catalog.Find("missing")
 	assert.False(t, found)
 }

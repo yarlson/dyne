@@ -64,7 +64,7 @@ func TestSessionRejectsInvalidRequestBeforeUsingCluster(t *testing.T) {
 	request := validPublishRequest()
 	request.Branch = " yar/review"
 	_, err := Session(context.Background(), nil, request)
-	require.EqualError(t, err, "--branch must not start or end with whitespace")
+	require.EqualError(t, err, "branch must not start or end with whitespace")
 }
 
 func TestPublishSessionRejectsExistingBranchWithoutPublisherOwnership(t *testing.T) {

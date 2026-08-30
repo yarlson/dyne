@@ -1,13 +1,13 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,17 +15,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yarlson/airlock/internal/agentconfig"
-	"github.com/yarlson/airlock/pkg/agentsandbox"
+	"github.com/yarlson/airlock/internal/agent"
 )
 
 func TestCreateSessionDoesNotExposeRawSessionContract(t *testing.T) {
-	server := New(operationsStub{start: func(context.Context, agentsandbox.StartRequest) error {
-		require.FailNow(t, "started a session through the raw HTTP contract")
-
-		return nil
-	}}, Config{}, nil)
-
+	server := New(operationsStub{}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/sessions", strings.NewReader(`{
 		"name":"review",
 		"storage":"persistent",
@@ -34,13 +28,17 @@ func TestCreateSessionDoesNotExposeRawSessionContract(t *testing.T) {
 		"prompt":"fix the failed checks"
 	}`))
 	response := httptest.NewRecorder()
+
 	server.ServeHTTP(response, request)
 
 	assert.Equal(t, http.StatusNotFound, response.Code)
 }
 
-func TestListAgentsReturnsSafeSortedDefinitions(t *testing.T) {
-	server := New(operationsStub{}, Config{Agents: testAgentCatalog(t)}, nil)
+func TestListAgentsReturnsSafeProductSummaries(t *testing.T) {
+	server := New(operationsStub{agents: []agent.AgentSummary{
+		{Name: "implementer", Description: "Implements focused changes.", Storage: agent.StoragePersistent, Skills: []string{"code-review"}},
+		{Name: "reviewer", Description: "Reviews repository changes.", Storage: agent.StorageEphemeral, Skills: []string{"code-review"}},
+	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/agents", nil)
 	response := httptest.NewRecorder()
 
@@ -57,16 +55,13 @@ func TestListAgentsReturnsSafeSortedDefinitions(t *testing.T) {
 	assert.NotContains(t, response.Body.String(), "mise install")
 }
 
-func TestCreateAgentSessionResolvesDefinition(t *testing.T) {
-	var received agentsandbox.StartRequest
-	server := New(operationsStub{start: func(_ context.Context, request agentsandbox.StartRequest) error {
+func TestCreateAgentSessionDelegatesOnlyClientOwnedInputs(t *testing.T) {
+	var received agent.StartRequest
+	server := New(operationsStub{start: func(_ context.Context, request agent.StartRequest) (agent.StartResult, error) {
 		received = request
 
-		return nil
-	}}, Config{
-		Namespace: "coding-agents", Image: "coding-agent:test", TaskTimeout: time.Hour,
-		Agents: testAgentCatalog(t),
-	}, nil)
+		return agent.StartResult{Agent: request.Agent, Name: request.Name, TaskID: request.Name}, nil
+	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/agents/implementer/sessions", strings.NewReader(`{
 		"name":"change-123",
 		"repository":"https://github.com/lokalise/kargo.git",
@@ -78,39 +73,18 @@ func TestCreateAgentSessionResolvesDefinition(t *testing.T) {
 	server.ServeHTTP(response, request)
 
 	require.Equal(t, http.StatusAccepted, response.Code)
-	assert.Equal(t, agentsandbox.StartRequest{
-		Target:       agentsandbox.Target{Namespace: "coding-agents", Name: "change-123"},
-		Image:        "coding-agent:test",
-		Storage:      agentsandbox.StoragePersistent,
-		Repository:   "https://github.com/lokalise/kargo.git",
-		InitialRef:   "main",
-		SetupCommand: "mise install",
-		Prompt:       "fix the failed checks",
-		AgentName:    "implementer",
-		Instructions: "Implement the smallest safe change.",
-		Skills: []agentsandbox.AgentSkill{{
-			Name: "code-review",
-			Contents: `---
-name: code-review
-description: Review changed code.
----
-
-Review correctness and tests.
-`,
-		}},
-		CloneDepth:  0,
-		StorageSize: "20Gi",
-		Timeout:     30 * time.Minute,
+	assert.Equal(t, agent.StartRequest{
+		Agent:      "implementer",
+		Name:       "change-123",
+		Repository: "https://github.com/lokalise/kargo.git",
+		Prompt:     "fix the failed checks",
+		Timeout:    30 * time.Minute,
 	}, received)
 	assert.JSONEq(t, `{"agent":"implementer","name":"change-123","task_id":"change-123"}`, response.Body.String())
 }
 
-func TestCreateAgentSessionRejectsUnknownAgent(t *testing.T) {
-	server := New(operationsStub{start: func(context.Context, agentsandbox.StartRequest) error {
-		require.FailNow(t, "started a session for an unknown agent")
-
-		return nil
-	}}, Config{Agents: testAgentCatalog(t)}, nil)
+func TestCreateAgentSessionReturnsNotFoundForUnknownAgent(t *testing.T) {
+	server := New(&agent.Control{}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/agents/missing/sessions", strings.NewReader(`{
 		"name":"change-123",
 		"repository":"https://github.com/lokalise/kargo.git",
@@ -124,36 +98,32 @@ func TestCreateAgentSessionRejectsUnknownAgent(t *testing.T) {
 	assert.JSONEq(t, `{"error":"agent missing is not configured"}`, response.Body.String())
 }
 
-func TestContinueSessionReturnsServerGeneratedTaskID(t *testing.T) {
-	var received agentsandbox.ContinueRequest
-	server := New(operationsStub{continueTask: func(_ context.Context, request agentsandbox.ContinueRequest) error {
+func TestContinueSessionReturnsProductGeneratedTaskID(t *testing.T) {
+	var received agent.ContinueRequest
+	server := New(operationsStub{continueTask: func(_ context.Context, request agent.ContinueRequest) (agent.TaskResult, error) {
 		received = request
 
-		return nil
-	}}, Config{Namespace: "coding-agents", TaskTimeout: time.Hour}, func() (string, error) {
-		return "abc123", nil
-	})
-
+		return agent.TaskResult{Name: request.Name, TaskID: "abc123"}, nil
+	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/sessions/review/tasks", strings.NewReader(`{"prompt":"continue the fix"}`))
 	response := httptest.NewRecorder()
+
 	server.ServeHTTP(response, request)
 
 	assert.Equal(t, http.StatusAccepted, response.Code)
-	assert.Equal(t, agentsandbox.ContinueRequest{
-		Target:  agentsandbox.Target{Namespace: "coding-agents", Name: "review"},
-		TaskID:  "abc123",
-		Prompt:  "continue the fix",
-		Timeout: time.Hour,
-	}, received)
+	assert.Equal(t, agent.ContinueRequest{Name: "review", Prompt: "continue the fix"}, received)
 	assert.JSONEq(t, `{"name":"review","task_id":"abc123"}`, response.Body.String())
 }
 
 func TestStatusReturnsStableJSON(t *testing.T) {
-	server := New(operationsStub{status: func(context.Context, agentsandbox.Target) (agentsandbox.Status, error) {
-		return agentsandbox.Status{Resources: []agentsandbox.ResourceStatus{{Kind: "Job", Name: "review", Ready: "1/1", State: "Complete"}}}, nil
-	}}, Config{Namespace: "coding-agents"}, nil)
+	server := New(operationsStub{status: func(_ context.Context, name string) (agent.Status, error) {
+		assert.Equal(t, "review", name)
+
+		return agent.Status{Resources: []agent.ResourceStatus{{Kind: "Job", Name: "review", Ready: "1/1", State: "Complete"}}}, nil
+	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/sessions/review", nil)
 	response := httptest.NewRecorder()
+
 	server.ServeHTTP(response, request)
 
 	require.Equal(t, http.StatusOK, response.Code)
@@ -164,97 +134,98 @@ func TestStatusReturnsStableJSON(t *testing.T) {
 }
 
 func TestPublishUsesAgentAuthoredMetadataContract(t *testing.T) {
-	var received agentsandbox.PublishRequest
-	server := New(operationsStub{publish: func(_ context.Context, request agentsandbox.PublishRequest) (agentsandbox.PublishResult, error) {
+	var received agent.PublishRequest
+	server := New(operationsStub{publish: func(_ context.Context, request agent.PublishRequest) (agent.PublishResult, error) {
 		received = request
 
-		return agentsandbox.PublishResult{PullRequestNumber: 17, PullRequestURL: "https://github.com/lokalise/kargo/pull/17"}, nil
-	}}, Config{Namespace: "coding-agents"}, nil)
+		return agent.PublishResult{PullRequestNumber: 17, PullRequestURL: "https://github.com/lokalise/kargo/pull/17"}, nil
+	}}, Config{})
 	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/sessions/review/publish", strings.NewReader(`{
 		"branch":"yar/review",
 		"commit_message":"Review changes"
 	}`))
 	response := httptest.NewRecorder()
+
 	server.ServeHTTP(response, request)
 
 	require.Equal(t, http.StatusOK, response.Code)
-	assert.Equal(t, agentsandbox.PublishRequest{
-		Target:        agentsandbox.Target{Namespace: "coding-agents", Name: "review"},
-		Branch:        "yar/review",
-		CommitMessage: "Review changes",
-		Draft:         true,
-		Timeout:       10 * time.Minute,
+	assert.Equal(t, agent.PublishRequest{
+		Name: "review", Branch: "yar/review", CommitMessage: "Review changes", Draft: true, Timeout: 10 * time.Minute,
 	}, received)
 	assert.NotContains(t, response.Body.String(), "title")
 }
 
-type operationsStub struct {
-	start        func(context.Context, agentsandbox.StartRequest) error
-	continueTask func(context.Context, agentsandbox.ContinueRequest) error
-	status       func(context.Context, agentsandbox.Target) (agentsandbox.Status, error)
-	publish      func(context.Context, agentsandbox.PublishRequest) (agentsandbox.PublishResult, error)
+func TestOperationFailureReturnsSafeServerErrorAndRetainsCause(t *testing.T) {
+	var errorOutput bytes.Buffer
+	server := New(operationsStub{status: func(context.Context, string) (agent.Status, error) {
+		return agent.Status{}, errors.New("list Pods: private cluster detail")
+	}}, Config{ErrorOutput: &errorOutput})
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/sessions/review", nil)
+	response := httptest.NewRecorder()
+
+	server.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.JSONEq(t, `{"error":"operation failed"}`, response.Body.String())
+	assert.Contains(t, errorOutput.String(), "private cluster detail")
+	assert.NotContains(t, response.Body.String(), "private cluster detail")
 }
 
-func (s operationsStub) Start(ctx context.Context, request agentsandbox.StartRequest) error {
+func TestLogFailureAfterStreamingDoesNotAppendJSON(t *testing.T) {
+	var errorOutput bytes.Buffer
+	server := New(operationsStub{writeLogs: func(_ context.Context, _ string, _ bool, output io.Writer) error {
+		_, err := io.WriteString(output, "first log line\n")
+		require.NoError(t, err)
+
+		return errors.New("stream interrupted")
+	}}, Config{ErrorOutput: &errorOutput})
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/sessions/review/logs", nil)
+	response := httptest.NewRecorder()
+
+	server.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, "first log line\n", response.Body.String())
+	assert.Contains(t, errorOutput.String(), "stream interrupted")
+}
+
+type operationsStub struct {
+	agents       []agent.AgentSummary
+	start        func(context.Context, agent.StartRequest) (agent.StartResult, error)
+	continueTask func(context.Context, agent.ContinueRequest) (agent.TaskResult, error)
+	status       func(context.Context, string) (agent.Status, error)
+	publish      func(context.Context, agent.PublishRequest) (agent.PublishResult, error)
+	writeLogs    func(context.Context, string, bool, io.Writer) error
+}
+
+func (s operationsStub) Agents() []agent.AgentSummary { return s.agents }
+
+func (s operationsStub) Start(ctx context.Context, request agent.StartRequest) (agent.StartResult, error) {
 	return s.start(ctx, request)
 }
 
-func (s operationsStub) Continue(ctx context.Context, request agentsandbox.ContinueRequest) error {
+func (s operationsStub) Continue(ctx context.Context, request agent.ContinueRequest) (agent.TaskResult, error) {
 	return s.continueTask(ctx, request)
 }
 
-func (s operationsStub) Status(ctx context.Context, target agentsandbox.Target) (agentsandbox.Status, error) {
-	return s.status(ctx, target)
+func (s operationsStub) Status(ctx context.Context, name string) (agent.Status, error) {
+	return s.status(ctx, name)
 }
 
-func (s operationsStub) Artifacts(context.Context, agentsandbox.Target) (agentsandbox.Artifacts, error) {
-	return agentsandbox.Artifacts{}, nil
+func (s operationsStub) Artifacts(context.Context, string) (agent.Artifacts, error) {
+	return agent.Artifacts{}, nil
 }
 
-func (s operationsStub) WriteLogs(context.Context, agentsandbox.LogRequest, io.Writer) error {
-	return nil
+func (s operationsStub) WriteLogs(ctx context.Context, name string, follow bool, output io.Writer) error {
+	if s.writeLogs == nil {
+		return nil
+	}
+
+	return s.writeLogs(ctx, name, follow, output)
 }
-func (s operationsStub) Delete(context.Context, agentsandbox.Target) error  { return nil }
-func (s operationsStub) Destroy(context.Context, agentsandbox.Target) error { return nil }
-func (s operationsStub) Publish(ctx context.Context, request agentsandbox.PublishRequest) (agentsandbox.PublishResult, error) {
+func (s operationsStub) Delete(context.Context, string) error  { return nil }
+func (s operationsStub) Destroy(context.Context, string) error { return nil }
+
+func (s operationsStub) Publish(ctx context.Context, request agent.PublishRequest) (agent.PublishResult, error) {
 	return s.publish(ctx, request)
-}
-
-func testAgentCatalog(t *testing.T) *agentconfig.Catalog {
-	t.Helper()
-	directory := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(directory, "skills", "code-review"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(directory, "skills", "code-review", "SKILL.md"), []byte(`---
-name: code-review
-description: Review changed code.
----
-
-Review correctness and tests.
-`), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(directory, "agents.yaml"), []byte(`version: v1
-agents:
-  reviewer:
-    description: Reviews repository changes.
-    storage: ephemeral
-    instructions: Review correctness, security, and tests.
-    skills:
-      - skills/code-review/SKILL.md
-  implementer:
-    description: Implements focused changes.
-    storage: persistent
-    instructions: Implement the smallest safe change.
-    skills:
-      - skills/code-review/SKILL.md
-    setup: mise install
-    clone_depth: 0
-    storage_size: 20Gi
-    timeout: 4h
-`), 0o600))
-
-	catalog, err := agentconfig.Load(filepath.Join(directory, "agents.yaml"), agentconfig.Defaults{
-		StorageSize: "10Gi", TaskTimeout: time.Hour,
-	})
-	require.NoError(t, err)
-
-	return catalog
 }

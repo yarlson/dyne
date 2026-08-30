@@ -121,34 +121,25 @@ func (c *Client) SessionPublishSource(ctx context.Context, namespace, session st
 		return PublishSource{}, fmt.Errorf("session outcome is %q, want completed", outcome.Status)
 	}
 
-	agentContainer, err := namedContainer(latest.Spec.Template.Spec.Containers, "agent")
+	definition, err := c.retainedSessionDefinition(ctx, namespace, session)
+	if errors.Is(err, errRetainedSessionNotFound) {
+		return PublishSource{}, errors.New("ephemeral sessions cannot be published")
+	}
+
 	if err != nil {
 		return PublishSource{}, err
 	}
 
-	environment := literalContainerEnvironment(agentContainer)
-	if environment["AGENT_STORAGE"] != "persistent" {
-		return PublishSource{}, errors.New("ephemeral sessions cannot be published")
-	}
-
-	if environment["AGENT_REPOSITORY"] == "" || environment["AGENT_REF"] == "" {
+	if definition.Repository == "" {
 		return PublishSource{}, errors.New("session repository and base ref are required for publishing")
 	}
 
 	workspaceClaim := sessionmanifest.SessionClaimName(session)
-	claim, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, workspaceClaim, metav1.GetOptions{})
-	if err != nil {
-		return PublishSource{}, fmt.Errorf("get session PersistentVolumeClaim: %w", err)
-	}
-
-	if claim.Status.Phase != corev1.ClaimBound {
-		return PublishSource{}, fmt.Errorf("session PersistentVolumeClaim is %s, want Bound", claim.Status.Phase)
-	}
 
 	return PublishSource{
-		Repository:     environment["AGENT_REPOSITORY"],
-		InitialRef:     environment["AGENT_REF"],
-		Image:          agentContainer.Image,
+		Repository:     definition.Repository,
+		InitialRef:     definition.InitialRef,
+		Image:          definition.Image,
 		WorkspaceClaim: workspaceClaim,
 	}, nil
 }
@@ -474,25 +465,6 @@ func publisherContainer(request PublisherJobRequest) corev1.Container {
 			{Name: "git-auth", MountPath: "/var/run/git-auth", ReadOnly: true},
 		},
 	}
-}
-
-func namedContainer(containers []corev1.Container, name string) (corev1.Container, error) {
-	for _, container := range containers {
-		if container.Name == name {
-			return container, nil
-		}
-	}
-
-	return corev1.Container{}, fmt.Errorf("session Pod has no %s container", name)
-}
-
-func literalContainerEnvironment(container corev1.Container) map[string]string {
-	environment := make(map[string]string, len(container.Env))
-	for _, variable := range container.Env {
-		environment[variable.Name] = variable.Value
-	}
-
-	return environment
 }
 
 func publisherJobName(session string) string {

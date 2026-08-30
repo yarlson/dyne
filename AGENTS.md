@@ -1,6 +1,6 @@
 # Repository instructions
 
-This repository contains a Go CLI and library for running coding sessions on Kubernetes. It supports bounded exploration, persistent code updates, resumable long sessions, setup commands, retained tool state, and explicit pull-request publishing.
+This repository contains a Go CLI and control plane for running coding sessions on Kubernetes. It supports bounded exploration, persistent code updates, resumable long sessions, setup commands, retained tool state, and explicit pull-request publishing.
 
 ## Commands
 
@@ -33,11 +33,11 @@ Before implementation, report the existing pattern, how the change will follow i
 
 ## Architecture
 
-`pkg/agentsandbox` is the entrypoint-neutral product boundary. The HTTP server uses its requests and results instead of lower-level Kubernetes, GitHub, publishing, or manifest types.
+`internal/agent` is the entrypoint-neutral product boundary. The HTTP server uses its requests and results instead of lower-level Kubernetes, GitHub, publishing, or manifest types.
 
 - `cmd/airlock` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
 - `internal/controlplane` owns the private HTTP contract for sessions, tasks, logs, artifacts, publishing, and deletion.
-- `pkg/agentsandbox` owns complete session operations and translates lower-level results into entrypoint-neutral contracts.
+- `internal/agent` owns configured agent and session operations and translates lower-level results into entrypoint-neutral contracts.
 - `internal/sessionmanifest` validates session specifications and renders ephemeral and persistent Job resources without contacting a cluster.
 - `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; Kubernetes API operations; resource status; retained definitions; and publisher Jobs.
 - `internal/publish` owns publish eligibility, intent identity, branch ownership, retry recovery, pull-request sequencing, and publisher cleanup.
@@ -49,11 +49,12 @@ Keep dependencies directional:
 ```text
 cmd/airlock -> internal/controlplane
 cmd/airlock -> internal/github
-cmd/airlock -> pkg/agentsandbox
-internal/controlplane -> pkg/agentsandbox
-pkg/agentsandbox -> internal/sessionmanifest
-pkg/agentsandbox -> internal/kubernetes
-pkg/agentsandbox -> internal/publish
+cmd/airlock -> internal/agent
+internal/controlplane -> internal/agent
+internal/agentconfig -> internal/agent
+internal/agent -> internal/sessionmanifest
+internal/agent -> internal/kubernetes
+internal/agent -> internal/publish
 internal/publish -> internal/kubernetes
 internal/publish -> internal/github
 internal/kubernetes -> internal/sessionmanifest

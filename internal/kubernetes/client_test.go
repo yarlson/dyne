@@ -106,9 +106,9 @@ func TestPersistentSessionDefinitionSurvivesWorkloadDeletion(t *testing.T) {
 		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 	}
 	client := &Client{typed: fake.NewClientset(claim)}
-	definition, err := client.PersistentSessionDefinition(context.Background(), "coding-agents", "example")
+	definition, err := client.persistentSessionDefinition(context.Background(), "coding-agents", "example")
 	require.NoError(t, err)
-	assert.Equal(t, SessionDefinition{
+	assert.Equal(t, sessionDefinition{
 		Image:        "coding-agent:test",
 		Repository:   "https://github.com/lokalise/kargo.git",
 		InitialRef:   "main",
@@ -138,7 +138,7 @@ func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testin
 	}
 	client := &Client{typed: fake.NewClientset(claim)}
 
-	_, err := client.PersistentSessionDefinition(context.Background(), "coding-agents", "example")
+	_, err := client.persistentSessionDefinition(context.Background(), "coding-agents", "example")
 	require.ErrorContains(t, err, "get agent ConfigMap")
 
 	immutable := true
@@ -155,15 +155,15 @@ func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testin
 			"skill-code-review": "retained skill",
 		},
 	})
-	definition, err := client.PersistentSessionDefinition(context.Background(), "coding-agents", "example")
+	definition, err := client.persistentSessionDefinition(context.Background(), "coding-agents", "example")
 	require.NoError(t, err)
 	assert.Equal(t, "reviewer", definition.AgentName)
 	assert.Equal(t, []sessionmanifest.AgentSkill{{Name: "code-review", Contents: "retained skill"}}, definition.Skills)
 }
 
-func TestNewestPodNameReportsMissingSession(t *testing.T) {
+func TestWriteSessionLogsReportsMissingSession(t *testing.T) {
 	client := &Client{typed: fake.NewClientset()}
-	_, err := client.NewestPodName(context.Background(), "coding-agents", "missing")
+	err := client.WriteSessionLogs(context.Background(), "coding-agents", "missing", false, io.Discard)
 	require.True(t, apierrors.IsNotFound(err), "got error %v, want missing Pod", err)
 }
 

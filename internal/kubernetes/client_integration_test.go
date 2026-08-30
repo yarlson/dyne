@@ -23,7 +23,9 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 		t.Skip("KUBERNETES_INTEGRATION_CONTEXT is required")
 	}
 
-	client, err := New(contextName, io.Discard)
+	config, err := loadKubeconfig("", contextName)
+	require.NoError(t, err)
+	client, err := NewForConfig(config, io.Discard)
 	require.NoError(t, err)
 	namespace := integrationNamespace(t)
 	t.Cleanup(func() {
@@ -40,7 +42,7 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 
 	testContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	require.NoError(t, client.Apply(testContext, integrationManifest(namespace)))
+	require.NoError(t, client.apply(testContext, integrationManifest(namespace)))
 
 	require.NoError(t, client.DeleteSession(testContext, namespace, "session"))
 	assertSessionWorkloadDeleted(t, testContext, client, namespace)

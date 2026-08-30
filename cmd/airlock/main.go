@@ -17,10 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yarlson/airlock/internal/agent"
 	"github.com/yarlson/airlock/internal/agentconfig"
 	"github.com/yarlson/airlock/internal/controlplane"
 	airlockgithub "github.com/yarlson/airlock/internal/github"
-	"github.com/yarlson/airlock/pkg/agentsandbox"
 )
 
 const defaultServerURL = "http://127.0.0.1:8080"
@@ -67,8 +67,8 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 	set := flag.NewFlagSet("server", flag.ContinueOnError)
 	set.SetOutput(stderr)
 	listenAddress := set.String("listen", "127.0.0.1:8080", "HTTP listen address")
-	namespace := set.String("namespace", agentsandbox.DefaultNamespace, "Kubernetes namespace owned by this server")
-	image := set.String("image", agentsandbox.DefaultImage, "coding-agent image")
+	namespace := set.String("namespace", agent.DefaultNamespace, "Kubernetes namespace owned by this server")
+	image := set.String("image", agent.DefaultImage, "coding-agent image")
 	storageSize := set.String("storage-size", "10Gi", "persistent session claim size")
 	taskTimeout := set.Duration("task-timeout", 2*time.Hour, "default task deadline")
 	kubeconfig := set.String("kubeconfig", "", "kubeconfig file")
@@ -110,20 +110,21 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 		return err
 	}
 
-	control, err := agentsandbox.Connect(ctx, agentsandbox.Connection{
-		KubeconfigPath: *kubeconfig,
-		ContextName:    *contextName,
-		EKSCluster:     *eksCluster,
-		AWSRegion:      *awsRegion,
-		AWSRoleARN:     *awsRoleARN,
-	}, agentsandbox.Streams{Input: strings.NewReader(""), Output: io.Discard, ErrorOutput: stderr}, githubApp)
+	control, err := agent.Connect(ctx, agent.Config{
+		Connection: agent.Connection{
+			KubeconfigPath: *kubeconfig,
+			ContextName:    *contextName,
+			EKSCluster:     *eksCluster,
+			AWSRegion:      *awsRegion,
+			AWSRoleARN:     *awsRoleARN,
+		},
+		Namespace: *namespace, Image: *image, TaskTimeout: *taskTimeout,
+	}, io.Discard, githubApp, agents)
 	if err != nil {
 		return err
 	}
 
-	handler := controlplane.New(control, controlplane.Config{
-		Namespace: *namespace, Image: *image, TaskTimeout: *taskTimeout, Agents: agents,
-	}, nil)
+	handler := controlplane.New(control, controlplane.Config{ErrorOutput: stderr})
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listenAddress)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listenAddress, err)
