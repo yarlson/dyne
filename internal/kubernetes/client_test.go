@@ -182,6 +182,16 @@ func TestSessionArtifactsReturnsNewestTerminatedAgentResult(t *testing.T) {
 	assert.Empty(t, artifacts.PullRequest)
 }
 
+func TestParseTaskArtifactsReturnsWorkflowOutput(t *testing.T) {
+	message := "outcome=eyJzdGF0dXMiOiJjb21wbGV0ZWQifQ==\nworkflow-output=eyJmaW5kaW5ncyI6WyJvbmUiXX0=\n"
+
+	artifacts, err := parseTaskArtifacts(message)
+	require.NoError(t, err)
+
+	assert.JSONEq(t, `{"status":"completed"}`, string(artifacts.Outcome))
+	assert.JSONEq(t, `{"findings":["one"]}`, string(artifacts.WorkflowOutput))
+}
+
 func TestDeleteSessionRemovesComputeAndRetainsPersistentState(t *testing.T) {
 	claimNames := []string{"session-example"}
 	client, clientset := sessionClientWithPersistentState(claimNames)

@@ -60,6 +60,16 @@ const (
 	SessionStoragePersistent SessionStorage = "persistent"
 )
 
+// ResultKind selects the artifact required when a task completes.
+type ResultKind string
+
+const (
+	// ResultKindPullRequest requires pull request metadata for completed work.
+	ResultKindPullRequest ResultKind = "pull-request"
+	// ResultKindWorkflowOutput requires bounded JSON output for a workflow dependency.
+	ResultKindWorkflowOutput ResultKind = "workflow-output"
+)
+
 // SessionSkill contains one instruction-only Codex skill mounted into a session.
 type SessionSkill struct {
 	// Name identifies the skill inside the Codex skill directory.
@@ -84,6 +94,9 @@ type SessionRequest struct {
 	CloneDepth     int
 	StorageSize    string
 	TimeoutSeconds int64
+	ResultKind     ResultKind
+	WorkflowRun    string
+	WorkflowStep   string
 }
 
 // ContinuationRequest contains the new task inputs for one retained session.
@@ -169,6 +182,9 @@ func (request SessionRequest) manifest() ([]byte, error) {
 		CloneDepth:     request.CloneDepth,
 		StorageSize:    request.StorageSize,
 		TimeoutSeconds: request.TimeoutSeconds,
+		ResultKind:     request.ResultKind,
+		WorkflowRun:    request.WorkflowRun,
+		WorkflowStep:   request.WorkflowStep,
 	})
 }
 
@@ -222,6 +238,57 @@ func (c *Client) CheckSessionAvailable(ctx context.Context, namespace, name stri
 
 	if len(jobs.Items) > 0 || len(claims.Items) > 0 || len(configMaps.Items) > 0 {
 		return fmt.Errorf("session %s already exists", name)
+	}
+
+	return nil
+}
+
+// CheckWorkflowSessionOwnership accepts an existing session only when every retained resource belongs to the step.
+func (c *Client) CheckWorkflowSessionOwnership(ctx context.Context, namespace, name, run, step string) error {
+	selector := sessionSelector(name)
+	jobs, err := c.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("check workflow session Jobs: %w", err)
+	}
+
+	claims, err := c.typed.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("check workflow session PersistentVolumeClaims: %w", err)
+	}
+
+	configMaps, err := c.typed.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("check workflow session ConfigMaps: %w", err)
+	}
+
+	owned := func(resourceLabels map[string]string) bool {
+		return resourceLabels["coding-agent/workflow-run"] == run && resourceLabels["coding-agent/workflow-step"] == step
+	}
+
+	count := 0
+	for i := range jobs.Items {
+		count++
+		if !owned(jobs.Items[i].Labels) {
+			return fmt.Errorf("session %s is not owned by workflow run %s step %s", name, run, step)
+		}
+	}
+
+	for i := range claims.Items {
+		count++
+		if !owned(claims.Items[i].Labels) {
+			return fmt.Errorf("session %s is not owned by workflow run %s step %s", name, run, step)
+		}
+	}
+
+	for i := range configMaps.Items {
+		count++
+		if !owned(configMaps.Items[i].Labels) {
+			return fmt.Errorf("session %s is not owned by workflow run %s step %s", name, run, step)
+		}
+	}
+
+	if count == 0 {
+		return fmt.Errorf("workflow session %s has no retained resources", name)
 	}
 
 	return nil
@@ -425,6 +492,8 @@ type TaskArtifacts struct {
 	Outcome json.RawMessage
 	// PullRequest is the proposed pull request metadata for completed work.
 	PullRequest json.RawMessage
+	// WorkflowOutput is the bounded JSON result passed to dependent workflow steps.
+	WorkflowOutput json.RawMessage
 }
 
 // SessionStatus returns the workloads, Pods, and claims owned by a session.
@@ -627,6 +696,8 @@ func parseTaskArtifacts(message string) (TaskArtifacts, error) {
 			result.Outcome = contents
 		case "pull-request":
 			result.PullRequest = contents
+		case "workflow-output":
+			result.WorkflowOutput = contents
 		}
 	}
 

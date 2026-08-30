@@ -22,6 +22,16 @@ const (
 	StoragePersistent Storage = "persistent"
 )
 
+// ResultKind selects the artifact required when an agent completes.
+type ResultKind string
+
+const (
+	// ResultKindPullRequest requires pull request metadata for completed work.
+	ResultKindPullRequest ResultKind = "pull-request"
+	// ResultKindWorkflowOutput requires JSON output for a dependent workflow step.
+	ResultKindWorkflowOutput ResultKind = "workflow-output"
+)
+
 // Connection selects how the control plane authenticates to its Kubernetes cluster.
 type Connection struct {
 	// KubeconfigPath selects an explicit kubeconfig file.
@@ -61,6 +71,8 @@ type Artifacts struct {
 	Outcome json.RawMessage `json:"outcome"`
 	// PullRequest is the proposed pull request metadata when work completed.
 	PullRequest json.RawMessage `json:"pull_request,omitempty"`
+	// WorkflowOutput is the JSON result passed to dependent workflow steps.
+	WorkflowOutput json.RawMessage `json:"workflow_output,omitempty"`
 }
 
 // ResourceStatus describes the readiness and state of one session resource.

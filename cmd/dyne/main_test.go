@@ -43,6 +43,38 @@ func TestStartRequiresConfiguredAgent(t *testing.T) {
 	assert.False(t, requested, "sent a raw session request without an agent")
 }
 
+func TestWorkflowCommandsUseWorkflowRoutes(t *testing.T) {
+	requests := make(chan *http.Request, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests <- request.Clone(context.Background())
+		writer.Header().Set("Content-Type", "application/json")
+		if request.Method == http.MethodPost {
+			writer.WriteHeader(http.StatusAccepted)
+			_, _ = writer.Write([]byte(`{"name":"change-123","workflow":"delivery","state":"pending"}`))
+
+			return
+		}
+
+		_, _ = writer.Write([]byte(`{"workflows":[]}`))
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	require.NoError(t, run(context.Background(), []string{"workflows", "--server", server.URL}, &output, &output))
+	listRequest := <-requests
+	assert.Equal(t, http.MethodGet, listRequest.Method)
+	assert.Equal(t, "/v1/workflows", listRequest.URL.Path)
+
+	output.Reset()
+	require.NoError(t, run(context.Background(), []string{
+		"workflow-start", "--server", server.URL, "--workflow", "delivery", "--name", "change-123",
+		"--repo", "https://github.com/lokalise/kargo.git", "--prompt", "fix it",
+	}, &output, &output))
+	startRequest := <-requests
+	assert.Equal(t, http.MethodPost, startRequest.Method)
+	assert.Equal(t, "/v1/workflows/delivery/runs", startRequest.URL.Path)
+}
+
 func TestStartAgentSendsOnlyInstanceInputs(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

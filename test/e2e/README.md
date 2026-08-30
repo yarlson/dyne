@@ -1,6 +1,6 @@
-# Live coding-session E2E test
+# Live multi-agent workflow E2E test
 
-This test runs a real Codex coding session against the private `lokalise/ratchet-test-service` repository. It builds the current dyne image, clones the repository through a GitHub App, fixes one known README link, publishes a draft pull request, verifies it through GitHub, then closes the pull request and removes its branch and Kubernetes namespace.
+This test runs a real three-step Codex workflow against the private `lokalise/ratchet-test-service` repository. Two isolated ephemeral reviewers inspect the documentation fix and its validation commands in parallel. A persistent implementation step receives both JSON outputs, fixes one known README link, and becomes the only publishable session. The test publishes a draft pull request, verifies it through GitHub, then closes the pull request and removes its branch, workflow database, sessions, and Kubernetes namespace.
 
 The test changes live GitHub and Kubernetes state and uses a real Codex account. Do not run it as an ordinary local or CI check.
 
@@ -76,4 +76,4 @@ make e2e-test
 
 Command-line Make variables override `test/e2e/local.mk` when you need a one-off value.
 
-The test stops before starting a session if the expected broken link on `main` has changed. Normal cleanup closes the draft pull request, deletes the `dyne/e2e-readme-link-*` branch, and deletes the unique `dyne-e2e-*` namespace. A hard process or machine failure can interrupt cleanup, so check GitHub and Kubernetes for those prefixes after an interrupted run.
+The test stops before starting the workflow if the expected broken link on `main` has changed. Normal cleanup closes the draft pull request, deletes the `dyne/e2e-readme-link-*` branch, destroys workflow sessions and its temporary SQLite database, and deletes the unique `dyne-e2e-*` namespace. A hard process or machine failure can interrupt cleanup, so check GitHub and Kubernetes for those prefixes after an interrupted run.

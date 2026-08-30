@@ -21,6 +21,9 @@ import (
 	"github.com/yarlson/dyne/internal/agentconfig"
 	"github.com/yarlson/dyne/internal/controlplane"
 	dynegithub "github.com/yarlson/dyne/internal/github"
+	"github.com/yarlson/dyne/internal/workflow"
+	workflowstorage "github.com/yarlson/dyne/internal/workflow/storage"
+	"github.com/yarlson/dyne/internal/workflowconfig"
 )
 
 const defaultServerURL = "http://127.0.0.1:8080"
@@ -44,6 +47,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return serve(ctx, args[1:], stderr)
 	case "agents":
 		return listAgents(ctx, args[1:], stdout)
+	case "workflows":
+		return listWorkflows(ctx, args[1:], stdout)
+	case "workflow-start":
+		return startWorkflow(ctx, args[1:], stdout)
+	case "workflow-status":
+		return getWorkflowRun(ctx, "workflow-status", args[1:], "", stdout)
+	case "workflow-artifacts":
+		return getWorkflowRun(ctx, "workflow-artifacts", args[1:], "/artifacts", stdout)
+	case "workflow-cancel":
+		return changeWorkflowRun(ctx, "workflow-cancel", http.MethodPost, args[1:], "/cancel", stdout)
+	case "workflow-delete":
+		return changeWorkflowRun(ctx, "workflow-delete", http.MethodDelete, args[1:], "", stdout)
 	case "start":
 		return start(ctx, args[1:], stdout)
 	case "status":
@@ -63,7 +78,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 }
 
-func serve(ctx context.Context, args []string, stderr io.Writer) error {
+func serve(ctx context.Context, args []string, stderr io.Writer) (result error) {
 	set := flag.NewFlagSet("server", flag.ContinueOnError)
 	set.SetOutput(stderr)
 	listenAddress := set.String("listen", "127.0.0.1:8080", "HTTP listen address")
@@ -80,6 +95,8 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 	githubInstallationID := set.Int64("github-installation-id", 0, "GitHub App installation ID")
 	githubPrivateKeyFile := set.String("github-private-key-file", "", "GitHub App private key file")
 	agentsFile := set.String("agents-file", "", "agent definitions YAML file")
+	workflowsFile := set.String("workflows-file", "", "workflow definitions YAML file")
+	databaseURL := set.String("database-url", defaultDatabaseURL(), "workflow database URL")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
@@ -93,6 +110,19 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 		})
 		if err != nil {
 			return fmt.Errorf("load agents file: %w", err)
+		}
+	}
+
+	var workflows *workflowconfig.Catalog
+	if *workflowsFile != "" {
+		if agents == nil {
+			return errors.New("--agents-file is required with --workflows-file")
+		}
+
+		var err error
+		workflows, err = workflowconfig.Load(*workflowsFile, agents)
+		if err != nil {
+			return fmt.Errorf("load workflows file: %w", err)
 		}
 	}
 
@@ -124,7 +154,37 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 		return err
 	}
 
-	handler := controlplane.New(control, controlplane.Config{ErrorOutput: stderr})
+	serverConfig := controlplane.Config{ErrorOutput: stderr}
+	if workflows != nil {
+		repository, err := workflowstorage.Open(ctx, *databaseURL)
+		if err != nil {
+			return err
+		}
+
+		workflowControl, err := workflow.New(workflow.Config{
+			Repository: repository, ErrorOutput: stderr,
+		}, control, workflows)
+		if err != nil {
+			return errors.Join(err, repository.Close())
+		}
+
+		workflowContext, stopWorkflows := context.WithCancel(ctx)
+		workflowDone := make(chan struct{})
+		defer func() {
+			stopWorkflows()
+			<-workflowDone
+			if err := repository.Close(); err != nil {
+				result = errors.Join(result, fmt.Errorf("close workflow storage: %w", err))
+			}
+		}()
+		serverConfig.Workflows = workflowControl
+		go func() {
+			defer close(workflowDone)
+			_ = workflowControl.Run(workflowContext, 2*time.Second)
+		}()
+	}
+
+	handler := controlplane.New(control, serverConfig)
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listenAddress)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listenAddress, err)
@@ -186,6 +246,77 @@ func listAgents(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 
 	return requestJSON(ctx, http.MethodGet, *server, "/v1/agents", nil, stdout)
+}
+
+func listWorkflows(ctx context.Context, args []string, stdout io.Writer) error {
+	set := flag.NewFlagSet("workflows", flag.ContinueOnError)
+	server := serverFlag(set)
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+
+	return requestJSON(ctx, http.MethodGet, *server, "/v1/workflows", nil, stdout)
+}
+
+func startWorkflow(ctx context.Context, args []string, stdout io.Writer) error {
+	set := flag.NewFlagSet("workflow-start", flag.ContinueOnError)
+	server := serverFlag(set)
+	workflowName := set.String("workflow", "", "configured workflow name")
+	name := set.String("name", "", "workflow run name")
+	repository := set.String("repo", "", "Git repository URL")
+	ref := set.String("ref", "main", "initial Git ref")
+	prompt := set.String("prompt", "", "workflow goal")
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+
+	if *workflowName == "" || *name == "" || *repository == "" || *prompt == "" {
+		return errors.New("workflow-start requires --workflow, --name, --repo, and --prompt")
+	}
+
+	body := map[string]any{
+		"name": *name, "repository": *repository, "ref": *ref, "prompt": *prompt,
+	}
+
+	return requestJSON(
+		ctx, http.MethodPost, *server, "/v1/workflows/"+url.PathEscape(*workflowName)+"/runs", body, stdout,
+	)
+}
+
+func getWorkflowRun(ctx context.Context, command string, args []string, suffix string, stdout io.Writer) error {
+	set := flag.NewFlagSet(command, flag.ContinueOnError)
+	server := serverFlag(set)
+	name := set.String("name", "", "workflow run name")
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+
+	if *name == "" {
+		return errors.New("--name is required")
+	}
+
+	return requestJSON(ctx, http.MethodGet, *server, "/v1/workflow-runs/"+url.PathEscape(*name)+suffix, nil, stdout)
+}
+
+func changeWorkflowRun(
+	ctx context.Context,
+	command, method string,
+	args []string,
+	suffix string,
+	stdout io.Writer,
+) error {
+	set := flag.NewFlagSet(command, flag.ContinueOnError)
+	server := serverFlag(set)
+	name := set.String("name", "", "workflow run name")
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+
+	if *name == "" {
+		return errors.New("--name is required")
+	}
+
+	return requestJSON(ctx, method, *server, "/v1/workflow-runs/"+url.PathEscape(*name)+suffix, nil, stdout)
 }
 
 func task(ctx context.Context, args []string, stdout io.Writer) error {
@@ -302,6 +433,14 @@ func serverFlag(set *flag.FlagSet) *string {
 	return set.String("server", defaultURL, "dyne server URL")
 }
 
+func defaultDatabaseURL() string {
+	if value := os.Getenv("DYNE_DATABASE_URL"); value != "" {
+		return value
+	}
+
+	return "sqlite:dyne.db"
+}
+
 func requestJSON(ctx context.Context, method, serverURL, path string, body any, output io.Writer) (result error) {
 	var contents io.Reader
 	if body != nil {
@@ -351,5 +490,5 @@ func requestJSON(ctx context.Context, method, serverURL, path string, body any, 
 }
 
 func usage() string {
-	return "usage: dyne <server|agents|start|status|logs|artifacts|task|publish|delete> [options]"
+	return "usage: dyne <server|agents|workflows|start|workflow-start|status|workflow-status|logs|artifacts|workflow-artifacts|task|publish|delete|workflow-cancel|workflow-delete> [options]"
 }

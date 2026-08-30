@@ -52,12 +52,15 @@ type Config struct {
 
 // StartRequest contains the client-owned inputs for a new agent session.
 type StartRequest struct {
-	Agent      string
-	Name       string
-	Repository string
-	InitialRef string
-	Prompt     string
-	Timeout    time.Duration
+	Agent        string
+	Name         string
+	Repository   string
+	InitialRef   string
+	Prompt       string
+	Timeout      time.Duration
+	ResultKind   ResultKind
+	WorkflowRun  string
+	WorkflowStep string
 }
 
 // StartResult identifies the accepted initial task.
@@ -183,6 +186,21 @@ func (c *Control) Start(ctx context.Context, request StartRequest) (StartResult,
 		return StartResult{}, newOperationError(ErrorNotFound, fmt.Sprintf("agent %s is not configured", request.Agent), nil)
 	}
 
+	return c.startDefinition(ctx, definition, request)
+}
+
+// StartDefinition creates a workflow-owned session from a snapshotted agent definition.
+func (c *Control) StartDefinition(
+	ctx context.Context,
+	definition AgentDefinition,
+	request StartRequest,
+) (StartResult, error) {
+	request.Agent = definition.Name
+
+	return c.startDefinition(ctx, definition, request)
+}
+
+func (c *Control) startDefinition(ctx context.Context, definition AgentDefinition, request StartRequest) (StartResult, error) {
 	if request.InitialRef == "" {
 		request.InitialRef = "main"
 	}
@@ -205,6 +223,9 @@ func (c *Control) Start(ctx context.Context, request StartRequest) (StartResult,
 		cloneDepth:   definition.CloneDepth,
 		storageSize:  definition.StorageSize,
 		timeout:      request.Timeout,
+		resultKind:   request.ResultKind,
+		workflowRun:  request.WorkflowRun,
+		workflowStep: request.WorkflowStep,
 	}
 	if err := session.validate(); err != nil {
 		return StartResult{}, newOperationError(ErrorInvalid, err.Error(), err)

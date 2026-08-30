@@ -20,7 +20,6 @@ import (
 	gh "github.com/google/go-github/v83/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +29,8 @@ import (
 
 	"github.com/yarlson/dyne/internal/agent"
 	dynegithub "github.com/yarlson/dyne/internal/github"
+	"github.com/yarlson/dyne/internal/workflow"
+	workflowstorage "github.com/yarlson/dyne/internal/workflow/storage"
 )
 
 const (
@@ -63,6 +64,10 @@ pnpm install --frozen-lockfile --ignore-scripts`
 
 const fixDocumentationLinkPrompt = `Fix only the empty Markdown link labeled "environment variable configuration" in README.md. Change it from [environment variable configuration]() to [environment variable configuration](./docs/environment-variables.md). Do not modify package versions, CHANGELOG.md, dependencies, production code, or any other line. Run pnpm run build, pnpm run lint, and git diff --check. If any required check cannot pass, report the exact blocker instead of claiming completion.`
 
+const inspectDocumentationPrompt = `Inspect README.md and docs/environment-variables.md. Identify the exact correction needed for the empty link labeled "environment variable configuration". Do not modify files. Return a workflow output object with the current link, required link, and evidence that the target file exists.`
+
+const inspectValidationPrompt = `Inspect package.json and the repository structure. Identify the exact commands that should validate a one-line README link fix and any constraint that keeps the change scoped. Do not modify files. Return a workflow output object with a checks array and scope constraint.`
+
 type taskOutcome struct {
 	Status  string `json:"status"`
 	Summary string `json:"summary"`
@@ -74,26 +79,39 @@ type pullRequestArtifact struct {
 	Body  string `json:"body"`
 }
 
-func TestCodingSessionFixesPrivateRepositoryAndPublishesDraftPullRequest(t *testing.T) {
+func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) {
 	environment := newLiveTestEnvironment(t)
 	environment.requireBrokenLinkOnMain(t)
 
-	_, err := environment.control.Start(environment.context, agent.StartRequest{
-		Agent:      "implementer",
-		Name:       environment.session,
+	_, err := environment.workflows.Start(environment.context, workflow.StartRequest{
+		Workflow:   "documentation-fix",
+		Name:       environment.run,
 		Repository: testRepository,
-		InitialRef: testRepositoryBase,
+		Ref:        testRepositoryBase,
 		Prompt:     fixDocumentationLinkPrompt,
 	})
 	require.NoError(t, err)
-	environment.requireJobSucceeded(t)
+	run := environment.requireWorkflowCompleted(t)
+	assert.Equal(t, workflow.StepCompleted, run.Steps["inspect-documentation"].State)
+	assert.Equal(t, workflow.StepCompleted, run.Steps["inspect-validation"].State)
+	assert.Equal(t, workflow.StepCompleted, run.Steps["implement"].State)
+	assert.NotEmpty(t, run.Steps["inspect-documentation"].Output)
+	assert.NotEmpty(t, run.Steps["inspect-validation"].Output)
+	require.NotNil(t, run.Steps["implement"].StartedAt)
+	require.NotNil(t, run.Steps["inspect-documentation"].FinishedAt)
+	require.NotNil(t, run.Steps["inspect-validation"].FinishedAt)
+	assert.False(t, run.Steps["implement"].StartedAt.Before(*run.Steps["inspect-documentation"].FinishedAt))
+	assert.False(t, run.Steps["implement"].StartedAt.Before(*run.Steps["inspect-validation"].FinishedAt))
 
-	artifacts, err := environment.control.Artifacts(environment.context, environment.session)
+	workflowArtifacts, err := environment.workflows.Artifacts(environment.context, environment.run)
+	require.NoError(t, err)
+	require.NotEmpty(t, workflowArtifacts.PublishableSession)
+	artifacts, err := environment.agents.Artifacts(environment.context, workflowArtifacts.PublishableSession)
 	require.NoError(t, err)
 	var outcome taskOutcome
 	require.NoError(t, json.Unmarshal(artifacts.Outcome, &outcome))
 	if outcome.Status != "completed" {
-		environment.logSessionLogs(t)
+		environment.logWorkflowLogs(t, run)
 	}
 	require.Equal(t, "completed", outcome.Status, "summary=%q blocker=%q", outcome.Summary, outcome.Blocker)
 	assert.NotEmpty(t, outcome.Summary)
@@ -103,8 +121,8 @@ func TestCodingSessionFixesPrivateRepositoryAndPublishesDraftPullRequest(t *test
 	require.NotEmpty(t, pullArtifact.Title)
 	require.NotEmpty(t, pullArtifact.Body)
 
-	result, err := environment.control.Publish(environment.context, agent.PublishRequest{
-		Name:          environment.session,
+	result, err := environment.agents.Publish(environment.context, agent.PublishRequest{
+		Name:          workflowArtifacts.PublishableSession,
 		Branch:        environment.branch,
 		BaseBranch:    testRepositoryBase,
 		CommitMessage: "docs: fix environment documentation link",
@@ -118,12 +136,13 @@ func TestCodingSessionFixesPrivateRepositoryAndPublishesDraftPullRequest(t *test
 
 type liveTestEnvironment struct {
 	context    context.Context
-	control    *agent.Control
+	agents     *agent.Control
+	workflows  *workflow.Control
 	kubernetes clientset.Interface
 	github     *gh.Client
 	output     *bytes.Buffer
 	namespace  string
-	session    string
+	run        string
 	branch     string
 }
 
@@ -145,7 +164,7 @@ func newLiveTestEnvironment(t *testing.T) liveTestEnvironment {
 	kubernetesClient := newKubernetesClient(t, config.contextName)
 	suffix := randomSuffix(t)
 	namespace := "dyne-e2e-" + suffix
-	session := "ratchet-" + suffix
+	run := "ratchet-" + suffix
 	branch := "dyne/e2e-readme-link-" + suffix
 	createSessionNamespace(t, testContext, kubernetesClient, namespace)
 	registerNamespaceCleanup(t, kubernetesClient, namespace)
@@ -156,17 +175,34 @@ func newLiveTestEnvironment(t *testing.T) liveTestEnvironment {
 	registerGitHubCleanup(t, config.githubApp, branch)
 
 	output := &bytes.Buffer{}
-	control, err := agent.Connect(testContext, agent.Config{
+	agentControl, err := agent.Connect(testContext, agent.Config{
 		Connection:  agent.Connection{ContextName: config.contextName},
 		Namespace:   namespace,
 		Image:       config.image,
 		TaskTimeout: taskTimeout,
 	}, output, config.githubApp, liveAgentCatalog())
 	require.NoError(t, err)
+	repository, err := workflowstorage.Open(testContext, "sqlite:"+t.TempDir()+"/workflows.db")
+	require.NoError(t, err)
+	workflowControl, err := workflow.New(workflow.Config{
+		Repository: repository, ErrorOutput: output,
+	}, agentControl, liveWorkflowCatalog())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		current, getErr := workflowControl.Get(context.Background(), run)
+		if getErr == nil && current.State != workflow.StateCompleted && current.State != workflow.StateBlocked && current.State != workflow.StateFailed && current.State != workflow.StateCanceled {
+			_ = workflowControl.Cancel(context.Background(), run)
+			_ = workflowControl.Reconcile(context.Background(), run)
+		}
+
+		_ = workflowControl.Delete(context.Background(), run)
+		require.NoError(t, repository.Close())
+	})
 
 	return liveTestEnvironment{
-		context: testContext, control: control, kubernetes: kubernetesClient, github: githubClient, output: output,
-		namespace: namespace, session: session, branch: branch,
+		context: testContext, agents: agentControl, workflows: workflowControl,
+		kubernetes: kubernetesClient, github: githubClient, output: output,
+		namespace: namespace, run: run, branch: branch,
 	}
 }
 
@@ -212,12 +248,48 @@ func requiredPositiveIntegerEnvironment(t *testing.T, name string) int64 {
 
 func liveAgentCatalog() agentCatalog {
 	return agentCatalog{
+		"reviewer": {
+			Name: "reviewer", Description: "Inspects one bounded concern and returns structured findings.", Storage: agent.StorageEphemeral,
+			Instructions: "Follow the repository AGENTS.md. Inspect only the requested concern, do not modify files, and return concise evidence.",
+			SetupCommand: liveSetupCommand, CloneDepth: 1, StorageSize: "5Gi", Timeout: taskTimeout,
+		},
 		"implementer": {
 			Name: "implementer", Description: "Implements and publishes one focused change.", Storage: agent.StoragePersistent,
 			Instructions: "Follow the repository AGENTS.md. Keep the change limited to the requested behavior and report failed checks honestly.",
 			SetupCommand: liveSetupCommand, CloneDepth: 1, StorageSize: "5Gi", Timeout: taskTimeout,
 		},
 	}
+}
+
+type workflowCatalog map[string]workflow.Definition
+
+func liveWorkflowCatalog() workflowCatalog {
+	reviewer, _ := liveAgentCatalog().Find("reviewer")
+	implementer, _ := liveAgentCatalog().Find("implementer")
+
+	return workflowCatalog{"documentation-fix": {
+		Name: "documentation-fix", Description: "Inspect and implement one documentation fix.", MaxParallelism: 2,
+		Steps: map[string]workflow.StepDefinition{
+			"inspect-documentation": {
+				Name: "inspect-documentation", Agent: "reviewer", Prompt: inspectDocumentationPrompt, ResolvedAgent: reviewer,
+			},
+			"inspect-validation": {
+				Name: "inspect-validation", Agent: "reviewer", Prompt: inspectValidationPrompt, ResolvedAgent: reviewer,
+			},
+			"implement": {
+				Name: "implement", Agent: "implementer", Prompt: fixDocumentationLinkPrompt,
+				After: []string{"inspect-documentation", "inspect-validation"}, Publishable: true, ResolvedAgent: implementer,
+			},
+		},
+	}}
+}
+
+func (c workflowCatalog) List() []workflow.Summary { return []workflow.Summary{} }
+
+func (c workflowCatalog) Find(name string) (workflow.Definition, bool) {
+	definition, found := c[name]
+
+	return workflow.CloneDefinition(definition), found
 }
 
 func (c agentCatalog) List() []agent.AgentSummary {
@@ -284,43 +356,52 @@ func (environment liveTestEnvironment) requireBrokenLinkOnMain(t *testing.T) {
 	assert.NotContains(t, contents, fixedDocumentationLink)
 }
 
-func (environment liveTestEnvironment) requireJobSucceeded(t *testing.T) {
+func (environment liveTestEnvironment) requireWorkflowCompleted(t *testing.T) workflow.Run {
 	t.Helper()
+	var run workflow.Run
 	err := wait.PollUntilContextTimeout(environment.context, waitInterval, taskTimeout, true, func(ctx context.Context) (bool, error) {
-		job, err := environment.kubernetes.BatchV1().Jobs(environment.namespace).Get(ctx, environment.session, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
+		if err := environment.workflows.Reconcile(ctx, environment.run); err != nil {
+			return false, err
 		}
 
+		var err error
+		run, err = environment.workflows.Get(ctx, environment.run)
 		if err != nil {
 			return false, err
 		}
 
-		if jobConditionTrue(job, batchv1.JobFailed) {
-			return false, fmt.Errorf("job %s failed", environment.session)
+		switch run.State {
+		case workflow.StateCompleted:
+			return true, nil
+		case workflow.StateBlocked, workflow.StateFailed, workflow.StateCanceled:
+			return false, fmt.Errorf("workflow run %s finished as %s", environment.run, run.State)
+		default:
+			return false, nil
 		}
-
-		return jobConditionTrue(job, batchv1.JobComplete), nil
 	})
 	if err != nil {
 		environment.logPodDiagnostics(t)
-		environment.logSessionLogs(t)
+		environment.logWorkflowLogs(t, run)
 		t.Logf("coding-session output:\n%s", environment.output.String())
 	}
 
 	require.NoError(t, err)
+
+	return run
 }
 
-func (environment liveTestEnvironment) logSessionLogs(t *testing.T) {
+func (environment liveTestEnvironment) logWorkflowLogs(t *testing.T, run workflow.Run) {
 	t.Helper()
-	var logs bytes.Buffer
-	if err := environment.control.WriteLogs(environment.context, environment.session, false, &logs); err != nil {
-		t.Logf("read coding-session logs: %v", err)
+	for _, step := range run.Steps {
+		var logs bytes.Buffer
+		if err := environment.agents.WriteLogs(environment.context, step.Session, false, &logs); err != nil {
+			t.Logf("read workflow step %s logs: %v", step.Name, err)
 
-		return
+			continue
+		}
+
+		t.Logf("workflow step %s logs:\n%s", step.Name, logs.String())
 	}
-
-	t.Logf("coding-session logs:\n%s", logs.String())
 }
 
 func (environment liveTestEnvironment) logPodDiagnostics(t *testing.T) {
@@ -369,16 +450,6 @@ func containerStateDescription(status corev1.ContainerStatus) string {
 	}
 
 	return "unknown"
-}
-
-func jobConditionTrue(job *batchv1.Job, conditionType batchv1.JobConditionType) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == conditionType {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-
-	return false
 }
 
 func (environment liveTestEnvironment) requireDraftPullRequest(t *testing.T, result agent.PublishResult, artifact pullRequestArtifact) {

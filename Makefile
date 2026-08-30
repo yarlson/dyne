@@ -1,6 +1,8 @@
 BINARY := dyne
 GOLANGCI_LINT_VERSION := v2.11.4
 GOLANGCI_LINT_VERSION_NUMBER := $(patsubst v%,%,$(GOLANGCI_LINT_VERSION))
+SQLC_VERSION := v1.31.1
+SQLC_VERSION_NUMBER := $(patsubst v%,%,$(SQLC_VERSION))
 DOCKER_CONTEXT ?= colima-codex-k8s
 IMAGE ?= coding-agent:local
 
@@ -27,6 +29,14 @@ test: ## Run all Go tests
 .PHONY: test-race
 test-race: ## Run all Go tests with the race detector
 	go test -race ./...
+
+.PHONY: generate
+generate: require-sqlc ## Generate typed workflow database access
+	sqlc generate
+
+.PHONY: sqlc-check
+sqlc-check: require-sqlc ## Check generated workflow database access
+	sqlc diff
 
 .PHONY: integration-test
 integration-test: ## Run live Kubernetes tests with KUBERNETES_INTEGRATION_CONTEXT
@@ -82,7 +92,7 @@ mod-check: ## Verify module checksums and tidy state
 	go mod tidy -diff
 
 .PHONY: check
-check: fmt-check mod-check vet lint test-race build ## Run all required local checks
+check: fmt-check sqlc-check mod-check vet lint test-race build ## Run all required local checks
 
 .PHONY: image
 image: ## Build the coding-agent image in the selected Docker context
@@ -91,13 +101,15 @@ image: ## Build the coding-agent image in the selected Docker context
 .PHONY: tools
 tools: ## Install the pinned development tools
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
 
 .PHONY: doctor
 doctor: ## Check required and optional development tools
-	@for tool in go git golangci-lint; do command -v $$tool >/dev/null || { printf 'required tool not found: %s\n' $$tool; exit 1; }; done
+	@for tool in go git golangci-lint sqlc; do command -v $$tool >/dev/null || { printf 'required tool not found: %s\n' $$tool; exit 1; }; done
 	@for tool in docker colima; do command -v $$tool >/dev/null || printf 'optional local-runtime tool not found: %s\n' $$tool; done
 	@go version
 	@golangci-lint version
+	@sqlc version
 
 .PHONY: clean
 clean: ## Remove generated local artifacts
@@ -107,3 +119,8 @@ clean: ## Remove generated local artifacts
 require-linter:
 	@command -v golangci-lint >/dev/null || { printf 'golangci-lint is required; run make tools\n'; exit 1; }
 	@version="$$(golangci-lint version 2>/dev/null)"; case "$$version" in *"version $(GOLANGCI_LINT_VERSION_NUMBER) "*) ;; *) printf 'golangci-lint $(GOLANGCI_LINT_VERSION_NUMBER) is required; run make tools\n'; exit 1;; esac
+
+.PHONY: require-sqlc
+require-sqlc:
+	@command -v sqlc >/dev/null || { printf 'sqlc is required; run make tools\n'; exit 1; }
+	@version="$$(sqlc version 2>/dev/null)"; case "$$version" in *"$(SQLC_VERSION_NUMBER)"*) ;; *) printf 'sqlc $(SQLC_VERSION_NUMBER) is required; run make tools\n'; exit 1;; esac

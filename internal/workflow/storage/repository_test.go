@@ -1,0 +1,100 @@
+package storage
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/workflow"
+)
+
+func TestRepositoryCreatesRunAndSnapshotsAtomically(t *testing.T) {
+	repository := openTestRepository(t)
+	defer func() { require.NoError(t, repository.Close()) }()
+	ctx := context.Background()
+
+	created, err := repository.Create(ctx, workflow.Run{
+		Version: "v1", Name: "delivery-123", State: workflow.StatePending,
+	}, map[string]agent.AgentDefinition{
+		"reviewer": {Name: "reviewer", Instructions: "review"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), created.Revision)
+
+	definition, err := repository.Agent(ctx, "delivery-123", "reviewer")
+	require.NoError(t, err)
+	assert.Equal(t, "review", definition.Instructions)
+}
+
+func TestRepositoryRejectsStaleRunUpdate(t *testing.T) {
+	repository := openTestRepository(t)
+	defer func() { require.NoError(t, repository.Close()) }()
+	ctx := context.Background()
+	created, err := repository.Create(ctx, workflow.Run{
+		Version: "v1", Name: "delivery-123", State: workflow.StatePending,
+	}, nil)
+	require.NoError(t, err)
+
+	updated := created
+	updated.State = workflow.StateRunning
+	updated, err = repository.Update(ctx, updated)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), updated.Revision)
+
+	created.State = workflow.StateFailed
+	_, err = repository.Update(ctx, created)
+	assert.ErrorIs(t, err, workflow.ErrConcurrentUpdate)
+
+	current, err := repository.Run(ctx, "delivery-123")
+	require.NoError(t, err)
+	assert.Equal(t, workflow.StateRunning, current.State)
+}
+
+func TestRepositoryDeletesRunAndSnapshotsTogether(t *testing.T) {
+	repository := openTestRepository(t)
+	defer func() { require.NoError(t, repository.Close()) }()
+	ctx := context.Background()
+	_, err := repository.Create(ctx, workflow.Run{Version: "v1", Name: "delivery-123"}, map[string]agent.AgentDefinition{
+		"reviewer": {Name: "reviewer"},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, repository.Delete(ctx, "delivery-123"))
+	_, err = repository.Run(ctx, "delivery-123")
+	assert.ErrorIs(t, err, workflow.ErrRunNotFound)
+	_, err = repository.Agent(ctx, "delivery-123", "reviewer")
+	assert.ErrorIs(t, err, workflow.ErrRunNotFound)
+}
+
+func TestOpenRejectsUnsupportedURL(t *testing.T) {
+	_, err := Open(context.Background(), "mysql://localhost/dyne")
+	require.ErrorContains(t, err, "unsupported workflow database URL")
+}
+
+func TestOpenProtectsLocalFileAndReappliesNoSchemaChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflows.db")
+	repository, err := Open(context.Background(), "sqlite:"+path)
+	require.NoError(t, err)
+	require.NoError(t, repository.Close())
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+	repository, err = Open(context.Background(), "sqlite:"+path)
+	require.NoError(t, err)
+	require.NoError(t, repository.Close())
+}
+
+func openTestRepository(t *testing.T) *Repository {
+	t.Helper()
+	repository, err := Open(context.Background(), "sqlite::memory:")
+	require.NoError(t, err)
+
+	return repository
+}

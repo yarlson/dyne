@@ -17,6 +17,7 @@ type renderedResource struct {
 	Metadata  struct {
 		Name        string            `json:"name"`
 		Annotations map[string]string `json:"annotations"`
+		Labels      map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Data map[string]string `json:"data"`
 	Spec struct {
@@ -26,6 +27,7 @@ type renderedResource struct {
 					Name string `json:"name"`
 					Env  []struct {
 						Name      string `json:"name"`
+						Value     string `json:"value"`
 						ValueFrom *struct {
 							ConfigMapKeyRef struct {
 								Name string `json:"name"`
@@ -56,6 +58,41 @@ type renderedResource struct {
 			} `json:"spec"`
 		} `json:"template"`
 	} `json:"spec"`
+}
+
+func TestRenderSelectsWorkflowOutputResultContract(t *testing.T) {
+	spec := validSpec()
+	spec.ResultKind = ResultKindWorkflowOutput
+
+	manifest, err := renderSessionManifest(spec)
+	require.NoError(t, err)
+	resources := decodeRenderedResources(t, manifest)
+
+	var resultKind string
+	for _, environment := range resources["Job/example"].Spec.Template.Spec.Containers[0].Env {
+		if environment.Name == "AGENT_RESULT_KIND" {
+			resultKind = environment.Value
+		}
+	}
+
+	assert.Equal(t, "workflow-output", resultKind)
+}
+
+func TestRenderLabelsWorkflowOwnedSessionResources(t *testing.T) {
+	spec := validSpec()
+	spec.AgentName = "reviewer"
+	spec.Instructions = "Review the change."
+	spec.WorkflowRun = "change-123"
+	spec.WorkflowStep = "security"
+
+	manifest, err := renderSessionManifest(spec)
+	require.NoError(t, err)
+	resources := decodeRenderedResources(t, manifest)
+
+	for _, identity := range []string{"Job/example", "PersistentVolumeClaim/session-example", "ConfigMap/session-example-agent"} {
+		assert.Equal(t, "change-123", resources[identity].Metadata.Labels["coding-agent/workflow-run"], identity)
+		assert.Equal(t, "security", resources[identity].Metadata.Labels["coding-agent/workflow-step"], identity)
+	}
 }
 
 func TestRenderSelectsExplicitSessionStorage(t *testing.T) {

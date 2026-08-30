@@ -30,6 +30,9 @@ type sessionStartRequest struct {
 	cloneDepth   int
 	storageSize  string
 	timeout      time.Duration
+	resultKind   ResultKind
+	workflowRun  string
+	workflowStep string
 }
 
 type sessionContinueRequest struct {
@@ -58,6 +61,7 @@ type sessionCluster interface {
 	ContinueSession(context.Context, kubernetes.ContinuationRequest) error
 	SetGitHubToken(context.Context, string, string) error
 	CheckSessionAvailable(context.Context, string, string) error
+	CheckWorkflowSessionOwnership(context.Context, string, string, string, string) error
 	SessionStatus(context.Context, string, string) ([]kubernetes.ResourceStatus, error)
 	SessionArtifacts(context.Context, string, string) (kubernetes.TaskArtifacts, error)
 	WriteSessionLogs(context.Context, string, string, bool, io.Writer) error
@@ -130,7 +134,15 @@ func (c *sessionControl) start(ctx context.Context, request sessionStartRequest)
 	}
 
 	if err := c.cluster.CheckSessionAvailable(ctx, request.target.namespace, request.target.name); err != nil {
-		return err
+		if request.workflowRun == "" {
+			return err
+		}
+
+		if ownershipErr := c.cluster.CheckWorkflowSessionOwnership(
+			ctx, request.target.namespace, request.target.name, request.workflowRun, request.workflowStep,
+		); ownershipErr != nil {
+			return errors.Join(err, ownershipErr)
+		}
 	}
 
 	if err := c.refreshRepositoryCredential(ctx, request.target.namespace); err != nil {
@@ -191,7 +203,9 @@ func (c *sessionControl) artifacts(ctx context.Context, target sessionTarget) (A
 		return Artifacts{}, err
 	}
 
-	return Artifacts{Outcome: result.Outcome, PullRequest: result.PullRequest}, nil
+	return Artifacts{
+		Outcome: result.Outcome, PullRequest: result.PullRequest, WorkflowOutput: result.WorkflowOutput,
+	}, nil
 }
 
 func (c *sessionControl) writeLogs(ctx context.Context, request sessionLogRequest, output io.Writer) error {
@@ -311,6 +325,9 @@ func (request sessionStartRequest) kubernetesRequest() kubernetes.SessionRequest
 		CloneDepth:     request.cloneDepth,
 		StorageSize:    request.storageSize,
 		TimeoutSeconds: int64(request.timeout.Seconds()),
+		ResultKind:     kubernetes.ResultKind(request.resultKind),
+		WorkflowRun:    request.workflowRun,
+		WorkflowStep:   request.workflowStep,
 	}
 }
 

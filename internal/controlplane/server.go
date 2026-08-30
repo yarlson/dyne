@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/workflow"
 )
 
 const maxRequestBytes = 1 << 20
@@ -18,6 +19,8 @@ const maxRequestBytes = 1 << 20
 type Config struct {
 	// ErrorOutput receives full operation errors that are unsafe to return to clients.
 	ErrorOutput io.Writer
+	// Workflows enables durable workflow routes when configured.
+	Workflows workflowOperations
 }
 
 type operations interface {
@@ -30,6 +33,15 @@ type operations interface {
 	Delete(context.Context, string) error
 	Destroy(context.Context, string) error
 	Publish(context.Context, agent.PublishRequest) (agent.PublishResult, error)
+}
+
+type workflowOperations interface {
+	Workflows() []workflow.Summary
+	Start(context.Context, workflow.StartRequest) (workflow.Run, error)
+	Get(context.Context, string) (workflow.Run, error)
+	Artifacts(context.Context, string) (workflow.Artifacts, error)
+	Cancel(context.Context, string) error
+	Delete(context.Context, string) error
 }
 
 // New returns the private-network HTTP control plane for one cluster and namespace.
@@ -48,8 +60,90 @@ func New(control operations, config Config) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{name}/artifacts", server.sessionArtifacts)
 	mux.HandleFunc("POST /v1/sessions/{name}/publish", server.publishSession)
 	mux.HandleFunc("DELETE /v1/sessions/{name}", server.deleteSession)
+	if config.Workflows != nil {
+		mux.HandleFunc("GET /v1/workflows", server.listWorkflows)
+		mux.HandleFunc("POST /v1/workflows/{workflow}/runs", server.createWorkflowRun)
+		mux.HandleFunc("GET /v1/workflow-runs/{name}", server.workflowRunStatus)
+		mux.HandleFunc("GET /v1/workflow-runs/{name}/artifacts", server.workflowRunArtifacts)
+		mux.HandleFunc("POST /v1/workflow-runs/{name}/cancel", server.cancelWorkflowRun)
+		mux.HandleFunc("DELETE /v1/workflow-runs/{name}", server.deleteWorkflowRun)
+	}
 
 	return mux
+}
+
+func (s *server) listWorkflows(writer http.ResponseWriter, _ *http.Request) {
+	writeJSON(writer, http.StatusOK, struct {
+		Workflows []workflow.Summary `json:"workflows"`
+	}{Workflows: s.config.Workflows.Workflows()})
+}
+
+func (s *server) createWorkflowRun(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Name       string `json:"name"`
+		Repository string `json:"repository"`
+		Ref        string `json:"ref"`
+		Prompt     string `json:"prompt"`
+	}
+	if err := decodeJSON(writer, request, &input); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+
+		return
+	}
+
+	run, err := s.config.Workflows.Start(request.Context(), workflow.StartRequest{
+		Workflow: request.PathValue("workflow"), Name: input.Name,
+		Repository: input.Repository, Ref: input.Ref, Prompt: input.Prompt,
+	})
+	if err != nil {
+		s.writeWorkflowError(writer, err)
+
+		return
+	}
+
+	writeJSON(writer, http.StatusAccepted, run)
+}
+
+func (s *server) workflowRunStatus(writer http.ResponseWriter, request *http.Request) {
+	run, err := s.config.Workflows.Get(request.Context(), request.PathValue("name"))
+	if err != nil {
+		s.writeWorkflowError(writer, err)
+
+		return
+	}
+
+	writeJSON(writer, http.StatusOK, run)
+}
+
+func (s *server) workflowRunArtifacts(writer http.ResponseWriter, request *http.Request) {
+	artifacts, err := s.config.Workflows.Artifacts(request.Context(), request.PathValue("name"))
+	if err != nil {
+		s.writeWorkflowError(writer, err)
+
+		return
+	}
+
+	writeJSON(writer, http.StatusOK, artifacts)
+}
+
+func (s *server) cancelWorkflowRun(writer http.ResponseWriter, request *http.Request) {
+	if err := s.config.Workflows.Cancel(request.Context(), request.PathValue("name")); err != nil {
+		s.writeWorkflowError(writer, err)
+
+		return
+	}
+
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) deleteWorkflowRun(writer http.ResponseWriter, request *http.Request) {
+	if err := s.config.Workflows.Delete(request.Context(), request.PathValue("name")); err != nil {
+		s.writeWorkflowError(writer, err)
+
+		return
+	}
+
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 type server struct {
@@ -258,6 +352,27 @@ func (s *server) writeOperationError(writer http.ResponseWriter, err error) {
 	case agent.ErrorNotFound:
 		status, message = http.StatusNotFound, err.Error()
 	case agent.ErrorUnavailable:
+		status, message = http.StatusServiceUnavailable, err.Error()
+	}
+
+	if status >= http.StatusInternalServerError {
+		s.logOperationError(err)
+	}
+
+	writeError(writer, status, errors.New(message))
+}
+
+func (s *server) writeWorkflowError(writer http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	message := "operation failed"
+	switch workflow.ErrorKindOf(err) {
+	case workflow.ErrorInvalid:
+		status, message = http.StatusBadRequest, err.Error()
+	case workflow.ErrorNotFound:
+		status, message = http.StatusNotFound, err.Error()
+	case workflow.ErrorConflict:
+		status, message = http.StatusConflict, err.Error()
+	case workflow.ErrorUnavailable:
 		status, message = http.StatusServiceUnavailable, err.Error()
 	}
 

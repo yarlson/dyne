@@ -1,10 +1,12 @@
 # dyne
 
-dyne is a small HTTP control plane for coding-agent Jobs on Kubernetes. One server owns one cluster connection and one existing namespace. The CLI talks only to that server; it never loads kubeconfig, AWS credentials, a GitHub App key, or a GitHub token.
+dyne is a small HTTP control plane for coding-agent Jobs and durable multi-agent workflows. One server owns one cluster connection and one existing namespace. The CLI talks only to that server; it never loads kubeconfig, AWS credentials, a GitHub App key, or a GitHub token.
 
 ## Runtime model
 
 Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, artifacts, and session definition. A continuation is another Job mounted to the same PVC. An agent-backed session also owns an immutable ConfigMap containing its developer instructions and selected instruction-only skills.
+
+A workflow is an immutable directed acyclic graph of isolated sessions. Steps never share a workspace or PVC. Dependency steps return bounded JSON outputs that dyne stores in SQL and includes in the direct dependent step's prompt. Independent ready steps can run concurrently up to the workflow's configured limit. At most one persistent leaf is publishable; all other steps are ephemeral findings.
 
 This keeps recovery simple:
 
@@ -12,12 +14,13 @@ This keeps recovery simple:
 - A new `dyne task` continues the retained Codex thread and workspace after a task completes or fails.
 - The PVC stores the immutable session definition, so continuation still works after the old Jobs are deleted or the dyne server restarts.
 - `dyne delete` removes Jobs and keeps a persistent session's PVC and agent configuration. `dyne delete --storage` also deletes retained state.
+- SQLite stores workflow state for a local server. PostgreSQL stores the same state in production. SQL transactions retain run intent, resolved agent snapshots, step results, cancellation, and cleanup progress across server restarts.
 
 The namespace must already exist and enforce the security policy appropriate for the cluster. Codex credentials must already exist in a Secret named `coding-agent-auth`. The Secret can contain `auth.json` or `CODEX_API_KEY`. Repository credentials are not stored there.
 
 ## Security boundary
 
-The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations. Agent definitions, instructions, skills, setup commands, and task prompts must not contain secrets. Principals allowed to read the server file, ConfigMaps, or Pod specifications can read those values.
+The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations. Agent definitions, instructions, skills, setup commands, and task prompts must not contain secrets. Principals allowed to read the server files, workflow database, ConfigMaps, or Pod specifications can read those values.
 
 Agent Pods run as UID/GID 1000 with a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, no privilege escalation, bounded resources, and denied ingress. The agent can still access the network and its Codex credential. dyne is intended for trusted repositories in a private cluster, not hostile multi-tenant execution.
 
@@ -45,6 +48,8 @@ Example with kubeconfig:
   --context colima-codex-proof \
   --namespace coding-agents \
   --agents-file ./agents.yaml \
+  --workflows-file ./workflows.yaml \
+  --database-url sqlite:dyne.db \
   --github-app-id 123 \
   --github-installation-id 456 \
   --github-private-key-file /secure/dyne-app.pem
@@ -59,10 +64,14 @@ Example with EKS and an assumed role:
   --aws-role-arn arn:aws:iam::123456789012:role/dyne-control-plane \
   --namespace coding-agents \
   --agents-file ./agents.yaml \
+  --workflows-file ./workflows.yaml \
+  --database-url "$DYNE_DATABASE_URL" \
   --github-app-id 123 \
   --github-installation-id 456 \
   --github-private-key-file /secure/dyne-app.pem
 ```
+
+`--workflows-file` is optional. Without it, the server does not open workflow storage or expose workflow routes. `--database-url` accepts `sqlite:path`, `postgres://...`, or `postgresql://...`; `DYNE_DATABASE_URL` supplies the default flag value. The server prepares and versions the SQL schema at startup. Use a local SQLite file for one local process and an externally managed PostgreSQL database for a production server.
 
 ## Define agents
 
@@ -112,6 +121,49 @@ dyne start \
 
 The repository, ref, prompt, session name, and optional timeout belong to the session instance. Storage, setup, clone depth, storage size, instructions, and skills belong to the agent definition and cannot be overridden by the client.
 
+## Define and run workflows
+
+Workflow definitions are loaded separately and resolve every named agent when the server starts. Non-publishable steps require ephemeral agents. The optional publishable step must use a persistent agent and must be a leaf.
+
+```yaml
+version: v1
+
+workflows:
+  delivery:
+    description: Review two concerns, then implement the change.
+    max_parallelism: 2
+    steps:
+      security:
+        agent: reviewer
+        prompt: Review the trust boundary and return structured findings.
+      tests:
+        agent: reviewer
+        prompt: Review test gaps and return structured findings.
+      implement:
+        agent: implementer
+        prompt: Implement the requested change using the review outputs.
+        after: [security, tests]
+        publishable: true
+```
+
+Start and inspect a durable run:
+
+```bash
+dyne workflows
+dyne workflow-start \
+  --workflow delivery \
+  --name change-123 \
+  --repo https://github.com/example/project.git \
+  --prompt 'Fix the parser without changing its public contract.'
+
+dyne workflow-status --name change-123
+dyne workflow-artifacts --name change-123
+```
+
+The run snapshots the workflow and resolved agent definitions in the database. Later edits to either YAML file affect only new runs. A failed or blocked step skips its descendants while independent branches continue. `dyne workflow-cancel` records cancellation before deleting active compute. `dyne workflow-delete` is accepted only for a terminal run, destroys every step session and retained workspace, then deletes SQL state.
+
+To publish a completed workflow, read `publishable_session` from `dyne workflow-artifacts` and pass that session name to the existing `dyne publish` command. Publishing remains explicit and uses the existing idempotent session publishing contract.
+
 ## Run and continue sessions
 
 Client commands use `--server` or `DYNE_SERVER`; the default is `http://127.0.0.1:8080`.
@@ -136,7 +188,7 @@ The selected agent definition controls storage and setup. Sessions created from 
 
 A task can finish as completed, blocked, or failed. A blocked result is valid and must identify the blocker; dyne does not turn missing information or a sandbox limitation into false success.
 
-The agent writes `outcome.json` for every successful invocation. Completed work also writes `pull-request.json` with a title and description. The harness validates these files and asks the same Codex thread to recreate invalid files once. The files remain on persistent storage, and their bounded API representation is available through `dyne artifacts`.
+The agent writes `outcome.json` for every successful invocation. A completed standalone or publishable task also writes `pull-request.json` with a title and description. A completed non-publishable workflow step writes a bounded `workflow-output.json` object instead. The harness validates the selected result contract, enforces the Kubernetes termination-message limit, and asks the same Codex thread to recreate invalid files once. Persistent session files remain on the PVC; workflow outputs are copied into SQL before dyne deletes completed ephemeral sessions.
 
 Publishing is explicit:
 
@@ -161,6 +213,12 @@ The CLI uses the agent creation endpoint and the session lifecycle endpoints:
 - `GET /v1/sessions/{name}/artifacts`
 - `POST /v1/sessions/{name}/publish`
 - `DELETE /v1/sessions/{name}?storage=delete`
+- `GET /v1/workflows`
+- `POST /v1/workflows/{workflow}/runs`
+- `GET /v1/workflow-runs/{name}`
+- `GET /v1/workflow-runs/{name}/artifacts`
+- `POST /v1/workflow-runs/{name}/cancel`
+- `DELETE /v1/workflow-runs/{name}`
 
 Session creation and continuation return `202 Accepted` after Kubernetes accepts the resources. Coding continues asynchronously.
 
@@ -168,6 +226,7 @@ Session creation and continuation return `202 Accepted` after Kubernetes accepts
 
 ```bash
 make doctor
+make generate
 make check BINARY=./bin/dyne
 make image
 make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/workflow"
 )
 
 func TestCreateSessionDoesNotExposeRawSessionContract(t *testing.T) {
@@ -81,6 +82,45 @@ func TestCreateAgentSessionDelegatesOnlyClientOwnedInputs(t *testing.T) {
 		Timeout:    30 * time.Minute,
 	}, received)
 	assert.JSONEq(t, `{"agent":"implementer","name":"change-123","task_id":"change-123"}`, response.Body.String())
+}
+
+func TestWorkflowRoutesDelegateDurableRunOperations(t *testing.T) {
+	var started workflow.StartRequest
+	var canceled string
+	workflows := workflowOperationsStub{
+		workflows: []workflow.Summary{{Name: "delivery", Description: "Review then implement.", MaxParallelism: 2, Steps: 3}},
+		start: func(_ context.Context, request workflow.StartRequest) (workflow.Run, error) {
+			started = request
+
+			return workflow.Run{Name: request.Name, Workflow: request.Workflow, State: workflow.StatePending}, nil
+		},
+		cancel: func(_ context.Context, name string) error {
+			canceled = name
+
+			return nil
+		},
+	}
+	server := New(operationsStub{}, Config{Workflows: workflows})
+
+	listResponse := httptest.NewRecorder()
+	server.ServeHTTP(listResponse, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/workflows", nil))
+	require.Equal(t, http.StatusOK, listResponse.Code)
+	assert.JSONEq(t, `{"workflows":[{"name":"delivery","description":"Review then implement.","max_parallelism":2,"steps":3}]}`, listResponse.Body.String())
+
+	startResponse := httptest.NewRecorder()
+	server.ServeHTTP(startResponse, httptest.NewRequestWithContext(
+		context.Background(), http.MethodPost, "/v1/workflows/delivery/runs",
+		strings.NewReader(`{"name":"change-123","repository":"https://github.com/lokalise/kargo.git","ref":"main","prompt":"fix it"}`),
+	))
+	require.Equal(t, http.StatusAccepted, startResponse.Code)
+	assert.Equal(t, workflow.StartRequest{
+		Workflow: "delivery", Name: "change-123", Repository: "https://github.com/lokalise/kargo.git", Ref: "main", Prompt: "fix it",
+	}, started)
+
+	cancelResponse := httptest.NewRecorder()
+	server.ServeHTTP(cancelResponse, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/workflow-runs/change-123/cancel", nil))
+	assert.Equal(t, http.StatusNoContent, cancelResponse.Code)
+	assert.Equal(t, "change-123", canceled)
 }
 
 func TestCreateAgentSessionReturnsNotFoundForUnknownAgent(t *testing.T) {
@@ -196,6 +236,37 @@ type operationsStub struct {
 	status       func(context.Context, string) (agent.Status, error)
 	publish      func(context.Context, agent.PublishRequest) (agent.PublishResult, error)
 	writeLogs    func(context.Context, string, bool, io.Writer) error
+}
+
+type workflowOperationsStub struct {
+	workflows []workflow.Summary
+	start     func(context.Context, workflow.StartRequest) (workflow.Run, error)
+	get       func(context.Context, string) (workflow.Run, error)
+	artifacts func(context.Context, string) (workflow.Artifacts, error)
+	cancel    func(context.Context, string) error
+	delete    func(context.Context, string) error
+}
+
+func (s workflowOperationsStub) Workflows() []workflow.Summary { return s.workflows }
+
+func (s workflowOperationsStub) Start(ctx context.Context, request workflow.StartRequest) (workflow.Run, error) {
+	return s.start(ctx, request)
+}
+
+func (s workflowOperationsStub) Get(ctx context.Context, name string) (workflow.Run, error) {
+	return s.get(ctx, name)
+}
+
+func (s workflowOperationsStub) Artifacts(ctx context.Context, name string) (workflow.Artifacts, error) {
+	return s.artifacts(ctx, name)
+}
+
+func (s workflowOperationsStub) Cancel(ctx context.Context, name string) error {
+	return s.cancel(ctx, name)
+}
+
+func (s workflowOperationsStub) Delete(ctx context.Context, name string) error {
+	return s.delete(ctx, name)
 }
 
 func (s operationsStub) Agents() []agent.AgentSummary { return s.agents }

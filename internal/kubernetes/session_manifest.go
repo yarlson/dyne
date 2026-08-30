@@ -38,6 +38,9 @@ type sessionManifestSpec struct {
 	CloneDepth     int
 	StorageSize    string
 	TimeoutSeconds int64
+	ResultKind     ResultKind
+	WorkflowRun    string
+	WorkflowStep   string
 }
 
 type manifestResource map[string]any
@@ -51,6 +54,10 @@ type manifestResourceList struct {
 var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
 func (s sessionManifestSpec) validate(initial bool) error {
+	if s.ResultKind == "" {
+		s.ResultKind = ResultKindPullRequest
+	}
+
 	if !dnsLabelPattern.MatchString(s.Name) || len(s.Name) > 40 {
 		return errors.New("name must be a lowercase DNS label no longer than 40 characters")
 	}
@@ -61,6 +68,20 @@ func (s sessionManifestSpec) validate(initial bool) error {
 
 	if s.TaskName != "" && (!dnsLabelPattern.MatchString(s.TaskName) || len(s.TaskName) > 63) {
 		return errors.New("task name must be a lowercase DNS label no longer than 63 characters")
+	}
+
+	if (s.WorkflowRun == "") != (s.WorkflowStep == "") {
+		return errors.New("workflow run and step must be provided together")
+	}
+
+	if s.WorkflowRun != "" {
+		if !dnsLabelPattern.MatchString(s.WorkflowRun) || len(s.WorkflowRun) > 40 {
+			return errors.New("workflow run must be a lowercase DNS label no longer than 40 characters")
+		}
+
+		if !dnsLabelPattern.MatchString(s.WorkflowStep) || len(s.WorkflowStep) > 63 {
+			return errors.New("workflow step must be a lowercase DNS label no longer than 63 characters")
+		}
 	}
 
 	if strings.TrimSpace(s.Image) == "" {
@@ -118,6 +139,12 @@ func (s sessionManifestSpec) validate(initial bool) error {
 	case SessionStorageEphemeral, SessionStoragePersistent:
 	default:
 		return fmt.Errorf("unsupported storage %q", s.Storage)
+	}
+
+	switch s.ResultKind {
+	case "", ResultKindPullRequest, ResultKindWorkflowOutput:
+	default:
+		return fmt.Errorf("unsupported result kind %q", s.ResultKind)
 	}
 
 	return nil
@@ -199,7 +226,7 @@ func persistentVolumeClaim(s sessionManifestSpec) manifestResource {
 		"metadata": map[string]any{
 			"name":        sessionClaimName(s.Name),
 			"namespace":   s.Namespace,
-			"labels":      sessionLabels(s.Name),
+			"labels":      sessionLabelsFor(s),
 			"annotations": annotations,
 		},
 		"spec": map[string]any{
@@ -213,7 +240,7 @@ func persistentVolumeClaim(s sessionManifestSpec) manifestResource {
 
 func sessionJob(s sessionManifestSpec) manifestResource {
 	name := taskName(s)
-	labels := sessionLabels(s.Name)
+	labels := sessionLabelsFor(s)
 	labels["coding-agent/task"] = name
 
 	return manifestResource{
@@ -320,6 +347,7 @@ func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceR
 		map[string]any{"name": "AGENT_TASK_ID", "value": taskName(s)},
 		map[string]any{"name": "AGENT_RESUME", "value": fmt.Sprintf("%t", s.Resume)},
 		map[string]any{"name": "AGENT_CLONE_DEPTH", "value": fmt.Sprintf("%d", s.CloneDepth)},
+		map[string]any{"name": "AGENT_RESULT_KIND", "value": string(resultKind(s.ResultKind))},
 		map[string]any{"name": "HOME", "value": "/home/agent"},
 		map[string]any{"name": "CODEX_HOME", "value": "/codex"},
 		map[string]any{"name": "MISE_DATA_DIR", "value": "/home/agent/.local/share/mise"},
@@ -365,8 +393,16 @@ func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceR
 	}
 }
 
+func resultKind(kind ResultKind) ResultKind {
+	if kind == "" {
+		return ResultKindPullRequest
+	}
+
+	return kind
+}
+
 func taskLabels(s sessionManifestSpec) map[string]any {
-	labels := sessionLabels(s.Name)
+	labels := sessionLabelsFor(s)
 	labels["coding-agent/task"] = taskName(s)
 
 	return labels
@@ -455,7 +491,7 @@ func agentConfigMap(s sessionManifestSpec) manifestResource {
 		"metadata": map[string]any{
 			"name":        sessionAgentConfigName(s.Name),
 			"namespace":   s.Namespace,
-			"labels":      sessionLabels(s.Name),
+			"labels":      sessionLabelsFor(s),
 			"annotations": map[string]any{sessionAgentAnnotation: s.AgentName},
 		},
 		"immutable": true,
@@ -494,4 +530,14 @@ func sessionLabels(session string) map[string]any {
 		"app.kubernetes.io/managed-by": "dyne",
 		"coding-agent/session":         session,
 	}
+}
+
+func sessionLabelsFor(s sessionManifestSpec) map[string]any {
+	labels := sessionLabels(s.Name)
+	if s.WorkflowRun != "" {
+		labels["coding-agent/workflow-run"] = s.WorkflowRun
+		labels["coding-agent/workflow-step"] = s.WorkflowStep
+	}
+
+	return labels
 }

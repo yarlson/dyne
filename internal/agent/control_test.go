@@ -90,6 +90,39 @@ func TestStartChecksOwnershipBeforeApplyingSession(t *testing.T) {
 	assert.Equal(t, []string{"check", "apply"}, operations)
 }
 
+func TestWorkflowStartReappliesResourcesAfterMatchingAmbiguousOutcome(t *testing.T) {
+	conflict := errors.New("session already exists")
+	var operations []string
+	cluster := startCluster{
+		check: func(context.Context, string, string) error {
+			operations = append(operations, "check")
+
+			return conflict
+		},
+		ownership: func(_ context.Context, namespace, name, run, step string) error {
+			operations = append(operations, "ownership")
+			assert.Equal(t, "coding-agents", namespace)
+			assert.Equal(t, "review", name)
+			assert.Equal(t, "change-123", run)
+			assert.Equal(t, "security", step)
+
+			return nil
+		},
+		create: func(context.Context, kubernetes.SessionRequest) error {
+			operations = append(operations, "apply")
+
+			return nil
+		},
+	}
+	control := &sessionControl{cluster: cluster}
+	request := validUpdateStartRequest()
+	request.workflowRun = "change-123"
+	request.workflowStep = "security"
+
+	require.NoError(t, control.start(context.Background(), request))
+	assert.Equal(t, []string{"check", "ownership", "apply"}, operations)
+}
+
 func TestContinueCreatesResumableJobAgainstPersistentSession(t *testing.T) {
 	cluster := continuationCluster{
 		continueTask: func(_ context.Context, request kubernetes.ContinuationRequest) error {
@@ -165,8 +198,13 @@ func TestPublishRejectsInvalidTargetWithoutStartingPublication(t *testing.T) {
 
 type startCluster struct {
 	sessionCluster
-	check  func(context.Context, string, string) error
-	create func(context.Context, kubernetes.SessionRequest) error
+	check     func(context.Context, string, string) error
+	ownership func(context.Context, string, string, string, string) error
+	create    func(context.Context, kubernetes.SessionRequest) error
+}
+
+func (c startCluster) CheckWorkflowSessionOwnership(ctx context.Context, namespace, name, run, step string) error {
+	return c.ownership(ctx, namespace, name, run, step)
 }
 
 func (c startCluster) CheckSessionAvailable(ctx context.Context, namespace, name string) error {
