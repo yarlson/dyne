@@ -34,7 +34,7 @@ integration-test: ## Run live Kubernetes tests with KUBERNETES_INTEGRATION_CONTE
 .PHONY: e2e-test
 e2e-test: image ## Run coding-session journeys on an isolated Kubernetes context
 	@test -n "$(KUBERNETES_INTEGRATION_CONTEXT)" || { printf 'KUBERNETES_INTEGRATION_CONTEXT is required\n'; exit 1; }
-	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" E2E_IMAGE="$(IMAGE)" go test -tags=integration -count=1 -timeout=20m ./e2e
+	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" E2E_IMAGE="$(IMAGE)" go test -tags=integration -count=1 -timeout=20m ./test/e2e
 
 .PHONY: coverage
 coverage: ## Write coverage.out
