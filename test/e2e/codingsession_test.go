@@ -23,7 +23,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/yarlson/airlock/internal/agent"
+	"github.com/yarlson/dyne/internal/agent"
 )
 
 const (
@@ -237,8 +237,8 @@ func newTestEnvironment(t *testing.T) testEnvironment {
 	t.Cleanup(cancel)
 	client := newKubernetesClient(t, contextName)
 	suffix := randomSuffix(t)
-	sessionNamespace := "airlock-e2e-" + suffix
-	fixtureNamespace := "airlock-git-" + suffix
+	sessionNamespace := "dyne-e2e-" + suffix
+	fixtureNamespace := "dyne-git-" + suffix
 	registerNamespaceCleanup(t, client, sessionNamespace, fixtureNamespace)
 	_, err := client.CoreV1().Namespaces().Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 		Name: sessionNamespace,

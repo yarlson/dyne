@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/yarlson/airlock/internal/sessionmanifest"
+	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 const (

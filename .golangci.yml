@@ -40,11 +40,11 @@ formatters:
     generated: lax
   settings:
     gofumpt:
-      module-path: github.com/yarlson/airlock
+      module-path: github.com/yarlson/dyne
       extra-rules: true
     goimports:
       local-prefixes:
-        - github.com/yarlson/airlock
+        - github.com/yarlson/dyne
     gci:
       sections:
         - standard

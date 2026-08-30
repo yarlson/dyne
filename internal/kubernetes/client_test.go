@@ -17,7 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/yarlson/airlock/internal/sessionmanifest"
+	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 func TestSessionStatusDescribesOwnedResources(t *testing.T) {
@@ -93,11 +93,11 @@ func TestPersistentSessionDefinitionSurvivesWorkloadDeletion(t *testing.T) {
 			Namespace: "coding-agents",
 			Labels:    labels,
 			Annotations: map[string]string{
-				"airlock.yarlson.dev/image":       "coding-agent:test",
-				"airlock.yarlson.dev/repository":  "https://github.com/lokalise/kargo.git",
-				"airlock.yarlson.dev/initial-ref": "main",
-				"airlock.yarlson.dev/setup":       "make tools",
-				"airlock.yarlson.dev/clone-depth": "1",
+				"dyne.yarlson.dev/image":       "coding-agent:test",
+				"dyne.yarlson.dev/repository":  "https://github.com/lokalise/kargo.git",
+				"dyne.yarlson.dev/initial-ref": "main",
+				"dyne.yarlson.dev/setup":       "make tools",
+				"dyne.yarlson.dev/clone-depth": "1",
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{Resources: corev1.VolumeResourceRequirements{
@@ -125,10 +125,10 @@ func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testin
 			Namespace: "coding-agents",
 			Labels:    labels,
 			Annotations: map[string]string{
-				"airlock.yarlson.dev/image":       "coding-agent:test",
-				"airlock.yarlson.dev/initial-ref": "main",
-				"airlock.yarlson.dev/clone-depth": "1",
-				"airlock.yarlson.dev/agent":       "reviewer",
+				"dyne.yarlson.dev/image":       "coding-agent:test",
+				"dyne.yarlson.dev/initial-ref": "main",
+				"dyne.yarlson.dev/clone-depth": "1",
+				"dyne.yarlson.dev/agent":       "reviewer",
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{Resources: corev1.VolumeResourceRequirements{
@@ -147,7 +147,7 @@ func TestPersistentAgentSessionDefinitionRequiresRetainedConfiguration(t *testin
 			Name:        sessionmanifest.SessionAgentConfigName("example"),
 			Namespace:   "coding-agents",
 			Labels:      labels,
-			Annotations: map[string]string{"airlock.yarlson.dev/agent": "reviewer"},
+			Annotations: map[string]string{"dyne.yarlson.dev/agent": "reviewer"},
 		},
 		Immutable: &immutable,
 		Data: map[string]string{

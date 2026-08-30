@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yarlson/airlock/internal/github"
-	"github.com/yarlson/airlock/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/github"
+	"github.com/yarlson/dyne/internal/kubernetes"
 )
 
 // Request defines one idempotent workspace publish operation.

@@ -46,7 +46,7 @@ func New(token string) (*Client, error) {
 		Timeout:   30 * time.Second,
 	}
 	api := gh.NewClient(httpClient).WithAuthToken(token)
-	api.UserAgent = "airlock"
+	api.UserAgent = "dyne"
 
 	return &Client{
 		api:          api,

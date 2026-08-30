@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yarlson/airlock/internal/kubernetes"
-	"github.com/yarlson/airlock/internal/publish"
+	"github.com/yarlson/dyne/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/publish"
 )
 
 func TestConnectRejectsMissingOutputBeforeLoadingKubeconfig(t *testing.T) {

@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/yarlson/airlock/internal/sessionmanifest"
+	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 func TestSessionPublishSourceReturnsCompletedUpdateWorkspace(t *testing.T) {
@@ -256,10 +256,10 @@ func boundWorkspaceClaim() *corev1.PersistentVolumeClaim {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "session-review", Namespace: "coding-agents",
 			Annotations: map[string]string{
-				"airlock.yarlson.dev/image":       "coding-agent:test",
-				"airlock.yarlson.dev/repository":  "https://github.com/lokalise/kargo.git",
-				"airlock.yarlson.dev/initial-ref": "main",
-				"airlock.yarlson.dev/clone-depth": "1",
+				"dyne.yarlson.dev/image":       "coding-agent:test",
+				"dyne.yarlson.dev/repository":  "https://github.com/lokalise/kargo.git",
+				"dyne.yarlson.dev/initial-ref": "main",
+				"dyne.yarlson.dev/clone-depth": "1",
 			},
 		},
 		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},

@@ -27,7 +27,7 @@ func TestLoadConnectionConfigSelectsExplicitEKS(t *testing.T) {
 		eks: func(_ context.Context, config ConnectionConfig) (*rest.Config, error) {
 			assert.Equal(t, "production", config.EKSCluster)
 			assert.Equal(t, "eu-west-1", config.AWSRegion)
-			assert.Equal(t, "arn:aws:iam::123456789012:role/airlock", config.AWSRoleARN)
+			assert.Equal(t, "arn:aws:iam::123456789012:role/dyne", config.AWSRoleARN)
 
 			return want, nil
 		},
@@ -36,7 +36,7 @@ func TestLoadConnectionConfigSelectsExplicitEKS(t *testing.T) {
 	got, err := loadConnectionConfig(context.Background(), ConnectionConfig{
 		EKSCluster: "production",
 		AWSRegion:  "eu-west-1",
-		AWSRoleARN: "arn:aws:iam::123456789012:role/airlock",
+		AWSRoleARN: "arn:aws:iam::123456789012:role/dyne",
 	}, loaders)
 	require.NoError(t, err)
 	assert.Same(t, want, got)

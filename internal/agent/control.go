@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yarlson/airlock/internal/kubernetes"
-	"github.com/yarlson/airlock/internal/publish"
-	"github.com/yarlson/airlock/internal/sessionmanifest"
+	"github.com/yarlson/dyne/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/publish"
+	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 type sessionTarget struct {

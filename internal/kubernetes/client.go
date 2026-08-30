@@ -27,10 +27,10 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/util/retry"
 
-	"github.com/yarlson/airlock/internal/sessionmanifest"
+	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
-const fieldManagerName = "airlock"
+const fieldManagerName = "dyne"
 
 var errRetainedSessionNotFound = errors.New("retained session does not exist")
 

@@ -19,17 +19,17 @@ const (
 	codexAuthSecretName   = "coding-agent-auth"
 	maxAgentConfigBytes   = 900 * 1024
 	// SessionImageAnnotation stores the image in a retained session definition.
-	SessionImageAnnotation = "airlock.yarlson.dev/image"
+	SessionImageAnnotation = "dyne.yarlson.dev/image"
 	// SessionRepositoryAnnotation stores the repository in a retained session definition.
-	SessionRepositoryAnnotation = "airlock.yarlson.dev/repository"
+	SessionRepositoryAnnotation = "dyne.yarlson.dev/repository"
 	// SessionInitialRefAnnotation stores the initial ref in a retained session definition.
-	SessionInitialRefAnnotation = "airlock.yarlson.dev/initial-ref"
+	SessionInitialRefAnnotation = "dyne.yarlson.dev/initial-ref"
 	// SessionSetupAnnotation stores the setup command in a retained session definition.
-	SessionSetupAnnotation = "airlock.yarlson.dev/setup"
+	SessionSetupAnnotation = "dyne.yarlson.dev/setup"
 	// SessionCloneDepthAnnotation stores the clone depth in a retained session definition.
-	SessionCloneDepthAnnotation = "airlock.yarlson.dev/clone-depth"
+	SessionCloneDepthAnnotation = "dyne.yarlson.dev/clone-depth"
 	// SessionAgentAnnotation stores the configured agent name in retained resources.
-	SessionAgentAnnotation = "airlock.yarlson.dev/agent"
+	SessionAgentAnnotation = "dyne.yarlson.dev/agent"
 )
 
 // Storage controls whether a session retains state after its task Pod is removed.
@@ -541,7 +541,7 @@ func validateAgentSkills(skills []AgentSkill) error {
 func sessionLabels(session string) map[string]any {
 	return map[string]any{
 		"app.kubernetes.io/name":       "coding-agent",
-		"app.kubernetes.io/managed-by": "airlock",
+		"app.kubernetes.io/managed-by": "dyne",
 		"coding-agent/session":         session,
 	}
 }

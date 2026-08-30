@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/yarlson/airlock/internal/agent"
+	"github.com/yarlson/dyne/internal/agent"
 )
 
 const maxRequestBytes = 1 << 20

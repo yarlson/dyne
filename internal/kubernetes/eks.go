@@ -124,7 +124,7 @@ func newEKSTokenGenerator(awsConfig aws.Config, clusterName string) func(context
 
 func addEKSClusterIDHeader(clusterName string) func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
-		return stack.Build.Add(middleware.BuildMiddlewareFunc("AirlockEKSClusterID", func(
+		return stack.Build.Add(middleware.BuildMiddlewareFunc("dyneEKSClusterID", func(
 			ctx context.Context,
 			input middleware.BuildInput,
 			next middleware.BuildHandler,

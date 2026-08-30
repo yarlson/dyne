@@ -1,6 +1,6 @@
-# Airlock
+# dyne
 
-Airlock is a small HTTP control plane for coding-agent Jobs on Kubernetes. One server owns one cluster connection and one existing namespace. The CLI talks only to that server; it never loads kubeconfig, AWS credentials, a GitHub App key, or a GitHub token.
+dyne is a small HTTP control plane for coding-agent Jobs on Kubernetes. One server owns one cluster connection and one existing namespace. The CLI talks only to that server; it never loads kubeconfig, AWS credentials, a GitHub App key, or a GitHub token.
 
 ## Runtime model
 
@@ -9,9 +9,9 @@ Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`
 This keeps recovery simple:
 
 - Kubernetes replaces a failed task Pod. Persistent work written before the failure remains on the PVC.
-- A new `airlock task` continues the retained Codex thread and workspace after a task completes or fails.
-- The PVC stores the immutable session definition, so continuation still works after the old Jobs are deleted or the Airlock server restarts.
-- `airlock delete` removes Jobs and keeps a persistent session's PVC and agent configuration. `airlock delete --storage` also deletes retained state.
+- A new `dyne task` continues the retained Codex thread and workspace after a task completes or fails.
+- The PVC stores the immutable session definition, so continuation still works after the old Jobs are deleted or the dyne server restarts.
+- `dyne delete` removes Jobs and keeps a persistent session's PVC and agent configuration. `dyne delete --storage` also deletes retained state.
 
 The namespace must already exist and enforce the security policy appropriate for the cluster. Codex credentials must already exist in a Secret named `coding-agent-auth`. The Secret can contain `auth.json` or `CODEX_API_KEY`. Repository credentials are not stored there.
 
@@ -19,16 +19,16 @@ The namespace must already exist and enforce the security policy appropriate for
 
 The agent Pod has no service-account token and never receives GitHub credentials. A short-lived GitHub App installation token is mounted only into the clone init container and the publisher Job. The server refreshes that token before clone and publish operations. Agent definitions, instructions, skills, setup commands, and task prompts must not contain secrets. Principals allowed to read the server file, ConfigMaps, or Pod specifications can read those values.
 
-Agent Pods run as UID/GID 1000 with a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, no privilege escalation, bounded resources, and denied ingress. The agent can still access the network and its Codex credential. Airlock is intended for trusted repositories in a private cluster, not hostile multi-tenant execution.
+Agent Pods run as UID/GID 1000 with a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, no privilege escalation, bounded resources, and denied ingress. The agent can still access the network and its Codex credential. dyne is intended for trusted repositories in a private cluster, not hostile multi-tenant execution.
 
 The HTTP API has no application authentication. It listens on `127.0.0.1:8080` by default. If it runs in Kubernetes, expose it only as a private `ClusterIP` service and rely on the cluster or private-network access boundary.
 
 ## Start the server
 
-Build without overwriting a local file named `airlock` by choosing an explicit output path when needed:
+Build without overwriting a local file named `dyne` by choosing an explicit output path when needed:
 
 ```bash
-go build -o ./bin/airlock ./cmd/airlock
+go build -o ./bin/dyne ./cmd/dyne
 ```
 
 The server uses the following Kubernetes authentication order:
@@ -41,27 +41,27 @@ The server uses the following Kubernetes authentication order:
 Example with kubeconfig:
 
 ```bash
-./bin/airlock server \
+./bin/dyne server \
   --context colima-codex-proof \
   --namespace coding-agents \
   --agents-file ./agents.yaml \
   --github-app-id 123 \
   --github-installation-id 456 \
-  --github-private-key-file /secure/airlock-app.pem
+  --github-private-key-file /secure/dyne-app.pem
 ```
 
 Example with EKS and an assumed role:
 
 ```bash
-./bin/airlock server \
+./bin/dyne server \
   --eks-cluster coding-agents \
   --aws-region eu-west-1 \
-  --aws-role-arn arn:aws:iam::123456789012:role/airlock-control-plane \
+  --aws-role-arn arn:aws:iam::123456789012:role/dyne-control-plane \
   --namespace coding-agents \
   --agents-file ./agents.yaml \
   --github-app-id 123 \
   --github-installation-id 456 \
-  --github-private-key-file /secure/airlock-app.pem
+  --github-private-key-file /secure/dyne-app.pem
 ```
 
 ## Define agents
@@ -96,14 +96,14 @@ agents:
 
 Each definition requires a description, `ephemeral` or `persistent` storage, and non-empty instructions. Clone depth defaults to 1. Storage size and timeout inherit the server defaults; storage size is valid only for persistent agents. The server rejects the complete file at startup if any definition is invalid.
 
-Skill paths are relative to the agent file and must identify a regular, non-symlink `SKILL.md` inside that directory. Each skill needs YAML frontmatter with a lowercase DNS-label name and a non-empty description. Airlock packages only `SKILL.md`; scripts, references, assets, plugins, and hooks are not supported. Configured skills are additive to repository and Codex system skills.
+Skill paths are relative to the agent file and must identify a regular, non-symlink `SKILL.md` inside that directory. Each skill needs YAML frontmatter with a lowercase DNS-label name and a non-empty description. dyne packages only `SKILL.md`; scripts, references, assets, plugins, and hooks are not supported. Configured skills are additive to repository and Codex system skills.
 
 List the configured agents and start a session from one:
 
 ```bash
-airlock agents
+dyne agents
 
-airlock start \
+dyne start \
   --agent reviewer \
   --name review-example \
   --repo https://github.com/example/project.git \
@@ -114,34 +114,34 @@ The repository, ref, prompt, session name, and optional timeout belong to the se
 
 ## Run and continue sessions
 
-Client commands use `--server` or `AIRLOCK_SERVER`; the default is `http://127.0.0.1:8080`.
+Client commands use `--server` or `DYNE_SERVER`; the default is `http://127.0.0.1:8080`.
 
 ```bash
-airlock start \
+dyne start \
   --agent implementer \
   --name update-example \
   --repo https://github.com/example/project.git \
   --prompt 'Implement the requested change and run focused tests.'
 
-airlock status --name update-example
-airlock logs --name update-example --follow
-airlock artifacts --name update-example
+dyne status --name update-example
+dyne logs --name update-example --follow
+dyne artifacts --name update-example
 
-airlock task --name update-example 'Address the remaining failed test.'
+dyne task --name update-example 'Address the remaining failed test.'
 ```
 
 The selected agent definition controls storage and setup. Sessions created from ephemeral agents cannot continue or publish.
 
 ## Outcomes, artifacts, and publishing
 
-A task can finish as completed, blocked, or failed. A blocked result is valid and must identify the blocker; Airlock does not turn missing information or a sandbox limitation into false success.
+A task can finish as completed, blocked, or failed. A blocked result is valid and must identify the blocker; dyne does not turn missing information or a sandbox limitation into false success.
 
-The agent writes `outcome.json` for every successful invocation. Completed work also writes `pull-request.json` with a title and description. The harness validates these files and asks the same Codex thread to recreate invalid files once. The files remain on persistent storage, and their bounded API representation is available through `airlock artifacts`.
+The agent writes `outcome.json` for every successful invocation. Completed work also writes `pull-request.json` with a title and description. The harness validates these files and asks the same Codex thread to recreate invalid files once. The files remain on persistent storage, and their bounded API representation is available through `dyne artifacts`.
 
 Publishing is explicit:
 
 ```bash
-airlock publish \
+dyne publish \
   --name update-example \
   --branch yar/KARGO-123-description \
   --commit-message 'KARGO-123: implement description'
@@ -168,7 +168,7 @@ Session creation and continuation return `202 Accepted` after Kubernetes accepts
 
 ```bash
 make doctor
-make check BINARY=./bin/airlock
+make check BINARY=./bin/dyne
 make image
 make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
 make e2e-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof DOCKER_CONTEXT=colima-codex-proof

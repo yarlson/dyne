@@ -1,4 +1,4 @@
-module github.com/yarlson/airlock
+module github.com/yarlson/dyne
 
 go 1.26.7
 

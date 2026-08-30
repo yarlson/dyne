@@ -18,7 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"github.com/yarlson/airlock/internal/sessionmanifest"
+	"github.com/yarlson/dyne/internal/sessionmanifest"
 )
 
 const publishIntentAnnotationKey = "coding-agent/publish-intent"
@@ -364,7 +364,7 @@ func (c *Client) deletePublisherJob(ctx context.Context, namespace, session stri
 func publisherJob(request PublisherJobRequest) *batchv1.Job {
 	labels := map[string]string{
 		"app.kubernetes.io/name":       "coding-agent",
-		"app.kubernetes.io/managed-by": "airlock",
+		"app.kubernetes.io/managed-by": "dyne",
 		"coding-agent/session":         request.Session,
 		"coding-agent/component":       "publisher",
 	}

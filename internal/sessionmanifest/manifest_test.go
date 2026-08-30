@@ -148,7 +148,7 @@ func TestRenderPackagesAgentInstructionsAndSkills(t *testing.T) {
 
 	configuration := resources["ConfigMap/session-example-agent"]
 	assert.True(t, configuration.Immutable)
-	assert.Equal(t, "reviewer", configuration.Metadata.Annotations["airlock.yarlson.dev/agent"])
+	assert.Equal(t, "reviewer", configuration.Metadata.Annotations["dyne.yarlson.dev/agent"])
 	assert.Equal(t, "Review correctness and tests.", configuration.Data["instructions"])
 	assert.Equal(t, spec.Skills[0].Contents, configuration.Data["skill-code-review"])
 

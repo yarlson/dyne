@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yarlson/airlock/internal/github"
-	"github.com/yarlson/airlock/internal/kubernetes"
+	"github.com/yarlson/dyne/internal/github"
+	"github.com/yarlson/dyne/internal/kubernetes"
 )
 
 func TestPublishSessionRecoversExistingPullRequestAndCleansPublisher(t *testing.T) {

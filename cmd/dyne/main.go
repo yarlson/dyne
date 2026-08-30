@@ -17,10 +17,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yarlson/airlock/internal/agent"
-	"github.com/yarlson/airlock/internal/agentconfig"
-	"github.com/yarlson/airlock/internal/controlplane"
-	airlockgithub "github.com/yarlson/airlock/internal/github"
+	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/agentconfig"
+	"github.com/yarlson/dyne/internal/controlplane"
+	dynegithub "github.com/yarlson/dyne/internal/github"
 )
 
 const defaultServerURL = "http://127.0.0.1:8080"
@@ -105,7 +105,7 @@ func serve(ctx context.Context, args []string, stderr io.Writer) error {
 		return fmt.Errorf("read GitHub App private key: %w", err)
 	}
 
-	githubApp, err := airlockgithub.NewApp(*githubAppID, *githubInstallationID, privateKey)
+	githubApp, err := dynegithub.NewApp(*githubAppID, *githubInstallationID, privateKey)
 	if err != nil {
 		return err
 	}
@@ -294,12 +294,12 @@ func deleteSession(ctx context.Context, args []string, stdout io.Writer) error {
 }
 
 func serverFlag(set *flag.FlagSet) *string {
-	defaultURL := os.Getenv("AIRLOCK_SERVER")
+	defaultURL := os.Getenv("DYNE_SERVER")
 	if defaultURL == "" {
 		defaultURL = defaultServerURL
 	}
 
-	return set.String("server", defaultURL, "Airlock server URL")
+	return set.String("server", defaultURL, "dyne server URL")
 }
 
 func requestJSON(ctx context.Context, method, serverURL, path string, body any, output io.Writer) (result error) {
@@ -329,27 +329,27 @@ func requestJSON(ctx context.Context, method, serverURL, path string, body any, 
 
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("call Airlock server: %w", err)
+		return fmt.Errorf("call dyne server: %w", err)
 	}
 
 	defer func() {
 		if err := response.Body.Close(); err != nil {
-			result = errors.Join(result, fmt.Errorf("close Airlock response: %w", err))
+			result = errors.Join(result, fmt.Errorf("close dyne response: %w", err))
 		}
 	}()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 
-		return fmt.Errorf("airlock server returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		return fmt.Errorf("dyne server returned %s: %s", response.Status, strings.TrimSpace(string(message)))
 	}
 
 	if _, err := io.Copy(output, response.Body); err != nil {
-		return fmt.Errorf("read Airlock response: %w", err)
+		return fmt.Errorf("read dyne response: %w", err)
 	}
 
 	return nil
 }
 
 func usage() string {
-	return "usage: airlock <server|agents|start|status|logs|artifacts|task|publish|delete> [options]"
+	return "usage: dyne <server|agents|start|status|logs|artifacts|task|publish|delete> [options]"
 }

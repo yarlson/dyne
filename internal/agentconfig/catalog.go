@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 
-	"github.com/yarlson/airlock/internal/agent"
+	"github.com/yarlson/dyne/internal/agent"
 )
 
 const maxAgentConfigBytes = 900 * 1024

@@ -35,7 +35,7 @@ Before implementation, report the existing pattern, how the change will follow i
 
 `internal/agent` is the entrypoint-neutral product boundary. The HTTP server uses its requests and results instead of lower-level Kubernetes, GitHub, publishing, or manifest types.
 
-- `cmd/airlock` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
+- `cmd/dyne` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
 - `internal/controlplane` owns the private HTTP contract for sessions, tasks, logs, artifacts, publishing, and deletion.
 - `internal/agent` owns configured agent and session operations and translates lower-level results into entrypoint-neutral contracts.
 - `internal/sessionmanifest` validates session specifications and renders ephemeral and persistent Job resources without contacting a cluster.
@@ -47,9 +47,9 @@ Before implementation, report the existing pattern, how the change will follow i
 Keep dependencies directional:
 
 ```text
-cmd/airlock -> internal/controlplane
-cmd/airlock -> internal/github
-cmd/airlock -> internal/agent
+cmd/dyne -> internal/controlplane
+cmd/dyne -> internal/github
+cmd/dyne -> internal/agent
 internal/controlplane -> internal/agent
 internal/agentconfig -> internal/agent
 internal/agent -> internal/sessionmanifest
@@ -93,7 +93,7 @@ Kubernetes and GitHub are external integration boundaries. Docker and Colima bui
 - Prefer the standard library and existing dependencies. Add a module only when it materially reduces current complexity or risk.
 - Never invoke `kubectl` from product code. Kubernetes access goes through `client-go` in `internal/kubernetes`.
 
-The repository uses gofumpt, goimports, and gci through golangci-lint. Imports are grouped as standard library, external packages, then `github.com/yarlson/airlock` packages. Separate a return or branch from preceding work, but keep a function containing only that return compact. Add a blank line after a block before the next statement. `make fmt-check` verifies formatting without changing files; `make check` runs the same check in CI.
+The repository uses gofumpt, goimports, and gci through golangci-lint. Imports are grouped as standard library, external packages, then `github.com/yarlson/dyne` packages. Separate a return or branch from preceding work, but keep a function containing only that return compact. Add a blank line after a block before the next statement. `make fmt-check` verifies formatting without changing files; `make check` runs the same check in CI.
 
 ## Tests
 

@@ -63,7 +63,7 @@ func integrationNamespace(t *testing.T) string {
 	_, err := rand.Read(suffix[:])
 	require.NoError(t, err)
 
-	return fmt.Sprintf("airlock-integration-%x", suffix)
+	return fmt.Sprintf("dyne-integration-%x", suffix)
 }
 
 func integrationManifest(namespace string) []byte {

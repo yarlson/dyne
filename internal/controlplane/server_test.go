@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yarlson/airlock/internal/agent"
+	"github.com/yarlson/dyne/internal/agent"
 )
 
 func TestCreateSessionDoesNotExposeRawSessionContract(t *testing.T) {
