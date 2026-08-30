@@ -58,22 +58,6 @@ func TestCreatePullRequestSendsDraftRequest(t *testing.T) {
 	assert.Equal(t, PullRequest{Number: 42, URL: "https://github.com/lokalise/kargo/pull/42"}, pull)
 }
 
-func TestCommitAuthorUsesAuthenticatedGitHubIdentity(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		assert.Equal(t, http.MethodGet, request.Method)
-		assert.Equal(t, "/user", request.URL.Path)
-
-		response.Header().Set("Content-Type", "application/json")
-		_, _ = response.Write([]byte(`{"login":"yar","id":12345}`))
-	}))
-	t.Cleanup(server.Close)
-	client := testClient(t, server.URL)
-	name, email, err := client.CommitAuthor(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, "yar", name)
-	assert.Equal(t, "12345+yar@users.noreply.github.com", email)
-}
-
 func TestBranchCommitSHAPreservesNestedBranchName(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		assert.Equal(t, "/repos/lokalise/kargo/git/ref/heads/yar/KARGO-123-description", request.RequestURI)

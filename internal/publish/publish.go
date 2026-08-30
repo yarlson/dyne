@@ -53,7 +53,6 @@ type publishCluster interface {
 }
 
 type githubClient interface {
-	CommitAuthor(context.Context) (string, string, error)
 	BranchCommitSHA(context.Context, github.Repository, string) (string, bool, error)
 	WaitForBranchCommit(context.Context, github.Repository, string, string, time.Duration) error
 	FindOpenPullRequest(context.Context, github.Repository, string, string) (*github.PullRequest, error)
@@ -179,10 +178,7 @@ func removePublisherJobAfterCompletion(ctx context.Context, cluster publishClust
 }
 
 func publishBranch(ctx context.Context, cluster publishCluster, client githubClient, repository github.Repository, source kubernetes.PublishSource, request Request, intentID string) (kubernetes.PublisherJobResult, error) {
-	authorName, authorEmail, err := client.CommitAuthor(ctx)
-	if err != nil {
-		return kubernetes.PublisherJobResult{}, err
-	}
+	authorName, authorEmail := github.CommitAuthor()
 
 	result, err := cluster.RunPublisherJob(ctx, kubernetes.PublisherJobRequest{
 		Namespace:      request.Namespace,

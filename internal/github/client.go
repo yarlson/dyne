@@ -78,20 +78,9 @@ func ParseRepository(rawURL string) (Repository, error) {
 	return Repository{owner: parts[0], name: name}, nil
 }
 
-// CommitAuthor returns the authenticated user's login as the author name and a GitHub noreply email address.
-func (c *Client) CommitAuthor(ctx context.Context) (string, string, error) {
-	result, _, err := c.api.Users.Get(ctx, "")
-	if err != nil {
-		return "", "", fmt.Errorf("get authenticated GitHub user: %w", err)
-	}
-
-	login := result.GetLogin()
-	id := result.GetID()
-	if login == "" || id <= 0 {
-		return "", "", errors.New("authenticated GitHub user has no login or numeric ID")
-	}
-
-	return login, fmt.Sprintf("%d+%s@users.noreply.github.com", id, login), nil
+// CommitAuthor returns the identity used for commits created by Dyne.
+func CommitAuthor() (string, string) {
+	return "dyne", "dyne@localhost"
 }
 
 // BranchCommitSHA returns a branch's commit SHA and whether the branch exists.

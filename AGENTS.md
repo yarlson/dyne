@@ -15,7 +15,7 @@ This repository contains a Go CLI and control plane for running coding sessions 
 - Run all required checks: `make check`
 - Build the local image: `make image`
 - Run the live Kubernetes test: `make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof`
-- Run the coding-session E2E suite: `make e2e-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof DOCKER_CONTEXT=colima-codex-proof`
+- Run the real coding-session E2E suite with the Kubernetes context, Docker context, Codex auth file, and GitHub App values documented in `README.md`.
 
 Run `make doctor` when the local toolchain is uncertain. Install the pinned linter with `make tools`. Ordinary checks must not install tools implicitly.
 
@@ -117,7 +117,7 @@ make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
 
 The integration test creates a unique namespace and verifies its deletion during cleanup.
 
-The E2E suite builds the current image and exercises coding-session journeys against the named context. It uses an in-cluster Git fixture and a deterministic Codex substitute, creates unique namespaces, and verifies their deletion during cleanup. It does not use real credentials or write to GitHub.
+The E2E suite builds the current image and runs a real Codex coding session against `lokalise/ratchet-test-service`. It clones through a GitHub App installation, publishes a real draft pull request, verifies the changed repository content, then closes the pull request, deletes its branch, and deletes its unique namespace. It requires the explicit live credentials documented in `README.md`; never run it as an ordinary check.
 
 ## Comments and technical writing
 

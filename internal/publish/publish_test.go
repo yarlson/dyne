@@ -97,9 +97,6 @@ func TestPublishSessionCleansFailedPublisherWhenBranchWasNotCreated(t *testing.T
 		return nil
 	}
 	client := githubClientStub{
-		author: func(context.Context) (string, string, error) {
-			return "yar", "12345+yar@users.noreply.github.com", nil
-		},
 		findPull: func(context.Context, github.Repository, string, string) (*github.PullRequest, error) {
 			return nil, nil
 		},
@@ -143,8 +140,8 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		assert.Equal(t, "main", job.BaseRef)
 		assert.Equal(t, "yar/review", job.Branch)
 		assert.Equal(t, "Review changes", job.CommitMessage)
-		assert.Equal(t, "yar", job.AuthorName)
-		assert.Equal(t, "12345+yar@users.noreply.github.com", job.AuthorEmail)
+		assert.Equal(t, "dyne", job.AuthorName)
+		assert.Equal(t, "dyne@localhost", job.AuthorEmail)
 		assert.Equal(t, "coding-agent:test", job.Image)
 		assert.Equal(t, "workspace-review", job.WorkspaceClaim)
 		assert.Equal(t, time.Minute, job.Timeout)
@@ -160,9 +157,6 @@ func TestPublishSessionRecoversPullRequestAfterAmbiguousCreateFailure(t *testing
 		return nil
 	}
 	client := githubClientStub{
-		author: func(context.Context) (string, string, error) {
-			return "yar", "12345+yar@users.noreply.github.com", nil
-		},
 		branchCommit: func(_ context.Context, _ github.Repository, branch string) (string, bool, error) {
 			operations = append(operations, "find branch")
 			assert.Equal(t, "yar/review", branch)
@@ -258,16 +252,11 @@ func (c publishClusterStub) DeletePublisherJob(ctx context.Context, namespace, s
 }
 
 type githubClientStub struct {
-	author       func(context.Context) (string, string, error)
 	branchCommit func(context.Context, github.Repository, string) (string, bool, error)
 	waitBranch   func(context.Context, github.Repository, string, string, time.Duration) error
 	findPull     func(context.Context, github.Repository, string, string) (*github.PullRequest, error)
 	waitPull     func(context.Context, github.Repository, string, string, time.Duration) (*github.PullRequest, error)
 	createPull   func(context.Context, github.Repository, string, string, string, string, bool) (github.PullRequest, error)
-}
-
-func (c githubClientStub) CommitAuthor(ctx context.Context) (string, string, error) {
-	return c.author(ctx)
 }
 
 func (c githubClientStub) BranchCommitSHA(ctx context.Context, repository github.Repository, branch string) (string, bool, error) {

@@ -171,7 +171,8 @@ make doctor
 make check BINARY=./bin/dyne
 make image
 make integration-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof
-make e2e-test KUBERNETES_INTEGRATION_CONTEXT=colima-codex-proof DOCKER_CONTEXT=colima-codex-proof
 ```
 
-Ordinary tests do not contact Kubernetes, Docker, GitHub, AWS, or Codex. Live tests require explicit contexts and clean up their namespaces.
+Ordinary tests do not contact Kubernetes, Docker, GitHub, AWS, or Codex. Live tests require explicit contexts and clean up their resources.
+
+The [live coding-session E2E runbook](test/e2e/README.md) explains the real Codex and private GitHub repository journey, required GitHub App permissions, credential discovery, the Colima command, and cleanup behavior.

@@ -32,9 +32,19 @@ integration-test: ## Run live Kubernetes tests with KUBERNETES_INTEGRATION_CONTE
 	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" go test -cover -tags=integration -count=1 ./internal/kubernetes
 
 .PHONY: e2e-test
-e2e-test: image ## Run coding-session journeys on an isolated Kubernetes context
+e2e-test: image ## Run the real private-repository coding and publish journey
 	@test -n "$(KUBERNETES_INTEGRATION_CONTEXT)" || { printf 'KUBERNETES_INTEGRATION_CONTEXT is required\n'; exit 1; }
-	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" E2E_IMAGE="$(IMAGE)" go test -tags=integration -count=1 -timeout=20m ./test/e2e
+	@test -n "$(E2E_CODEX_AUTH_FILE)" || { printf 'E2E_CODEX_AUTH_FILE is required\n'; exit 1; }
+	@test -n "$(E2E_GITHUB_APP_ID)" || { printf 'E2E_GITHUB_APP_ID is required\n'; exit 1; }
+	@test -n "$(E2E_GITHUB_INSTALLATION_ID)" || { printf 'E2E_GITHUB_INSTALLATION_ID is required\n'; exit 1; }
+	@test -n "$(E2E_GITHUB_PRIVATE_KEY_FILE)" || { printf 'E2E_GITHUB_PRIVATE_KEY_FILE is required\n'; exit 1; }
+	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" \
+		E2E_IMAGE="$(IMAGE)" \
+		E2E_CODEX_AUTH_FILE="$(E2E_CODEX_AUTH_FILE)" \
+		E2E_GITHUB_APP_ID="$(E2E_GITHUB_APP_ID)" \
+		E2E_GITHUB_INSTALLATION_ID="$(E2E_GITHUB_INSTALLATION_ID)" \
+		E2E_GITHUB_PRIVATE_KEY_FILE="$(E2E_GITHUB_PRIVATE_KEY_FILE)" \
+		go test -tags=integration -count=1 -timeout=45m ./test/e2e
 
 .PHONY: coverage
 coverage: ## Write coverage.out
