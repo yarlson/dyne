@@ -4,24 +4,21 @@ dyne coordinates coding agents to investigate, plan, implement, review, and publ
 
 Use one agent for a single task, or run a workflow with separate planning, implementation, test review, and security review steps. Tasks run in the cluster, so you can close the client and come back later. You can read the logs, continue a persistent session with another prompt, or publish the finished change.
 
-The built-in workflows cover two common paths:
+`engineering-change` investigates and plans before implementation, then runs test and security review in parallel:
 
-```text
-focused-change:     implement → test review → finalize
-engineering-change: investigate → plan → implement → test + security review → finalize
+```mermaid
+flowchart LR
+    investigator[Investigate] --> planner[Plan]
+    planner --> implementer[Implement]
+    implementer --> testReviewer[Test review]
+    implementer --> securityReviewer[Security review]
+    testReviewer --> finisher[Finalize]
+    securityReviewer --> finisher
+    finisher -.-> publishStep[Run dyne publish]
+    publishStep --> pullRequest[Draft pull request]
 ```
 
-Each workflow step gets its own workspace. Reviewers receive the proposed change and results from earlier steps. No remote branch or pull request is created until you run `dyne publish`. By default, the command opens a draft pull request and never force-pushes.
-
-## Deployment model
-
-dyne does not deploy itself. This repository provides the server, client, and coding-agent image. It does not include a Kubernetes Deployment, Service, ServiceAccount, RBAC policy, Helm chart, or Kustomize package.
-
-The `dyne` client calls one server to start work and read its status, logs, and artifacts. Only the server reads Kubernetes and GitHub credentials. It also loads the agent catalog and stores application state in SQL.
-
-Run one server for one namespace. Restrict its Kubernetes identity to that namespace, and keep its HTTP endpoint on a private network. The API has no application authentication.
-
-Use dyne only for trusted repositories in a private cluster. The coding-agent container runs Codex with approvals and its sandbox bypassed. The agent container has no GitHub credential or Kubernetes service-account token, but it can use its Codex credential and network access.
+`focused-change` follows Implement → Test review → Finalize. Each workflow step gets its own workspace. Reviewers receive the proposed change and results from earlier steps. No remote branch or pull request is created until you run `dyne publish`. By default, the command opens a draft pull request and never force-pushes.
 
 ## Prerequisites
 
@@ -177,14 +174,14 @@ A workflow defines dependencies between sessions. Steps do not share a writable 
 
 The built-in catalog contains these agents:
 
-| Agent               | Storage    | Role                                                                 |
-| ------------------- | ---------- | -------------------------------------------------------------------- |
-| `investigator`      | Ephemeral  | Examine the current code and recommend what to change.               |
-| `planner`           | Ephemeral  | Write an implementation plan from the investigation results.         |
-| `implementer`       | Persistent | Make the code change and save it for later steps.                    |
-| `test-reviewer`     | Ephemeral  | Check whether the tests prove the changed behavior.                  |
-| `security-reviewer` | Ephemeral  | Check changed trust boundaries and ways to exploit the change.       |
-| `finisher`          | Persistent | Fix review findings, run final checks, and prepare the change.       |
+| Agent               | Storage    | Role                                                           |
+| ------------------- | ---------- | -------------------------------------------------------------- |
+| `investigator`      | Ephemeral  | Examine the current code and recommend what to change.         |
+| `planner`           | Ephemeral  | Write an implementation plan from the investigation results.   |
+| `implementer`       | Persistent | Make the code change and save it for later steps.              |
+| `test-reviewer`     | Ephemeral  | Check whether the tests prove the changed behavior.            |
+| `security-reviewer` | Ephemeral  | Check changed trust boundaries and ways to exploit the change. |
+| `finisher`          | Persistent | Fix review findings, run final checks, and prepare the change. |
 
 It also contains these workflows:
 
@@ -251,6 +248,16 @@ The CLI uses these private routes:
 | Workflows           | `GET /v1/workflows`, `POST /v1/workflows/{workflow}/runs`, `GET /v1/workflow-runs/{name}`, `GET /v1/workflow-runs/{name}/artifacts`, `POST /v1/workflow-runs/{name}/cancel`, `DELETE /v1/workflow-runs/{name}`                                           |
 
 Session creation and continuation return `202 Accepted` after Kubernetes accepts the resource. The logs route returns `application/x-ndjson`.
+
+## Deployment model
+
+dyne does not deploy itself. This repository provides the server, client, and coding-agent image. It does not include a Kubernetes Deployment, Service, ServiceAccount, RBAC policy, Helm chart, or Kustomize package.
+
+The `dyne` client calls one server to start work and read its status, logs, and artifacts. Only the server reads Kubernetes and GitHub credentials. It also loads the agent catalog and stores application state in SQL.
+
+Run one server for one namespace. Restrict its Kubernetes identity to that namespace, and keep its HTTP endpoint on a private network. The API has no application authentication.
+
+Use dyne only for trusted repositories in a private cluster. The coding-agent container runs Codex with approvals and its sandbox bypassed. The agent container has no GitHub credential or Kubernetes service-account token, but it can use its Codex credential and network access.
 
 ## Security notes
 
