@@ -66,8 +66,6 @@ const (
 	TaskSucceeded TaskPhase = "succeeded"
 	// TaskFailed means the task process failed.
 	TaskFailed TaskPhase = "failed"
-	// TaskCanceled means the runtime canceled the task.
-	TaskCanceled TaskPhase = "canceled"
 )
 
 // TaskArtifacts contains raw result files reported by one task execution.

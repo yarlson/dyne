@@ -561,13 +561,6 @@ func applyObservation(task *Task, observation workload.TaskObservation, now time
 		task.FinishedAt = &now
 
 		return nil
-	case workload.TaskCanceled:
-		task.State = TaskCanceled
-		task.Artifacts = taskArtifacts(observation.Artifacts)
-		task.Failure = observation.Failure
-		task.FinishedAt = &now
-
-		return nil
 	case workload.TaskSucceeded:
 	default:
 		return fmt.Errorf("runtime returned unsupported task phase %q", observation.Phase)
