@@ -37,6 +37,7 @@ Before implementation, report the existing pattern, how the change will follow i
 
 - `cmd/dyne` owns server and API-client flags, environment and file input, terminal streams, signal handling, and process exit.
 - `internal/controlplane` owns the private HTTP contract for sessions, tasks, logs, artifacts, publishing, and deletion.
+- `internal/catalog` owns built-in and operator-supplied agent and workflow catalogs, including guidance and skill loading.
 - `internal/agent` owns configured agent definitions and resolves them into immutable session definitions.
 - `internal/session` owns session lifecycle policy, validation, concurrency, repository credential refresh, and publish eligibility.
 - `internal/workflow` owns durable multi-session orchestration, dependency scheduling, cancellation, and run artifacts.
@@ -51,6 +52,7 @@ Keep dependencies directional:
 
 ```text
 cmd/dyne -> internal/controlplane
+cmd/dyne -> internal/catalog
 cmd/dyne -> internal/github
 cmd/dyne -> internal/agent
 cmd/dyne -> internal/session
@@ -63,7 +65,8 @@ internal/controlplane -> internal/agent
 internal/controlplane -> internal/session
 internal/controlplane -> internal/publish
 internal/controlplane -> internal/workflow
-internal/agentconfig -> internal/agent
+internal/catalog -> internal/agent
+internal/catalog -> internal/workflow
 internal/agent -> internal/session
 internal/workflow -> internal/session
 internal/publish -> internal/session

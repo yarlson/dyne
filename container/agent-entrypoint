@@ -30,6 +30,9 @@ initialize_workspace() {
 
 clone_workspace() {
   if [[ -d /workspace/.git ]]; then
+    if [[ ! -f /artifacts/base-commit ]]; then
+      git -C /workspace rev-parse HEAD > /artifacts/base-commit
+    fi
     return
   fi
   if find /workspace -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
@@ -47,9 +50,62 @@ clone_workspace() {
   clone_args+=(-- "${AGENT_REPOSITORY}" /workspace)
   if [[ -f /var/run/git-auth/token ]]; then
     GIT_ASKPASS=/usr/local/bin/git-askpass GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}"
+  else
+    GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}"
+  fi
+  git -C /workspace rev-parse HEAD > /artifacts/base-commit
+}
+
+validate_change_file() {
+  local path="$1" expected_sha="$2" expected_bytes="$3"
+  if [[ ! "${expected_sha}" =~ ^[0-9a-f]{64}$ || ! "${expected_bytes}" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  local actual_sha actual_bytes
+  actual_sha="$(sha256sum "${path}" | awk '{print $1}')"
+  actual_bytes="$(wc -c < "${path}")"
+  [[ "${actual_sha}" == "${expected_sha}" && "${actual_bytes}" == "${expected_bytes}" ]]
+}
+
+apply_change() {
+  : "${CHANGE_SHA256:?CHANGE_SHA256 is required}"
+  : "${CHANGE_BYTES:?CHANGE_BYTES is required}"
+  local change_path="/change/changes/${CHANGE_SHA256}.patch"
+  validate_change_file "${change_path}" "${CHANGE_SHA256}" "${CHANGE_BYTES}"
+  cd /workspace
+  git apply --index --binary "${change_path}"
+}
+
+create_change_artifact() {
+  if [[ ! -f /artifacts/outcome.json ]]; then
     return
   fi
-  GIT_TERMINAL_PROMPT=0 git "${clone_args[@]}"
+  local outcome_status
+  outcome_status="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("/artifacts/outcome.json", "utf8")).status || ""))' 2>/dev/null || true)"
+  if [[ "${outcome_status}" != "completed" ]]; then
+    rm -f /artifacts/change.patch /artifacts/change.json
+    return
+  fi
+  if [[ "${AGENT_RESULT_KIND:-pull-request}" != "workflow-change" && ! ( "${AGENT_RESULT_KIND:-pull-request}" == "pull-request" && "${AGENT_STORAGE:-}" == "persistent" ) ]]; then
+    return
+  fi
+  local base_commit
+  base_commit="$(< /artifacts/base-commit)"
+  cd /workspace
+  git add -A
+  git diff --cached --binary --full-index "${base_commit}" -- > /artifacts/change.patch
+  local change_sha change_bytes
+  change_sha="$(sha256sum /artifacts/change.patch | awk '{print $1}')"
+  change_bytes="$(wc -c < /artifacts/change.patch)"
+  mkdir -p /artifacts/changes
+  local retained_change="/artifacts/changes/${change_sha}.patch"
+  if [[ -f "${retained_change}" ]]; then
+    validate_change_file "${retained_change}" "${change_sha}" "${change_bytes}"
+    rm -f /artifacts/change.patch
+  else
+    mv /artifacts/change.patch "${retained_change}"
+  fi
+  node -e 'require("fs").writeFileSync("/artifacts/change.json", JSON.stringify({sha256:process.argv[1],bytes:Number(process.argv[2])}) + "\n")' "${change_sha}" "${change_bytes}"
 }
 
 publish_workspace() {
@@ -70,11 +126,18 @@ publish_workspace() {
     exit 1
   fi
   git_publish clone --branch "${PUBLISH_BASE}" --depth 1 --single-branch -- "${PUBLISH_REPOSITORY}" /publish
-  find /publish -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
-  find /workspace -mindepth 1 -maxdepth 1 ! -name .git -printf '%P\0' \
-    | tar --null --directory=/workspace --files-from=- --create --file=- \
-    | tar --directory=/publish --extract --file=-
   cd /publish
+  if [[ -n "${PUBLISH_CHANGE_SHA256:-}" ]]; then
+    : "${PUBLISH_CHANGE_BYTES:?PUBLISH_CHANGE_BYTES is required}"
+    local change_path="/artifacts/changes/${PUBLISH_CHANGE_SHA256}.patch"
+    validate_change_file "${change_path}" "${PUBLISH_CHANGE_SHA256}" "${PUBLISH_CHANGE_BYTES}"
+    git_publish apply --index --binary "${change_path}"
+  else
+    find /publish -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+    find /workspace -mindepth 1 -maxdepth 1 ! -name .git -printf '%P\0' \
+      | tar --null --directory=/workspace --files-from=- --create --file=- \
+      | tar --directory=/publish --extract --file=-
+  fi
   if [[ -z "$(git_publish status --porcelain=v1 --untracked-files=normal)" ]]; then
     printf 'workspace has no changes relative to %s\n' "${PUBLISH_BASE}" >&2
     exit 1
@@ -120,7 +183,7 @@ git_publish() {
 
 run_task() {
   load_api_key
-  rm -f /artifacts/outcome.json /artifacts/pull-request.json /artifacts/workflow-output.json
+  rm -f /artifacts/outcome.json /artifacts/pull-request.json /artifacts/workflow-output.json /artifacts/change.patch /artifacts/change.json
   local -a args=(exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace)
   if [[ -n "${AGENT_INSTRUCTIONS:-}" ]]; then
     local encoded_instructions
@@ -135,7 +198,7 @@ run_task() {
   fi
 
   local contract result_contract task_status
-  if [[ "${AGENT_RESULT_KIND:-pull-request}" == "workflow-output" ]]; then
+  if [[ "${AGENT_RESULT_KIND:-pull-request}" == "workflow-output" || "${AGENT_RESULT_KIND:-pull-request}" == "workflow-change" ]]; then
     result_contract='For completed work, also write /artifacts/workflow-output.json as a JSON object no larger than 1400 bytes.'
   else
     result_contract='For completed work, also write /artifacts/pull-request.json as JSON with non-empty title and body strings.'
@@ -151,17 +214,25 @@ run_task() {
     return "${task_status}"
   fi
 
+  create_change_artifact
   if validate_task_artifacts; then
     report_task_artifacts
     return
   fi
 
   codex exec --dangerously-bypass-approvals-and-sandbox --json --cd /workspace resume --last "The task result artifacts are missing or invalid. Recreate /artifacts/outcome.json with status (completed or blocked), summary, and blocker strings. ${result_contract} Preserve an honest blocked result when work cannot be completed." 2>&1 | tee -a "/logs/${AGENT_TASK_ID}.ndjson"
+  create_change_artifact
   validate_task_artifacts
   report_task_artifacts
 }
 
 validate_task_artifacts() {
+  if [[ -f /artifacts/change.json ]]; then
+    local change_sha change_bytes
+    change_sha="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("/artifacts/change.json", "utf8")).sha256 || ""))' 2>/dev/null || true)"
+    change_bytes="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("/artifacts/change.json", "utf8")).bytes || ""))' 2>/dev/null || true)"
+    validate_change_file "/artifacts/changes/${change_sha}.patch" "${change_sha}" "${change_bytes}" || return 1
+  fi
   node -e '
 const fs = require("fs");
 const read = path => JSON.parse(fs.readFileSync(path, "utf8"));
@@ -171,13 +242,18 @@ if (outcome.status === "blocked") {
   if (!outcome.blocker.trim()) process.exit(1);
   process.exit(0);
 }
-if ((process.env.AGENT_RESULT_KIND || "pull-request") === "workflow-output") {
+if (["workflow-output", "workflow-change"].includes(process.env.AGENT_RESULT_KIND || "pull-request")) {
   const output = read("/artifacts/workflow-output.json");
   if (!output || Array.isArray(output) || typeof output !== "object" || Buffer.byteLength(JSON.stringify(output)) > 1400) process.exit(1);
-  process.exit(0);
+  if ((process.env.AGENT_RESULT_KIND || "pull-request") === "workflow-output") process.exit(0);
+} else {
+  const pull = read("/artifacts/pull-request.json");
+  if (typeof pull.title !== "string" || !pull.title.trim() || pull.title.includes("\n") || pull.title.length > 256 || typeof pull.body !== "string" || !pull.body.trim() || pull.body.length > 2000) process.exit(1);
 }
-const pull = read("/artifacts/pull-request.json");
-if (typeof pull.title !== "string" || !pull.title.trim() || pull.title.includes("\n") || pull.title.length > 256 || typeof pull.body !== "string" || !pull.body.trim() || pull.body.length > 2000) process.exit(1);
+if ((process.env.AGENT_RESULT_KIND || "pull-request") === "workflow-change" || ((process.env.AGENT_RESULT_KIND || "pull-request") === "pull-request" && process.env.AGENT_STORAGE === "persistent")) {
+  const change = read("/artifacts/change.json");
+  if (!/^[0-9a-f]{64}$/.test(change.sha256) || !Number.isSafeInteger(change.bytes) || change.bytes <= 0) process.exit(1);
+}
 ' 2>/dev/null
 }
 
@@ -187,6 +263,7 @@ const fs = require("fs");
 const lines = ["outcome=" + fs.readFileSync("/artifacts/outcome.json").toString("base64")];
 if (fs.existsSync("/artifacts/pull-request.json")) lines.push("pull-request=" + fs.readFileSync("/artifacts/pull-request.json").toString("base64"));
 if (fs.existsSync("/artifacts/workflow-output.json")) lines.push("workflow-output=" + fs.readFileSync("/artifacts/workflow-output.json").toString("base64"));
+if (fs.existsSync("/artifacts/change.json")) lines.push("change=" + fs.readFileSync("/artifacts/change.json").toString("base64"));
 let message = lines.join("\n") + "\n";
 if (Buffer.byteLength(message) > 4096) {
   const outcome = Buffer.from(JSON.stringify({status:"failed",summary:"task result artifacts exceeded the Kubernetes termination message limit",blocker:"reduce the task result artifact size"}) + "\n").toString("base64");
@@ -201,6 +278,9 @@ fs.writeFileSync("/dev/termination-log", message);
 case "${1:-}" in
   clone)
     clone_workspace
+    ;;
+  apply-change)
+    apply_change
     ;;
   init)
     initialize_workspace
@@ -218,7 +298,7 @@ case "${1:-}" in
     exec sleep infinity
     ;;
   *)
-    printf 'usage: agent-entrypoint <clone|init|auth|publish|run|idle>\n' >&2
+    printf 'usage: agent-entrypoint <clone|apply-change|init|auth|publish|run|idle>\n' >&2
     exit 2
     ;;
 esac

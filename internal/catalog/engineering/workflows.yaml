@@ -1,0 +1,53 @@
+version: v1
+
+workflows:
+  focused-change:
+    description: Implement, review, finalize, and retain one focused change for publication.
+    max_parallelism: 1
+    steps:
+      implement:
+        agent: implementer
+        prompt: Implement the requested change and verify the affected behavior.
+      test-review:
+        agent: test-reviewer
+        prompt: Review the applied implementation and its behavioral proof.
+        after: [implement]
+        change_from: implement
+      finalize:
+        agent: finisher
+        prompt: Address required review findings and complete final validation.
+        after: [implement, test-review]
+        change_from: implement
+        publishable: true
+
+  engineering-change:
+    description: Investigate, plan, implement, review, finalize, and retain a substantial change for publication.
+    max_parallelism: 2
+    steps:
+      investigate:
+        agent: investigator
+        prompt: Trace the current system and recommend the smallest safe change boundary.
+      plan:
+        agent: planner
+        prompt: Create an implementation-ready plan from the investigation evidence.
+        after: [investigate]
+      implement:
+        agent: implementer
+        prompt: Implement the approved plan and verify the affected behavior.
+        after: [plan]
+      test-review:
+        agent: test-reviewer
+        prompt: Review the applied implementation and its behavioral proof.
+        after: [implement]
+        change_from: implement
+      security-review:
+        agent: security-reviewer
+        prompt: Review the applied implementation for concrete exploit paths.
+        after: [implement]
+        change_from: implement
+      finalize:
+        agent: finisher
+        prompt: Address required review findings and complete final validation.
+        after: [implement, test-review, security-review]
+        change_from: implement
+        publishable: true

@@ -1,0 +1,73 @@
+version: v1
+guidance: AGENTS.md
+
+agents:
+  investigator:
+    description: Traces current behavior and recommends the smallest safe change.
+    storage: ephemeral
+    instructions: |
+      Use $system-investigate to answer the workflow step through read-only repository evidence.
+      Return concrete findings, uncertainties, and the recommended change boundary.
+    skills:
+      - skills/system-investigate/SKILL.md
+    clone_depth: 1
+    timeout: 2h
+
+  planner:
+    description: Turns settled evidence into an implementation-ready delivery plan.
+    storage: ephemeral
+    instructions: |
+      Use $plan-create to turn the workflow goal and dependency evidence into a bounded plan.
+      Keep requirements traceable and identify concrete validation gates.
+    skills:
+      - skills/plan-create/SKILL.md
+    clone_depth: 1
+    timeout: 2h
+
+  implementer:
+    description: Implements one focused change and retains it for dependent agents.
+    storage: persistent
+    instructions: |
+      Use $behavior-implement to implement the workflow goal within the supplied contract.
+      Run focused checks and return a concise account of behavior, files, and verification.
+    skills:
+      - skills/behavior-implement/SKILL.md
+    clone_depth: 1
+    timeout: 4h
+
+  test-reviewer:
+    description: Reviews whether the implemented change has credible behavioral proof.
+    storage: ephemeral
+    instructions: |
+      Use $test-gap-review to inspect the applied change and its tests without modifying files.
+      Return only evidence-backed gaps, or state why the current proof is sufficient.
+    skills:
+      - skills/test-gap-review/SKILL.md
+    clone_depth: 1
+    timeout: 2h
+
+  security-reviewer:
+    description: Reviews changed trust boundaries and concrete exploit paths.
+    storage: ephemeral
+    instructions: |
+      Use $security-review to inspect the applied change without modifying files.
+      Report only concrete exploit paths and the smallest required remediation.
+    skills:
+      - skills/security-review/SKILL.md
+    clone_depth: 1
+    timeout: 2h
+
+  finisher:
+    description: Applies review evidence, validates the complete change, and prepares publication.
+    storage: persistent
+    instructions: |
+      Use the supplied review outputs to fix required gaps in the applied change.
+      Then use $phase-validate, $phase-review, $docs-drift-review, and $change-cleanup-review.
+      Leave the workspace complete, focused, tested, and ready for explicit publication.
+    skills:
+      - skills/phase-validate/SKILL.md
+      - skills/phase-review/SKILL.md
+      - skills/docs-drift-review/SKILL.md
+      - skills/change-cleanup-review/SKILL.md
+    clone_depth: 1
+    timeout: 4h

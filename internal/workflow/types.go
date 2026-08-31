@@ -114,26 +114,29 @@ type Run struct {
 
 // Step is the durable state and result of one isolated agent session.
 type Step struct {
-	Name        string          `json:"name"`
-	Agent       string          `json:"agent"`
-	Prompt      string          `json:"prompt"`
-	After       []string        `json:"after,omitempty"`
-	Publishable bool            `json:"publishable,omitempty"`
-	Session     string          `json:"session"`
-	State       StepState       `json:"state"`
-	Summary     string          `json:"summary,omitempty"`
-	Blocker     string          `json:"blocker,omitempty"`
-	Output      json.RawMessage `json:"output,omitempty"`
-	Cleaned     bool            `json:"cleaned,omitempty"`
-	StartedAt   *time.Time      `json:"started_at,omitempty"`
-	FinishedAt  *time.Time      `json:"finished_at,omitempty"`
+	Name        string                  `json:"name"`
+	Agent       string                  `json:"agent"`
+	Prompt      string                  `json:"prompt"`
+	After       []string                `json:"after,omitempty"`
+	ChangeFrom  string                  `json:"change_from,omitempty"`
+	Publishable bool                    `json:"publishable,omitempty"`
+	Session     string                  `json:"session"`
+	State       StepState               `json:"state"`
+	Summary     string                  `json:"summary,omitempty"`
+	Blocker     string                  `json:"blocker,omitempty"`
+	Output      json.RawMessage         `json:"output,omitempty"`
+	Change      *session.ChangeArtifact `json:"change,omitempty"`
+	Cleaned     bool                    `json:"cleaned,omitempty"`
+	StartedAt   *time.Time              `json:"started_at,omitempty"`
+	FinishedAt  *time.Time              `json:"finished_at,omitempty"`
 }
 
 // Artifacts contains the explicit outputs and publishable session for a run.
 type Artifacts struct {
-	Name               string                     `json:"name"`
-	Outputs            map[string]json.RawMessage `json:"outputs"`
-	PublishableSession string                     `json:"publishable_session,omitempty"`
+	Name               string                            `json:"name"`
+	Outputs            map[string]json.RawMessage        `json:"outputs"`
+	Changes            map[string]session.ChangeArtifact `json:"changes,omitempty"`
+	PublishableSession string                            `json:"publishable_session,omitempty"`
 }
 
 // Definition is one validated immutable workflow graph.
@@ -150,6 +153,7 @@ type StepDefinition struct {
 	Agent             string
 	Prompt            string
 	After             []string
+	ChangeFrom        string
 	Publishable       bool
 	SessionDefinition session.Definition
 }

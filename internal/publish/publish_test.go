@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,8 @@ func TestPublishRecordsIntentBeforeCheckingOrChangingGitHub(t *testing.T) {
 	runtime := runtimeStub{run: func(request workload.PublishRequest) (workload.PublishResult, error) {
 		operations = append(operations, "publish branch")
 		assert.Equal(t, "installation-token", request.RepositoryCredential)
+		require.NotNil(t, request.Change)
+		assert.Equal(t, workload.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123}, *request.Change)
 
 		return workload.PublishResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
 	}}
@@ -284,6 +287,7 @@ func (sessionStub) PreparePublication(context.Context, string) (*session.Publica
 		Repository: "https://github.com/lokalise/ratchet-test-service", InitialRef: "main",
 		Image:       "coding-agent:test",
 		PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
+		Change:      &session.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
 	}}, nil
 }
 

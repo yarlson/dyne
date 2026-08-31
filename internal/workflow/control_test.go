@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,6 +104,11 @@ func cloneRun(run Run) Run {
 	for name, step := range run.Steps {
 		step.After = slices.Clone(step.After)
 		step.Output = slices.Clone(step.Output)
+		if step.Change != nil {
+			change := *step.Change
+			step.Change = &change
+		}
+
 		clone.Steps[name] = step
 	}
 
@@ -205,6 +211,49 @@ func TestReconcileRunsIndependentStepsThenPassesOutputsToDependentStep(t *testin
 	assert.Equal(t, session.ResultKindPullRequest, implementation.ResultKind)
 }
 
+func TestReconcilePassesProducedChangeToReviewAndPublishableSteps(t *testing.T) {
+	repository := newMemoryRepository()
+	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}
+	control := newControl(repository, sessions, changeCatalog(), time.Now)
+
+	_, err := control.Start(context.Background(), StartRequest{
+		Workflow: "change", Name: "change-200", Repository: "https://github.com/example/service.git", Ref: "main", Prompt: "Fix it.",
+	})
+	require.NoError(t, err)
+	require.NoError(t, control.Reconcile(context.Background(), "change-200"))
+	require.NoError(t, control.Reconcile(context.Background(), "change-200"))
+	require.Len(t, sessions.starts, 1)
+	implementation := sessions.starts[0]
+	assert.Equal(t, session.ResultKindWorkflowChange, implementation.ResultKind)
+
+	change := &session.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123}
+	sessions.statuses[implementation.Name] = completedStatus(implementation.Name)
+	sessions.artifacts[implementation.Name] = session.Artifacts{
+		Outcome:        json.RawMessage(`{"status":"completed","summary":"implemented","blocker":""}`),
+		WorkflowOutput: json.RawMessage(`{"summary":"implemented"}`),
+		Change:         change,
+	}
+	require.NoError(t, control.Reconcile(context.Background(), "change-200"))
+	require.NoError(t, control.Reconcile(context.Background(), "change-200"))
+	require.Len(t, sessions.starts, 2)
+	review := sessions.starts[1]
+	require.NotNil(t, review.ChangeInput)
+	assert.Equal(t, session.ChangeInput{Session: implementation.Name, Artifact: *change}, *review.ChangeInput)
+
+	sessions.statuses[review.Name] = completedStatus(review.Name)
+	sessions.artifacts[review.Name] = session.Artifacts{
+		Outcome:        json.RawMessage(`{"status":"completed","summary":"reviewed","blocker":""}`),
+		WorkflowOutput: json.RawMessage(`{"verdict":"approved"}`),
+	}
+	require.NoError(t, control.Reconcile(context.Background(), "change-200"))
+	require.NoError(t, control.Reconcile(context.Background(), "change-200"))
+	require.Len(t, sessions.starts, 3)
+	finalize := sessions.starts[2]
+	require.NotNil(t, finalize.ChangeInput)
+	assert.Equal(t, session.ChangeInput{Session: implementation.Name, Artifact: *change}, *finalize.ChangeInput)
+	assert.Equal(t, session.ResultKindPullRequest, finalize.ResultKind)
+}
+
 func TestReconcileSkipsDescendantsAndCompletesIndependentBranch(t *testing.T) {
 	repository := newMemoryRepository()
 	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}
@@ -288,6 +337,26 @@ func testCatalog() definitionCatalog {
 			"security":  {Name: "security", Agent: "reviewer", Prompt: "Review security.", SessionDefinition: reviewer},
 			"tests":     {Name: "tests", Agent: "reviewer", Prompt: "Review tests.", SessionDefinition: reviewer},
 			"implement": {Name: "implement", Agent: "implementer", Prompt: "Implement.", After: []string{"security", "tests"}, Publishable: true, SessionDefinition: implementer},
+		},
+	}}
+}
+
+func changeCatalog() definitionCatalog {
+	reviewer := session.Definition{Agent: "reviewer", Storage: session.StorageEphemeral, Timeout: time.Hour}
+	implementer := session.Definition{Agent: "implementer", Storage: session.StoragePersistent, Timeout: time.Hour}
+
+	return definitionCatalog{"change": {
+		Name: "change", Description: "Implement, review, and finalize.", MaxParallelism: 2,
+		Steps: map[string]StepDefinition{
+			"implement": {Name: "implement", Agent: "implementer", Prompt: "Implement.", SessionDefinition: implementer},
+			"review": {
+				Name: "review", Agent: "reviewer", Prompt: "Review.", After: []string{"implement"},
+				ChangeFrom: "implement", SessionDefinition: reviewer,
+			},
+			"finalize": {
+				Name: "finalize", Agent: "implementer", Prompt: "Finalize.", After: []string{"implement", "review"},
+				ChangeFrom: "implement", Publishable: true, SessionDefinition: implementer,
+			},
 		},
 	}}
 }

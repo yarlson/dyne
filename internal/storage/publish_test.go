@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ func TestPublicationRepositoryRetainsIntentProgressAndResult(t *testing.T) {
 		Session: "review", IntentID: "publish-intent",
 		Request:    publish.Request{Session: "review", Branch: "yar/review", Timeout: time.Minute},
 		Repository: "https://github.com/lokalise/ratchet-test-service", State: publish.StateReady,
+		Change:    &session.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
 		CreatedAt: now, UpdatedAt: now,
 	}
 
@@ -44,6 +46,7 @@ func TestPublicationRepositoryRetainsIntentProgressAndResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, publish.StateCompleted, stored.State)
 	assert.Equal(t, 17, stored.PullRequestNumber)
+	assert.Equal(t, record.Change, stored.Change)
 }
 
 func TestPublicationRepositoryRejectsAnotherIntentForSession(t *testing.T) {

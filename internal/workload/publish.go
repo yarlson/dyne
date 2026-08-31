@@ -31,6 +31,16 @@ func (c *Runtime) RunPublisher(ctx context.Context, request PublishRequest) (Pub
 		return PublishResult{}, errors.New("publisher repository credential is required")
 	}
 
+	if request.Change != nil {
+		if !changeSHA256Pattern.MatchString(request.Change.SHA256) {
+			return PublishResult{}, errors.New("publisher change sha256 must contain 64 lowercase hexadecimal characters")
+		}
+
+		if request.Change.Bytes <= 0 {
+			return PublishResult{}, errors.New("publisher change bytes must be greater than zero")
+		}
+	}
+
 	existing, err := c.typed.BatchV1().Jobs(c.namespace).Get(ctx, publisherJobName(request.Session), metav1.GetOptions{})
 	if err == nil && existing.Annotations[publishIntentAnnotationKey] != request.IntentID {
 		return PublishResult{}, errors.New("publisher Job belongs to a different publish intent")
@@ -256,6 +266,30 @@ func (c *Runtime) deletePublisherJob(ctx context.Context, sessionName string) er
 
 func publisherJob(namespace string, request PublishRequest) *batchv1.Job {
 	jobLabels := publisherLabels(request.Session)
+	volumes := []corev1.Volume{
+		{
+			Name: "artifacts",
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: sessionClaimName(request.Session), ReadOnly: true,
+			}},
+		},
+		{Name: "publish", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resourceQuantity("4Gi"))}}},
+		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: new(resourceQuantity("1Gi"))}}},
+		{
+			Name: "git-auth",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: publisherCredentialName(request.Session), DefaultMode: new(int32(0o440)),
+			}},
+		},
+	}
+	if request.Change == nil {
+		volumes = append([]corev1.Volume{{
+			Name: "workspace",
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: sessionClaimName(request.Session), ReadOnly: true,
+			}},
+		}}, volumes...)
+	}
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -274,28 +308,7 @@ func publisherJob(namespace string, request PublishRequest) *batchv1.Job {
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{publisherContainer(request)},
-					Volumes: []corev1.Volume{
-						{
-							Name: "workspace",
-							VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-								ClaimName: sessionClaimName(request.Session), ReadOnly: true,
-							}},
-						},
-						{
-							Name: "artifacts",
-							VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-								ClaimName: sessionClaimName(request.Session), ReadOnly: true,
-							}},
-						},
-						{Name: "publish", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resourceQuantity("4Gi"))}}},
-						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: new(resourceQuantity("1Gi"))}}},
-						{
-							Name: "git-auth",
-							VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-								SecretName: publisherCredentialName(request.Session), DefaultMode: new(int32(0o440)),
-							}},
-						},
-					},
+					Volumes:    volumes,
 				},
 			},
 		},
@@ -303,17 +316,34 @@ func publisherJob(namespace string, request PublishRequest) *batchv1.Job {
 }
 
 func publisherContainer(request PublishRequest) corev1.Container {
+	environment := []corev1.EnvVar{
+		{Name: "PUBLISH_REPOSITORY", Value: request.Repository},
+		{Name: "PUBLISH_BASE", Value: request.BaseRef},
+		{Name: "PUBLISH_BRANCH", Value: request.Branch},
+		{Name: "PUBLISH_COMMIT_MESSAGE", Value: request.CommitMessage},
+		{Name: "PUBLISH_AUTHOR_NAME", Value: request.AuthorName},
+		{Name: "PUBLISH_AUTHOR_EMAIL", Value: request.AuthorEmail},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{Name: "artifacts", MountPath: "/artifacts", SubPath: "artifacts", ReadOnly: true},
+		{Name: "publish", MountPath: "/publish"},
+		{Name: "tmp", MountPath: "/tmp"},
+		{Name: "git-auth", MountPath: "/var/run/git-auth", ReadOnly: true},
+	}
+	if request.Change == nil {
+		volumeMounts = append([]corev1.VolumeMount{
+			{Name: "workspace", MountPath: "/workspace", SubPath: "workspace", ReadOnly: true},
+		}, volumeMounts...)
+	} else {
+		environment = append(environment,
+			corev1.EnvVar{Name: "PUBLISH_CHANGE_SHA256", Value: request.Change.SHA256},
+			corev1.EnvVar{Name: "PUBLISH_CHANGE_BYTES", Value: fmt.Sprintf("%d", request.Change.Bytes)},
+		)
+	}
+
 	return corev1.Container{
 		Name: "publisher", Image: request.Image, ImagePullPolicy: corev1.PullIfNotPresent,
-		Args: []string{"publish"}, WorkingDir: "/workspace",
-		Env: []corev1.EnvVar{
-			{Name: "PUBLISH_REPOSITORY", Value: request.Repository},
-			{Name: "PUBLISH_BASE", Value: request.BaseRef},
-			{Name: "PUBLISH_BRANCH", Value: request.Branch},
-			{Name: "PUBLISH_COMMIT_MESSAGE", Value: request.CommitMessage},
-			{Name: "PUBLISH_AUTHOR_NAME", Value: request.AuthorName},
-			{Name: "PUBLISH_AUTHOR_EMAIL", Value: request.AuthorEmail},
-		},
+		Args: []string{"publish"}, WorkingDir: "/publish", Env: environment,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: new(false), ReadOnlyRootFilesystem: new(true),
 			Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -328,13 +358,7 @@ func publisherContainer(request PublishRequest) corev1.Container {
 				corev1.ResourceEphemeralStorage: resourceQuantity("6Gi"),
 			},
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "workspace", MountPath: "/workspace", SubPath: "workspace", ReadOnly: true},
-			{Name: "artifacts", MountPath: "/artifacts", SubPath: "artifacts", ReadOnly: true},
-			{Name: "publish", MountPath: "/publish"},
-			{Name: "tmp", MountPath: "/tmp"},
-			{Name: "git-auth", MountPath: "/var/run/git-auth", ReadOnly: true},
-		},
+		VolumeMounts: volumeMounts,
 	}
 }
 

@@ -34,6 +34,7 @@ type sessionManifestSpec struct {
 	ResultKind     ResultKind
 	WorkflowRun    string
 	WorkflowStep   string
+	ChangeInput    *ChangeInput
 	GitCredential  string
 }
 
@@ -45,7 +46,10 @@ type manifestResourceList struct {
 	Items      []manifestResource `json:"items"`
 }
 
-var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
+var (
+	dnsLabelPattern     = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
+	changeSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
 
 func (s sessionManifestSpec) validate(initial bool) error {
 	if s.ResultKind == "" {
@@ -75,6 +79,32 @@ func (s sessionManifestSpec) validate(initial bool) error {
 
 		if !dnsLabelPattern.MatchString(s.WorkflowStep) || len(s.WorkflowStep) > 63 {
 			return errors.New("workflow step must be a lowercase DNS label no longer than 63 characters")
+		}
+	}
+
+	if s.ChangeInput != nil {
+		if !initial {
+			return errors.New("change input is only supported for an initial task")
+		}
+
+		if s.WorkflowRun == "" {
+			return errors.New("change input requires a workflow-owned session")
+		}
+
+		if !dnsLabelPattern.MatchString(s.ChangeInput.Session) || len(s.ChangeInput.Session) > 40 {
+			return errors.New("change input session must be a lowercase DNS label no longer than 40 characters")
+		}
+
+		if s.ChangeInput.Session == s.Name {
+			return errors.New("change input session must differ from the target session")
+		}
+
+		if !changeSHA256Pattern.MatchString(s.ChangeInput.Artifact.SHA256) {
+			return errors.New("change input sha256 must contain 64 lowercase hexadecimal characters")
+		}
+
+		if s.ChangeInput.Artifact.Bytes <= 0 {
+			return errors.New("change input bytes must be greater than zero")
 		}
 	}
 
@@ -137,6 +167,10 @@ func (s sessionManifestSpec) validate(initial bool) error {
 
 	switch s.ResultKind {
 	case "", ResultKindPullRequest, ResultKindWorkflowOutput:
+	case ResultKindWorkflowChange:
+		if s.Storage != StoragePersistent {
+			return errors.New("workflow change result requires persistent storage")
+		}
 	default:
 		return fmt.Errorf("unsupported result kind %q", s.ResultKind)
 	}
@@ -247,6 +281,20 @@ func sessionJob(s sessionManifestSpec) manifestResource {
 
 func sessionPodTemplate(s sessionManifestSpec) map[string]any {
 	workspaceReadOnly := s.Storage == StorageEphemeral
+	initContainers := []any{
+		sessionDirectoryContainer(s),
+		sessionContainer(s, "repo-init", []any{"clone"}, false, mountAccess{workspace: true, artifacts: true, gitAuth: true}),
+	}
+	if s.ChangeInput != nil {
+		initContainers = append(initContainers,
+			sessionContainer(s, "change-init", []any{"apply-change"}, false, mountAccess{workspace: true, changeInput: true}),
+		)
+	}
+
+	initContainers = append(initContainers,
+		sessionContainer(s, "workspace-init", []any{"init"}, false, mountAccess{workspace: true, home: true, tmp: true}),
+		sessionContainer(s, "auth-init", []any{"auth"}, false, mountAccess{codex: true}),
+	)
 
 	return map[string]any{
 		"metadata": map[string]any{"labels": taskLabels(s)},
@@ -263,14 +311,9 @@ func sessionPodTemplate(s sessionManifestSpec) map[string]any {
 					"type": "RuntimeDefault",
 				},
 			},
-			"initContainers": []any{
-				sessionDirectoryContainer(s),
-				sessionContainer(s, "repo-init", []any{"clone"}, false, mountAccess{workspace: true, gitAuth: true}),
-				sessionContainer(s, "workspace-init", []any{"init"}, false, mountAccess{workspace: true, home: true, tmp: true}),
-				sessionContainer(s, "auth-init", []any{"auth"}, false, mountAccess{codex: true}),
-			},
-			"containers": []any{sessionContainer(s, "agent", []any{"run"}, workspaceReadOnly, mountAccess{workspace: true, home: true, tmp: true, codex: true, artifacts: true, logs: true, agentInstructions: s.AgentName != "", agentSkills: len(s.Skills) > 0})},
-			"volumes":    sessionVolumes(s),
+			"initContainers": initContainers,
+			"containers":     []any{sessionContainer(s, "agent", []any{"run"}, workspaceReadOnly, mountAccess{workspace: true, home: true, tmp: true, codex: true, artifacts: true, logs: true, agentInstructions: s.AgentName != "", agentSkills: len(s.Skills) > 0})},
+			"volumes":        sessionVolumes(s),
 		},
 	}
 }
@@ -285,6 +328,7 @@ type mountAccess struct {
 	gitAuth           bool
 	agentInstructions bool
 	agentSkills       bool
+	changeInput       bool
 }
 
 func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceReadOnly bool, access mountAccess) map[string]any {
@@ -324,6 +368,12 @@ func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceR
 		volumeMounts = append(volumeMounts, map[string]any{"name": "agent-config", "mountPath": "/home/agent/.agents/skills", "readOnly": true})
 	}
 
+	if access.changeInput {
+		volumeMounts = append(volumeMounts, map[string]any{
+			"name": "change-input", "mountPath": "/change", "subPath": "artifacts", "readOnly": true,
+		})
+	}
+
 	environment := []any{
 		map[string]any{"name": "AGENT_STORAGE", "value": string(s.Storage)},
 		map[string]any{"name": "AGENT_REPOSITORY", "value": s.Repository},
@@ -347,6 +397,13 @@ func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceR
 				"configMapKeyRef": map[string]any{"name": sessionAgentConfigName(s.Name), "key": "instructions"},
 			},
 		})
+	}
+
+	if access.changeInput {
+		environment = append(environment,
+			map[string]any{"name": "CHANGE_SHA256", "value": s.ChangeInput.Artifact.SHA256},
+			map[string]any{"name": "CHANGE_BYTES", "value": fmt.Sprintf("%d", s.ChangeInput.Artifact.Bytes)},
+		)
 	}
 
 	return map[string]any{
@@ -460,6 +517,15 @@ func sessionVolumes(s sessionManifestSpec) []any {
 			"configMap": map[string]any{
 				"name":  sessionAgentConfigName(s.Name),
 				"items": items,
+			},
+		})
+	}
+
+	if s.ChangeInput != nil {
+		volumes = append(volumes, map[string]any{
+			"name": "change-input",
+			"persistentVolumeClaim": map[string]any{
+				"claimName": sessionClaimName(s.ChangeInput.Session), "readOnly": true,
 			},
 		})
 	}

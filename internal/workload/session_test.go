@@ -2,7 +2,9 @@ package workload
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -93,4 +95,12 @@ func TestParseTaskArtifactsReturnsWorkflowOutput(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"status":"completed"}`, string(artifacts.Outcome))
 	assert.JSONEq(t, `{"findings":["one"]}`, string(artifacts.WorkflowOutput))
+}
+
+func TestParseTaskArtifactsReturnsRetainedChangeMetadata(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte(`{"sha256":"` + strings.Repeat("a", 64) + `","bytes":123}`))
+	artifacts, err := parseTaskArtifacts("outcome=eyJzdGF0dXMiOiJjb21wbGV0ZWQifQ==\nchange=" + encoded + "\n")
+	require.NoError(t, err)
+	require.NotNil(t, artifacts.Change)
+	assert.Equal(t, ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123}, *artifacts.Change)
 }

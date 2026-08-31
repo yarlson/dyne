@@ -1,4 +1,4 @@
-package workflowconfig
+package catalog
 
 import (
 	"os"
@@ -22,7 +22,7 @@ func (c agentCatalog) Find(name string) (agent.AgentDefinition, bool) {
 	return definition, found
 }
 
-func TestLoadResolvesFanOutAndPublishableLeaf(t *testing.T) {
+func TestLoadWorkflowsResolvesFanOutAndPublishableLeaf(t *testing.T) {
 	path := writeWorkflows(t, `version: v1
 workflows:
   delivery:
@@ -46,7 +46,7 @@ workflows:
 		"implementer": {Name: "implementer", Storage: agent.StoragePersistent, Timeout: 2 * time.Hour},
 	}
 
-	catalog, err := Load(path, agents)
+	catalog, err := LoadWorkflows(path, agents)
 	require.NoError(t, err)
 
 	assert.Equal(t, 2, catalog.List()[0].MaxParallelism)
@@ -56,7 +56,37 @@ workflows:
 	assert.Equal(t, 2*time.Hour, definition.Steps["implement"].SessionDefinition.Timeout)
 }
 
-func TestLoadDefaultsMaxParallelismToOne(t *testing.T) {
+func TestLoadWorkflowsAllowsPersistentChangeProducerForDirectDependents(t *testing.T) {
+	path := writeWorkflows(t, `version: v1
+workflows:
+  delivery:
+    description: Implement, review, and finalize one change.
+    steps:
+      implement:
+        agent: implementer
+        prompt: Implement the change.
+      review:
+        agent: reviewer
+        prompt: Review the implemented change.
+        after: [implement]
+        change_from: implement
+      finalize:
+        agent: implementer
+        prompt: Address review findings and validate the change.
+        after: [implement, review]
+        change_from: implement
+        publishable: true
+`)
+	agents := agentCatalog{
+		"reviewer":    {Name: "reviewer", Storage: agent.StorageEphemeral},
+		"implementer": {Name: "implementer", Storage: agent.StoragePersistent},
+	}
+
+	_, err := LoadWorkflows(path, agents)
+	require.NoError(t, err)
+}
+
+func TestLoadWorkflowsDefaultsMaxParallelismToOne(t *testing.T) {
 	path := writeWorkflows(t, `version: v1
 workflows:
   review:
@@ -67,7 +97,7 @@ workflows:
         prompt: Review the change.
 `)
 
-	catalog, err := Load(path, agentCatalog{"reviewer": {Name: "reviewer", Storage: agent.StorageEphemeral}})
+	catalog, err := LoadWorkflows(path, agentCatalog{"reviewer": {Name: "reviewer", Storage: agent.StorageEphemeral}})
 	require.NoError(t, err)
 
 	definition, found := catalog.Find("review")
@@ -75,7 +105,7 @@ workflows:
 	assert.Equal(t, 1, definition.MaxParallelism)
 }
 
-func TestLoadRejectsInvalidWorkflowGraphs(t *testing.T) {
+func TestLoadWorkflowsRejectsInvalidWorkflowGraphs(t *testing.T) {
 	tests := []struct {
 		name    string
 		steps   string
@@ -108,6 +138,23 @@ func TestLoadRejectsInvalidWorkflowGraphs(t *testing.T) {
         agent: implementer
         prompt: Inspect.
 `, message: "non-publishable step requires an ephemeral agent"},
+		{name: "change source is not a direct dependency", steps: `      implement:
+        agent: implementer
+        prompt: Implement.
+      inspect:
+        agent: reviewer
+        prompt: Inspect.
+        change_from: implement
+`, message: "must be a direct dependency"},
+		{name: "change producer is ephemeral", steps: `      implement:
+        agent: reviewer
+        prompt: Implement.
+      inspect:
+        agent: reviewer
+        prompt: Inspect.
+        after: [implement]
+        change_from: implement
+`, message: "step implement requires a persistent agent"},
 	}
 
 	for _, test := range tests {
@@ -118,13 +165,13 @@ func TestLoadRejectsInvalidWorkflowGraphs(t *testing.T) {
 				"implementer": {Name: "implementer", Storage: agent.StoragePersistent},
 			}
 
-			_, err := Load(path, agents)
+			_, err := LoadWorkflows(path, agents)
 			require.ErrorContains(t, err, test.message)
 		})
 	}
 }
 
-func TestLoadRejectsUnknownFields(t *testing.T) {
+func TestLoadWorkflowsRejectsUnknownFields(t *testing.T) {
 	path := writeWorkflows(t, `version: v1
 workflows:
   review:
@@ -136,7 +183,7 @@ workflows:
         prompt: Review.
 `)
 
-	_, err := Load(path, agentCatalog{"reviewer": {Name: "reviewer", Storage: agent.StorageEphemeral}})
+	_, err := LoadWorkflows(path, agentCatalog{"reviewer": {Name: "reviewer", Storage: agent.StorageEphemeral}})
 	require.ErrorContains(t, err, "unknown")
 }
 

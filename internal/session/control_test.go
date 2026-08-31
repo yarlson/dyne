@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,39 @@ func TestStartRecordsIntentBeforeProjectingExecution(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StartResult{Agent: "reviewer", Name: "review", TaskID: "review"}, result)
 	assert.Equal(t, []string{"record intent", "start runtime"}, operations)
+}
+
+func TestStartPersistsAndProjectsWorkflowChangeInput(t *testing.T) {
+	repository := newMemoryRepository()
+	change := &ChangeInput{
+		Session:  "implementation",
+		Artifact: ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
+	}
+	var projected workload.TaskRequest
+	control := newTestControl(t, repository, runtimeStub{start: func(request workload.TaskRequest) error {
+		projected = request
+
+		return nil
+	}}, nil)
+	definition := validDefinition()
+	definition.Storage = StorageEphemeral
+	request := validStartRequest()
+	request.WorkflowRun = "change-200"
+	request.WorkflowStep = "review"
+	request.ResultKind = ResultKindWorkflowOutput
+	request.ChangeInput = change
+
+	_, err := control.Start(context.Background(), definition, request)
+	require.NoError(t, err)
+	stored, err := repository.LatestTask(context.Background(), "review")
+	require.NoError(t, err)
+	require.NotNil(t, stored.ChangeInput)
+	assert.Equal(t, *change, *stored.ChangeInput)
+	require.NotNil(t, projected.ChangeInput)
+	assert.Equal(t, workload.ChangeInput{
+		Session:  "implementation",
+		Artifact: workload.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
+	}, *projected.ChangeInput)
 }
 
 func TestStartWithSameIntentEnsuresPendingExecutionAfterRestart(t *testing.T) {
@@ -77,6 +111,7 @@ func TestStatusPersistsValidatedRuntimeResult(t *testing.T) {
 		return workload.TaskObservation{Phase: workload.TaskSucceeded, Artifacts: workload.TaskArtifacts{
 			Outcome:     []byte(`{"status":"completed","summary":"fixed","blocker":""}`),
 			PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
+			Change:      &workload.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
 		}}, nil
 	}}
 	control := newTestControl(t, repository, runtime, nil)
@@ -93,6 +128,27 @@ func TestStatusPersistsValidatedRuntimeResult(t *testing.T) {
 	artifacts, err := restarted.Artifacts(context.Background(), "review")
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"status":"completed","summary":"fixed","blocker":""}`, string(artifacts.Outcome))
+}
+
+func TestStatusRejectsInvalidRetainedChangeMetadata(t *testing.T) {
+	repository := newMemoryRepository()
+	runtime := runtimeStub{observe: func(string, string) (workload.TaskObservation, error) {
+		return workload.TaskObservation{Phase: workload.TaskSucceeded, Artifacts: workload.TaskArtifacts{
+			Outcome:     []byte(`{"status":"completed","summary":"fixed","blocker":""}`),
+			PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
+			Change:      &workload.ChangeArtifact{SHA256: "invalid", Bytes: 123},
+		}}, nil
+	}}
+	control := newTestControl(t, repository, runtime, nil)
+	_, err := control.Start(context.Background(), validDefinition(), validStartRequest())
+	require.NoError(t, err)
+
+	status, err := control.Status(context.Background(), "review")
+	require.NoError(t, err)
+	assert.Equal(t, TaskFailed, status.State)
+	task, err := repository.LatestTask(context.Background(), "review")
+	require.NoError(t, err)
+	assert.Contains(t, task.Failure, "validate retained change metadata")
 }
 
 func TestContinueUsesDurableDefinitionInsteadOfRuntimeMetadata(t *testing.T) {
@@ -203,12 +259,15 @@ func TestPreparePublicationUsesOnlyDurableSessionState(t *testing.T) {
 	assert.Equal(t, "https://github.com/lokalise/ratchet-test-service", publication.Source.Repository)
 	assert.Equal(t, "coding-agent:test", publication.Source.Image)
 	assert.JSONEq(t, `{"title":"Fix link","body":"Updates the README."}`, string(publication.Source.PullRequest))
+	require.NotNil(t, publication.Source.Change)
+	assert.Equal(t, ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123}, *publication.Source.Change)
 }
 
 func completedObservation(string, string) (workload.TaskObservation, error) {
 	return workload.TaskObservation{Phase: workload.TaskSucceeded, Artifacts: workload.TaskArtifacts{
 		Outcome:     []byte(`{"status":"completed","summary":"fixed","blocker":""}`),
 		PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
+		Change:      &workload.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
 	}}, nil
 }
 

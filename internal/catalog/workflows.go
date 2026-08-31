@@ -1,8 +1,9 @@
-package workflowconfig
+package catalog
 
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"slices"
 	"strings"
@@ -20,12 +21,12 @@ const (
 	maxParallelism         = 8
 )
 
-// Catalog provides immutable workflow definitions loaded at server startup.
-type Catalog struct {
+// Workflows provides immutable workflow definitions loaded at server startup.
+type Workflows struct {
 	definitions map[string]workflow.Definition
 }
 
-type catalogFile struct {
+type workflowCatalogFile struct {
 	Version   string                    `json:"version"`
 	Workflows map[string]definitionFile `json:"workflows"`
 }
@@ -40,11 +41,12 @@ type stepFile struct {
 	Agent       string   `json:"agent"`
 	Prompt      string   `json:"prompt"`
 	After       []string `json:"after"`
+	ChangeFrom  string   `json:"change_from"`
 	Publishable bool     `json:"publishable"`
 }
 
-// Load reads and validates one complete workflow catalog.
-func Load(path string, agents agent.AgentCatalog) (*Catalog, error) {
+// LoadWorkflows reads and validates one complete workflow catalog.
+func LoadWorkflows(path string, agents agent.AgentCatalog) (*Workflows, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read workflows file: %w", err)
@@ -54,7 +56,41 @@ func Load(path string, agents agent.AgentCatalog) (*Catalog, error) {
 		return nil, fmt.Errorf("workflows file exceeds %d bytes", maxWorkflowConfigBytes)
 	}
 
-	var source catalogFile
+	return loadWorkflowCatalog(contents, agents)
+}
+
+func loadWorkflowsFS(files fs.FS, name string, agents agent.AgentCatalog) (*Workflows, error) {
+	if files == nil || !fs.ValidPath(name) {
+		return nil, fmt.Errorf("read workflows file: invalid file path %q", name)
+	}
+
+	info, err := fs.Stat(files, name)
+	if err != nil {
+		return nil, fmt.Errorf("read workflows file: %w", err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("read workflows file: file %q must be a regular file", name)
+	}
+
+	if info.Size() > maxWorkflowConfigBytes {
+		return nil, fmt.Errorf("workflows file exceeds %d bytes", maxWorkflowConfigBytes)
+	}
+
+	contents, err := fs.ReadFile(files, name)
+	if err != nil {
+		return nil, fmt.Errorf("read workflows file: %w", err)
+	}
+
+	if len(contents) > maxWorkflowConfigBytes {
+		return nil, fmt.Errorf("workflows file exceeds %d bytes", maxWorkflowConfigBytes)
+	}
+
+	return loadWorkflowCatalog(contents, agents)
+}
+
+func loadWorkflowCatalog(contents []byte, agents agent.AgentCatalog) (*Workflows, error) {
+	var source workflowCatalogFile
 	if err := yaml.UnmarshalStrict(contents, &source); err != nil {
 		return nil, fmt.Errorf("decode workflows file: %w", err)
 	}
@@ -69,7 +105,7 @@ func Load(path string, agents agent.AgentCatalog) (*Catalog, error) {
 
 	definitions := make(map[string]workflow.Definition, len(source.Workflows))
 	for name, raw := range source.Workflows {
-		definition, err := loadDefinition(name, raw, agents)
+		definition, err := loadWorkflowDefinition(name, raw, agents)
 		if err != nil {
 			return nil, fmt.Errorf("workflow %s: %w", name, err)
 		}
@@ -77,11 +113,11 @@ func Load(path string, agents agent.AgentCatalog) (*Catalog, error) {
 		definitions[name] = definition
 	}
 
-	return &Catalog{definitions: definitions}, nil
+	return &Workflows{definitions: definitions}, nil
 }
 
 // List returns safe workflow summaries sorted by name.
-func (c *Catalog) List() []workflow.Summary {
+func (c *Workflows) List() []workflow.Summary {
 	if c == nil {
 		return []workflow.Summary{}
 	}
@@ -102,7 +138,7 @@ func (c *Catalog) List() []workflow.Summary {
 }
 
 // Find returns one workflow definition by name.
-func (c *Catalog) Find(name string) (workflow.Definition, bool) {
+func (c *Workflows) Find(name string) (workflow.Definition, bool) {
 	if c == nil {
 		return workflow.Definition{}, false
 	}
@@ -112,7 +148,7 @@ func (c *Catalog) Find(name string) (workflow.Definition, bool) {
 	return workflow.CloneDefinition(definition), found
 }
 
-func loadDefinition(name string, raw definitionFile, agents agent.AgentCatalog) (workflow.Definition, error) {
+func loadWorkflowDefinition(name string, raw definitionFile, agents agent.AgentCatalog) (workflow.Definition, error) {
 	if messages := validation.IsDNS1123Label(name); len(messages) > 0 {
 		return workflow.Definition{}, fmt.Errorf("name must be a lowercase DNS label: %s", strings.Join(messages, ", "))
 	}
@@ -137,7 +173,7 @@ func loadDefinition(name string, raw definitionFile, agents agent.AgentCatalog) 
 	steps := make(map[string]workflow.StepDefinition, len(raw.Steps))
 	publishable := ""
 	for stepName, rawStep := range raw.Steps {
-		step, err := loadStep(stepName, rawStep, agents)
+		step, err := loadWorkflowStep(stepName, rawStep, agents)
 		if err != nil {
 			return workflow.Definition{}, fmt.Errorf("step %s: %w", stepName, err)
 		}
@@ -157,6 +193,26 @@ func loadDefinition(name string, raw definitionFile, agents agent.AgentCatalog) 
 		return workflow.Definition{}, err
 	}
 
+	changeProducers, err := validateChangeHandoffs(steps)
+	if err != nil {
+		return workflow.Definition{}, err
+	}
+
+	for stepName, step := range steps {
+		storage := step.SessionDefinition.Storage
+		if step.Publishable || changeProducers[stepName] {
+			if storage != agent.StoragePersistent {
+				return workflow.Definition{}, fmt.Errorf("step %s requires a persistent agent", stepName)
+			}
+
+			continue
+		}
+
+		if storage != agent.StorageEphemeral {
+			return workflow.Definition{}, fmt.Errorf("step %s: non-publishable step requires an ephemeral agent", stepName)
+		}
+	}
+
 	if publishable != "" {
 		for _, step := range steps {
 			if slices.Contains(step.After, publishable) {
@@ -170,7 +226,7 @@ func loadDefinition(name string, raw definitionFile, agents agent.AgentCatalog) 
 	}, nil
 }
 
-func loadStep(name string, raw stepFile, agents agent.AgentCatalog) (workflow.StepDefinition, error) {
+func loadWorkflowStep(name string, raw stepFile, agents agent.AgentCatalog) (workflow.StepDefinition, error) {
 	if messages := validation.IsDNS1123Label(name); len(messages) > 0 {
 		return workflow.StepDefinition{}, fmt.Errorf("name must be a lowercase DNS label: %s", strings.Join(messages, ", "))
 	}
@@ -188,14 +244,6 @@ func loadStep(name string, raw stepFile, agents agent.AgentCatalog) (workflow.St
 		return workflow.StepDefinition{}, fmt.Errorf("agent %s is not configured", raw.Agent)
 	}
 
-	if raw.Publishable && definition.Storage != agent.StoragePersistent {
-		return workflow.StepDefinition{}, errors.New("publishable step requires a persistent agent")
-	}
-
-	if !raw.Publishable && definition.Storage != agent.StorageEphemeral {
-		return workflow.StepDefinition{}, errors.New("non-publishable step requires an ephemeral agent")
-	}
-
 	dependencies := make(map[string]struct{}, len(raw.After))
 	for _, dependency := range raw.After {
 		if _, exists := dependencies[dependency]; exists {
@@ -207,8 +255,25 @@ func loadStep(name string, raw stepFile, agents agent.AgentCatalog) (workflow.St
 
 	return workflow.StepDefinition{
 		Name: name, Agent: raw.Agent, Prompt: raw.Prompt, After: slices.Clone(raw.After),
-		Publishable: raw.Publishable, SessionDefinition: definition.SessionDefinition(),
+		ChangeFrom: raw.ChangeFrom, Publishable: raw.Publishable, SessionDefinition: definition.SessionDefinition(),
 	}, nil
+}
+
+func validateChangeHandoffs(steps map[string]workflow.StepDefinition) (map[string]bool, error) {
+	producers := make(map[string]bool)
+	for name, step := range steps {
+		if step.ChangeFrom == "" {
+			continue
+		}
+
+		if !slices.Contains(step.After, step.ChangeFrom) {
+			return nil, fmt.Errorf("step %s change_from %s must be a direct dependency", name, step.ChangeFrom)
+		}
+
+		producers[step.ChangeFrom] = true
+	}
+
+	return producers, nil
 }
 
 func validateGraph(steps map[string]workflow.StepDefinition) error {

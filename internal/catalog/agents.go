@@ -1,9 +1,11 @@
-package agentconfig
+package catalog
 
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,22 +20,23 @@ import (
 
 const maxAgentConfigBytes = 900 * 1024
 
-// Defaults supplies server-owned values omitted from an agent definition.
-type Defaults struct {
+// AgentDefaults supplies server-owned values omitted from an agent definition.
+type AgentDefaults struct {
 	// StorageSize is the default PVC capacity for persistent agents.
 	StorageSize string
 	// TaskTimeout is the default task duration.
 	TaskTimeout time.Duration
 }
 
-// Catalog provides immutable agent definitions loaded at server startup.
-type Catalog struct {
+// Agents provides immutable agent definitions loaded at server startup.
+type Agents struct {
 	definitions map[string]agent.AgentDefinition
 }
 
-type catalogFile struct {
-	Version string                     `json:"version"`
-	Agents  map[string]agentDefinition `json:"agents"`
+type agentCatalogFile struct {
+	Version  string                     `json:"version"`
+	Guidance string                     `json:"guidance"`
+	Agents   map[string]agentDefinition `json:"agents"`
 }
 
 type agentDefinition struct {
@@ -52,8 +55,10 @@ type skillMetadata struct {
 	Description string `json:"description"`
 }
 
-// Load reads and validates one complete agent catalog.
-func Load(path string, defaults Defaults) (*Catalog, error) {
+type catalogReader func(relativePath, kind string) ([]byte, string, error)
+
+// LoadAgents reads and validates one complete agent catalog.
+func LoadAgents(path string, defaults AgentDefaults) (*Agents, error) {
 	if err := validateDefaults(defaults); err != nil {
 		return nil, err
 	}
@@ -63,17 +68,9 @@ func Load(path string, defaults Defaults) (*Catalog, error) {
 		return nil, fmt.Errorf("read agents file: %w", err)
 	}
 
-	var source catalogFile
-	if err := yaml.UnmarshalStrict(contents, &source); err != nil {
-		return nil, fmt.Errorf("decode agents file: %w", err)
-	}
-
-	if source.Version != "v1" {
-		return nil, fmt.Errorf("unsupported agents file version %q", source.Version)
-	}
-
-	if len(source.Agents) == 0 {
-		return nil, errors.New("agents file must define at least one agent")
+	source, err := decodeAgentCatalog(contents)
+	if err != nil {
+		return nil, err
 	}
 
 	directory, err := filepath.Abs(filepath.Dir(path))
@@ -86,9 +83,72 @@ func Load(path string, defaults Defaults) (*Catalog, error) {
 		return nil, fmt.Errorf("resolve agents file directory: %w", err)
 	}
 
+	reader := func(relativePath, kind string) ([]byte, string, error) {
+		filePath, cleanPath, err := catalogFilePath(directory, relativePath, kind)
+		if err != nil {
+			return nil, "", err
+		}
+
+		contents, err := readBoundedFile(filePath, maxAgentConfigBytes)
+		if err != nil {
+			return nil, "", fmt.Errorf("read %s %q: %w", kind, relativePath, err)
+		}
+
+		return contents, cleanPath, nil
+	}
+
+	return loadAgentCatalog(source, reader, defaults)
+}
+
+func loadAgentsFS(files fs.FS, name string, defaults AgentDefaults) (*Agents, error) {
+	if err := validateDefaults(defaults); err != nil {
+		return nil, err
+	}
+
+	contents, err := readBoundedFSFile(files, name, maxAgentConfigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read agents file: %w", err)
+	}
+
+	source, err := decodeAgentCatalog(contents)
+	if err != nil {
+		return nil, err
+	}
+
+	directory := path.Dir(name)
+	reader := func(relativePath, kind string) ([]byte, string, error) {
+		return readCatalogFSFile(files, directory, relativePath, kind)
+	}
+
+	return loadAgentCatalog(source, reader, defaults)
+}
+
+func decodeAgentCatalog(contents []byte) (agentCatalogFile, error) {
+	var source agentCatalogFile
+	if err := yaml.UnmarshalStrict(contents, &source); err != nil {
+		return agentCatalogFile{}, fmt.Errorf("decode agents file: %w", err)
+	}
+
+	if source.Version != "v1" {
+		return agentCatalogFile{}, fmt.Errorf("unsupported agents file version %q", source.Version)
+	}
+
+	if len(source.Agents) == 0 {
+		return agentCatalogFile{}, errors.New("agents file must define at least one agent")
+	}
+
+	return source, nil
+}
+
+func loadAgentCatalog(source agentCatalogFile, reader catalogReader, defaults AgentDefaults) (*Agents, error) {
+	guidance, err := loadGuidance(reader, source.Guidance)
+	if err != nil {
+		return nil, err
+	}
+
 	definitions := make(map[string]agent.AgentDefinition, len(source.Agents))
 	for name, raw := range source.Agents {
-		definition, err := loadDefinition(directory, name, raw, defaults)
+		definition, err := loadAgentDefinition(reader, name, raw, guidance, defaults)
 		if err != nil {
 			return nil, fmt.Errorf("agent %s: %w", name, err)
 		}
@@ -96,11 +156,11 @@ func Load(path string, defaults Defaults) (*Catalog, error) {
 		definitions[name] = definition
 	}
 
-	return &Catalog{definitions: definitions}, nil
+	return &Agents{definitions: definitions}, nil
 }
 
 // List returns safe agent summaries sorted by name.
-func (c *Catalog) List() []agent.AgentSummary {
+func (c *Agents) List() []agent.AgentSummary {
 	if c == nil {
 		return []agent.AgentSummary{}
 	}
@@ -126,7 +186,7 @@ func (c *Catalog) List() []agent.AgentSummary {
 }
 
 // Find returns one agent definition by name.
-func (c *Catalog) Find(name string) (agent.AgentDefinition, bool) {
+func (c *Agents) Find(name string) (agent.AgentDefinition, bool) {
 	if c == nil {
 		return agent.AgentDefinition{}, false
 	}
@@ -137,7 +197,7 @@ func (c *Catalog) Find(name string) (agent.AgentDefinition, bool) {
 	return definition, found
 }
 
-func loadDefinition(directory, name string, raw agentDefinition, defaults Defaults) (agent.AgentDefinition, error) {
+func loadAgentDefinition(reader catalogReader, name string, raw agentDefinition, guidance string, defaults AgentDefaults) (agent.AgentDefinition, error) {
 	if messages := validation.IsDNS1123Label(name); len(messages) > 0 {
 		return agent.AgentDefinition{}, fmt.Errorf("name must be a lowercase DNS label: %s", strings.Join(messages, ", "))
 	}
@@ -190,12 +250,17 @@ func loadDefinition(directory, name string, raw agentDefinition, defaults Defaul
 		return agent.AgentDefinition{}, errors.New("timeout must be greater than zero")
 	}
 
-	skills, err := loadSkills(directory, raw.Skills)
+	skills, err := loadSkills(reader, raw.Skills)
 	if err != nil {
 		return agent.AgentDefinition{}, err
 	}
 
-	size := len(raw.Instructions)
+	instructions := raw.Instructions
+	if guidance != "" {
+		instructions = strings.TrimSpace(guidance) + "\n\n" + strings.TrimSpace(instructions)
+	}
+
+	size := len(instructions)
 	for _, skill := range skills {
 		size += len(skill.Name) + len(skill.Contents)
 	}
@@ -208,7 +273,7 @@ func loadDefinition(directory, name string, raw agentDefinition, defaults Defaul
 		Name:         name,
 		Description:  raw.Description,
 		Storage:      agent.Storage(raw.Storage),
-		Instructions: raw.Instructions,
+		Instructions: instructions,
 		Skills:       skills,
 		SetupCommand: raw.SetupCommand,
 		CloneDepth:   cloneDepth,
@@ -217,7 +282,7 @@ func loadDefinition(directory, name string, raw agentDefinition, defaults Defaul
 	}, nil
 }
 
-func validateDefaults(defaults Defaults) error {
+func validateDefaults(defaults AgentDefaults) error {
 	if _, err := resource.ParseQuantity(defaults.StorageSize); err != nil {
 		return fmt.Errorf("parse default storage size: %w", err)
 	}
@@ -229,11 +294,11 @@ func validateDefaults(defaults Defaults) error {
 	return nil
 }
 
-func loadSkills(directory string, paths []string) ([]agent.AgentSkill, error) {
+func loadSkills(reader catalogReader, paths []string) ([]agent.AgentSkill, error) {
 	skills := make([]agent.AgentSkill, 0, len(paths))
 	names := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		skill, err := loadSkill(directory, path)
+		skill, err := loadSkill(reader, path)
 		if err != nil {
 			return nil, err
 		}
@@ -249,47 +314,14 @@ func loadSkills(directory string, paths []string) ([]agent.AgentSkill, error) {
 	return skills, nil
 }
 
-func loadSkill(directory, relativePath string) (agent.AgentSkill, error) {
-	if relativePath == "" || filepath.IsAbs(relativePath) {
-		return agent.AgentSkill{}, fmt.Errorf("skill path %q must be relative", relativePath)
-	}
-
-	cleanPath := filepath.Clean(relativePath)
-	if cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
-		return agent.AgentSkill{}, fmt.Errorf("skill path %q must stay within the agents file directory", relativePath)
+func loadSkill(reader catalogReader, relativePath string) (agent.AgentSkill, error) {
+	contents, cleanPath, err := reader(relativePath, "skill")
+	if err != nil {
+		return agent.AgentSkill{}, err
 	}
 
 	if filepath.Base(cleanPath) != "SKILL.md" {
 		return agent.AgentSkill{}, fmt.Errorf("skill path %q must identify SKILL.md", relativePath)
-	}
-
-	path := filepath.Join(directory, cleanPath)
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return agent.AgentSkill{}, fmt.Errorf("resolve skill path %q: %w", relativePath, err)
-	}
-
-	absoluteResolved, err := filepath.Abs(resolved)
-	if err != nil {
-		return agent.AgentSkill{}, fmt.Errorf("resolve skill path %q: %w", relativePath, err)
-	}
-
-	if absoluteResolved != path {
-		return agent.AgentSkill{}, fmt.Errorf("skill path %q must not contain symlinks", relativePath)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return agent.AgentSkill{}, fmt.Errorf("stat skill path %q: %w", relativePath, err)
-	}
-
-	if !info.Mode().IsRegular() {
-		return agent.AgentSkill{}, fmt.Errorf("skill path %q must be a regular file", relativePath)
-	}
-
-	contents, err := readBoundedFile(path, maxAgentConfigBytes)
-	if err != nil {
-		return agent.AgentSkill{}, fmt.Errorf("read skill %q: %w", relativePath, err)
 	}
 
 	metadata, err := parseSkillMetadata(contents)
@@ -298,6 +330,82 @@ func loadSkill(directory, relativePath string) (agent.AgentSkill, error) {
 	}
 
 	return agent.AgentSkill{Name: metadata.Name, Contents: string(contents)}, nil
+}
+
+func loadGuidance(reader catalogReader, relativePath string) (string, error) {
+	if relativePath == "" {
+		return "", nil
+	}
+
+	contents, cleanPath, err := reader(relativePath, "guidance")
+	if err != nil {
+		return "", err
+	}
+
+	if filepath.Base(cleanPath) != "AGENTS.md" {
+		return "", fmt.Errorf("guidance path %q must identify AGENTS.md", relativePath)
+	}
+
+	if strings.TrimSpace(string(contents)) == "" {
+		return "", fmt.Errorf("guidance %q is empty", relativePath)
+	}
+
+	return string(contents), nil
+}
+
+func catalogFilePath(directory, relativePath, kind string) (string, string, error) {
+	if relativePath == "" || filepath.IsAbs(relativePath) {
+		return "", "", fmt.Errorf("%s path %q must be relative", kind, relativePath)
+	}
+
+	cleanPath := filepath.Clean(relativePath)
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("%s path %q must stay within the agents file directory", kind, relativePath)
+	}
+
+	path := filepath.Join(directory, cleanPath)
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve %s path %q: %w", kind, relativePath, err)
+	}
+
+	absoluteResolved, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve %s path %q: %w", kind, relativePath, err)
+	}
+
+	if absoluteResolved != path {
+		return "", "", fmt.Errorf("%s path %q must not contain symlinks", kind, relativePath)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", "", fmt.Errorf("stat %s path %q: %w", kind, relativePath, err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("%s path %q must be a regular file", kind, relativePath)
+	}
+
+	return path, cleanPath, nil
+}
+
+func readCatalogFSFile(files fs.FS, directory, relativePath, kind string) ([]byte, string, error) {
+	if relativePath == "" || path.IsAbs(relativePath) {
+		return nil, "", fmt.Errorf("%s path %q must be relative", kind, relativePath)
+	}
+
+	cleanPath := path.Clean(relativePath)
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return nil, "", fmt.Errorf("%s path %q must stay within the agents file directory", kind, relativePath)
+	}
+
+	contents, err := readBoundedFSFile(files, path.Join(directory, cleanPath), maxAgentConfigBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s %q: %w", kind, relativePath, err)
+	}
+
+	return contents, cleanPath, nil
 }
 
 func parseSkillMetadata(contents []byte) (skillMetadata, error) {
@@ -346,4 +454,34 @@ func readBoundedFile(path string, maximum int64) ([]byte, error) {
 	}
 
 	return os.ReadFile(path)
+}
+
+func readBoundedFSFile(files fs.FS, name string, maximum int64) ([]byte, error) {
+	if files == nil || !fs.ValidPath(name) {
+		return nil, fmt.Errorf("invalid file path %q", name)
+	}
+
+	info, err := fs.Stat(files, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("file %q must be a regular file", name)
+	}
+
+	if info.Size() > maximum {
+		return nil, fmt.Errorf("file exceeds %d bytes", maximum)
+	}
+
+	contents, err := fs.ReadFile(files, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if int64(len(contents)) > maximum {
+		return nil, fmt.Errorf("file exceeds %d bytes", maximum)
+	}
+
+	return contents, nil
 }

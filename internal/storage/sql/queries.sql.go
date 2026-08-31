@@ -132,8 +132,9 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (i
 const createSessionTask = `-- name: CreateSessionTask :exec
 INSERT INTO session_tasks (
     session_name, task_id, prompt, timeout_nanoseconds, result_kind, state,
-    outcome, pull_request, workflow_output, failure, created_at, finished_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    change_input, outcome, pull_request, workflow_output, change_artifact,
+    failure, created_at, finished_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 `
 
 type CreateSessionTaskParams struct {
@@ -143,9 +144,11 @@ type CreateSessionTaskParams struct {
 	TimeoutNanoseconds int64         `json:"timeout_nanoseconds"`
 	ResultKind         string        `json:"result_kind"`
 	State              string        `json:"state"`
+	ChangeInput        []byte        `json:"change_input"`
 	Outcome            []byte        `json:"outcome"`
 	PullRequest        []byte        `json:"pull_request"`
 	WorkflowOutput     []byte        `json:"workflow_output"`
+	ChangeArtifact     []byte        `json:"change_artifact"`
 	Failure            string        `json:"failure"`
 	CreatedAt          int64         `json:"created_at"`
 	FinishedAt         sql.NullInt64 `json:"finished_at"`
@@ -159,9 +162,11 @@ func (q *Queries) CreateSessionTask(ctx context.Context, arg CreateSessionTaskPa
 		arg.TimeoutNanoseconds,
 		arg.ResultKind,
 		arg.State,
+		arg.ChangeInput,
 		arg.Outcome,
 		arg.PullRequest,
 		arg.WorkflowOutput,
+		arg.ChangeArtifact,
 		arg.Failure,
 		arg.CreatedAt,
 		arg.FinishedAt,
@@ -215,7 +220,8 @@ func (q *Queries) GetAgentSnapshot(ctx context.Context, arg GetAgentSnapshotPara
 
 const getLatestSessionTask = `-- name: GetLatestSessionTask :one
 SELECT session_name, task_id, prompt, timeout_nanoseconds, result_kind, state,
-       outcome, pull_request, workflow_output, failure, created_at, finished_at
+       outcome, pull_request, workflow_output, failure, created_at, finished_at,
+       change_input, change_artifact
 FROM session_tasks
 WHERE session_name = $1
 ORDER BY created_at DESC, task_id DESC
@@ -238,6 +244,8 @@ func (q *Queries) GetLatestSessionTask(ctx context.Context, sessionName string) 
 		&i.Failure,
 		&i.CreatedAt,
 		&i.FinishedAt,
+		&i.ChangeInput,
+		&i.ChangeArtifact,
 	)
 	return i, err
 }
@@ -431,8 +439,9 @@ SET state = $3,
     outcome = $4,
     pull_request = $5,
     workflow_output = $6,
-    failure = $7,
-    finished_at = $8
+    change_artifact = $7,
+    failure = $8,
+    finished_at = $9
 WHERE session_name = $1 AND task_id = $2
 `
 
@@ -443,6 +452,7 @@ type UpdateSessionTaskParams struct {
 	Outcome        []byte        `json:"outcome"`
 	PullRequest    []byte        `json:"pull_request"`
 	WorkflowOutput []byte        `json:"workflow_output"`
+	ChangeArtifact []byte        `json:"change_artifact"`
 	Failure        string        `json:"failure"`
 	FinishedAt     sql.NullInt64 `json:"finished_at"`
 }
@@ -455,6 +465,7 @@ func (q *Queries) UpdateSessionTask(ctx context.Context, arg UpdateSessionTaskPa
 		arg.Outcome,
 		arg.PullRequest,
 		arg.WorkflowOutput,
+		arg.ChangeArtifact,
 		arg.Failure,
 		arg.FinishedAt,
 	)

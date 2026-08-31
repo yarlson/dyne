@@ -9,10 +9,50 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yarlson/dyne/internal/catalog"
 )
+
+func TestLoadServerCatalogsUsesBuiltInEngineeringCatalogByDefault(t *testing.T) {
+	agents, workflows, err := loadServerCatalogs("", "", catalog.AgentDefaults{
+		StorageSize: "10Gi",
+		TaskTimeout: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Len(t, agents.List(), 6)
+	assert.Len(t, workflows.List(), 2)
+}
+
+func TestLoadServerCatalogsUsesCustomAgentsWithoutBuiltInWorkflows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agents.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`version: v1
+agents:
+  reviewer:
+    description: Reviews changes.
+    storage: ephemeral
+    instructions: Review the requested change.
+`), 0o600))
+
+	agents, workflows, err := loadServerCatalogs(path, "", catalog.AgentDefaults{
+		StorageSize: "10Gi",
+		TaskTimeout: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Len(t, agents.List(), 1)
+	assert.Nil(t, workflows)
+}
+
+func TestLoadServerCatalogsRequiresCustomAgentsForCustomWorkflows(t *testing.T) {
+	_, _, err := loadServerCatalogs("", "workflows.yaml", catalog.AgentDefaults{
+		StorageSize: "10Gi",
+		TaskTimeout: time.Hour,
+	})
+	require.EqualError(t, err, "--agents-file is required with --workflows-file")
+}
 
 func TestAgentsListsServerDefinitions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

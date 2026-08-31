@@ -27,7 +27,21 @@ const (
 	ResultKindPullRequest ResultKind = "pull-request"
 	// ResultKindWorkflowOutput requires JSON output for a dependent workflow step.
 	ResultKindWorkflowOutput ResultKind = "workflow-output"
+	// ResultKindWorkflowChange requires a workflow output and retained patch.
+	ResultKindWorkflowChange ResultKind = "workflow-change"
 )
+
+// ChangeArtifact identifies one retained patch.
+type ChangeArtifact struct {
+	SHA256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
+}
+
+// ChangeInput identifies the retained patch applied before a task starts.
+type ChangeInput struct {
+	Session  string         `json:"session"`
+	Artifact ChangeArtifact `json:"artifact"`
+}
 
 // TaskState is the durable lifecycle state of one bounded coding task.
 type TaskState string
@@ -75,6 +89,7 @@ type StartRequest struct {
 	ResultKind   ResultKind
 	WorkflowRun  string
 	WorkflowStep string
+	ChangeInput  *ChangeInput
 }
 
 // StartResult identifies the accepted initial task.
@@ -109,6 +124,7 @@ type Artifacts struct {
 	Outcome        json.RawMessage `json:"outcome"`
 	PullRequest    json.RawMessage `json:"pull_request,omitempty"`
 	WorkflowOutput json.RawMessage `json:"workflow_output,omitempty"`
+	Change         *ChangeArtifact `json:"change,omitempty"`
 }
 
 // Record is the durable identity and immutable definition of one session.
@@ -133,15 +149,16 @@ type Deletion struct {
 
 // Task is one durable bounded execution within a session.
 type Task struct {
-	ID         string
-	Prompt     string
-	Timeout    time.Duration
-	ResultKind ResultKind
-	State      TaskState
-	Artifacts  Artifacts
-	Failure    string
-	CreatedAt  time.Time
-	FinishedAt *time.Time
+	ID          string
+	Prompt      string
+	Timeout     time.Duration
+	ResultKind  ResultKind
+	ChangeInput *ChangeInput
+	State       TaskState
+	Artifacts   Artifacts
+	Failure     string
+	CreatedAt   time.Time
+	FinishedAt  *time.Time
 }
 
 // PublicationSource is the durable eligible source for one publish operation.
@@ -150,6 +167,7 @@ type PublicationSource struct {
 	InitialRef  string
 	Image       string
 	PullRequest json.RawMessage
+	Change      *ChangeArtifact
 }
 
 // RepositoryTokenProvider returns short-lived repository credentials.

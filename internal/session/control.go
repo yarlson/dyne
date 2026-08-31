@@ -19,7 +19,10 @@ import (
 
 const maxAgentConfigBytes = 900 * 1024
 
-var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
+var (
+	dnsLabelPattern     = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
+	changeSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
 
 // ErrorKind classifies a session operation failure for entrypoints.
 type ErrorKind string
@@ -478,7 +481,7 @@ func (c *Control) PreparePublication(ctx context.Context, name string) (*Publica
 
 	return &Publication{Source: PublicationSource{
 		Repository: record.Repository, InitialRef: record.InitialRef, Image: record.Image,
-		PullRequest: task.Artifacts.PullRequest,
+		PullRequest: task.Artifacts.PullRequest, Change: cloneChangeArtifact(task.Artifacts.Change),
 	}, release: release}, nil
 }
 
@@ -492,7 +495,7 @@ func (c *Control) initialIntent(definition Definition, request StartRequest) (Re
 			WorkflowRun: request.WorkflowRun, WorkflowStep: request.WorkflowStep, CreatedAt: now,
 		}, Task{
 			ID: request.Name, Prompt: request.Prompt, Timeout: request.Timeout, ResultKind: request.ResultKind,
-			State: TaskPending, CreatedAt: now,
+			ChangeInput: cloneChangeInput(request.ChangeInput), State: TaskPending, CreatedAt: now,
 		}
 }
 
@@ -528,7 +531,7 @@ func (c *Control) synchronizeLatestTask(ctx context.Context, record Record) (Tas
 		return Task{}, newOperationError(ErrorUnavailable, "observe session task failed", err)
 	}
 
-	if err := applyObservation(&task, observation, c.now().UTC()); err != nil {
+	if err := applyObservation(&task, observation, record.Definition.Storage, c.now().UTC()); err != nil {
 		task.State = TaskFailed
 		task.Failure = err.Error()
 		now := c.now().UTC()
@@ -542,7 +545,7 @@ func (c *Control) synchronizeLatestTask(ctx context.Context, record Record) (Tas
 	return task, nil
 }
 
-func applyObservation(task *Task, observation workload.TaskObservation, now time.Time) error {
+func applyObservation(task *Task, observation workload.TaskObservation, storage Storage, now time.Time) error {
 	switch observation.Phase {
 	case workload.TaskPending:
 		task.State = TaskPending
@@ -590,9 +593,27 @@ func applyObservation(task *Task, observation workload.TaskObservation, now time
 			if len(observation.Artifacts.PullRequest) == 0 {
 				return errors.New("completed task did not report pull request metadata")
 			}
+
+			if storage == StoragePersistent && observation.Artifacts.Change != nil {
+				if err := validateChangeArtifact(observation.Artifacts.Change.SHA256, observation.Artifacts.Change.Bytes); err != nil {
+					return fmt.Errorf("validate retained change metadata: %w", err)
+				}
+			}
 		case ResultKindWorkflowOutput:
 			if len(observation.Artifacts.WorkflowOutput) == 0 {
 				return errors.New("completed task did not report workflow output")
+			}
+		case ResultKindWorkflowChange:
+			if len(observation.Artifacts.WorkflowOutput) == 0 {
+				return errors.New("completed workflow change task did not report workflow output")
+			}
+
+			if observation.Artifacts.Change == nil {
+				return errors.New("completed workflow change task did not report retained change metadata")
+			}
+
+			if err := validateChangeArtifact(observation.Artifacts.Change.SHA256, observation.Artifacts.Change.Bytes); err != nil {
+				return fmt.Errorf("validate retained change metadata: %w", err)
 			}
 		}
 	}
@@ -618,13 +639,15 @@ func taskRequest(record Record, task Task, resume bool, credential string) workl
 		CloneDepth: record.Definition.CloneDepth, StorageSize: record.Definition.StorageSize,
 		Timeout: task.Timeout, ResultKind: workload.ResultKind(task.ResultKind),
 		WorkflowRun: record.WorkflowRun, WorkflowStep: record.WorkflowStep,
-		Resume: resume, RepositoryCredential: credential,
+		ChangeInput: workloadChangeInput(task.ChangeInput),
+		Resume:      resume, RepositoryCredential: credential,
 	}
 }
 
 func taskArtifacts(artifacts workload.TaskArtifacts) Artifacts {
 	return Artifacts{
 		Outcome: artifacts.Outcome, PullRequest: artifacts.PullRequest, WorkflowOutput: artifacts.WorkflowOutput,
+		Change: sessionChangeArtifact(artifacts.Change),
 	}
 }
 
@@ -644,6 +667,24 @@ func validateStart(definition Definition, request StartRequest) error {
 
 		if err := validateDNSLabel("workflow step", request.WorkflowStep, 63); err != nil {
 			return err
+		}
+	}
+
+	if request.ChangeInput != nil {
+		if request.WorkflowRun == "" {
+			return errors.New("change input requires a workflow-owned session")
+		}
+
+		if err := validateDNSLabel("change input session", request.ChangeInput.Session, 40); err != nil {
+			return err
+		}
+
+		if request.ChangeInput.Session == request.Name {
+			return errors.New("change input session must differ from the target session")
+		}
+
+		if err := validateChangeArtifact(request.ChangeInput.Artifact.SHA256, request.ChangeInput.Artifact.Bytes); err != nil {
+			return fmt.Errorf("change input: %w", err)
 		}
 	}
 
@@ -677,11 +718,70 @@ func validateStart(definition Definition, request StartRequest) error {
 
 	switch request.ResultKind {
 	case ResultKindPullRequest, ResultKindWorkflowOutput:
+	case ResultKindWorkflowChange:
+		if request.WorkflowRun == "" {
+			return errors.New("workflow change result requires a workflow-owned session")
+		}
+
+		if definition.Storage != StoragePersistent {
+			return errors.New("workflow change result requires persistent storage")
+		}
 	default:
 		return fmt.Errorf("unsupported result kind %q", request.ResultKind)
 	}
 
 	return nil
+}
+
+func validateChangeArtifact(sha256 string, bytes int64) error {
+	if !changeSHA256Pattern.MatchString(sha256) {
+		return errors.New("sha256 must contain 64 lowercase hexadecimal characters")
+	}
+
+	if bytes <= 0 {
+		return errors.New("bytes must be greater than zero")
+	}
+
+	return nil
+}
+
+func cloneChangeInput(input *ChangeInput) *ChangeInput {
+	if input == nil {
+		return nil
+	}
+
+	clone := *input
+
+	return &clone
+}
+
+func cloneChangeArtifact(artifact *ChangeArtifact) *ChangeArtifact {
+	if artifact == nil {
+		return nil
+	}
+
+	clone := *artifact
+
+	return &clone
+}
+
+func workloadChangeInput(input *ChangeInput) *workload.ChangeInput {
+	if input == nil {
+		return nil
+	}
+
+	return &workload.ChangeInput{
+		Session:  input.Session,
+		Artifact: workload.ChangeArtifact{SHA256: input.Artifact.SHA256, Bytes: input.Artifact.Bytes},
+	}
+}
+
+func sessionChangeArtifact(artifact *workload.ChangeArtifact) *ChangeArtifact {
+	if artifact == nil {
+		return nil
+	}
+
+	return &ChangeArtifact{SHA256: artifact.SHA256, Bytes: artifact.Bytes}
 }
 
 func validateDefinition(definition Definition) error {

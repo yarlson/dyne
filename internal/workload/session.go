@@ -46,7 +46,7 @@ func manifestSpec(request TaskRequest, namespace string) sessionManifestSpec {
 		CloneDepth: request.CloneDepth, StorageSize: request.StorageSize,
 		TimeoutSeconds: int64(request.Timeout.Seconds()), ResultKind: request.ResultKind,
 		WorkflowRun: request.WorkflowRun, WorkflowStep: request.WorkflowStep,
-		Resume: request.Resume, GitCredential: request.RepositoryCredential,
+		ChangeInput: request.ChangeInput, Resume: request.Resume, GitCredential: request.RepositoryCredential,
 	}
 }
 
@@ -219,6 +219,13 @@ func parseTaskArtifacts(message string) (TaskArtifacts, error) {
 			result.PullRequest = contents
 		case "workflow-output":
 			result.WorkflowOutput = contents
+		case "change":
+			var change ChangeArtifact
+			if err := json.Unmarshal(contents, &change); err != nil {
+				return TaskArtifacts{}, errors.New("task artifact change is invalid")
+			}
+
+			result.Change = &change
 		}
 	}
 

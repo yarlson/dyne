@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/yarlson/dyne/internal/agent"
+	"github.com/yarlson/dyne/internal/catalog"
 	dynegithub "github.com/yarlson/dyne/internal/github"
 	"github.com/yarlson/dyne/internal/publish"
 	"github.com/yarlson/dyne/internal/session"
@@ -49,8 +50,9 @@ const (
 	testRepositoryBase                 = "main"
 	brokenDocumentationLink            = "[environment variable configuration]()"
 	fixedDocumentationLink             = "[environment variable configuration](./docs/environment-variables.md)"
-	sessionTimeout                     = 35 * time.Minute
+	sessionTimeout                     = 75 * time.Minute
 	taskTimeout                        = 20 * time.Minute
+	workflowTimeout                    = 60 * time.Minute
 	publishTimeout                     = 10 * time.Minute
 	cleanupTimeout                     = 3 * time.Minute
 	waitInterval                       = 2 * time.Second
@@ -67,10 +69,6 @@ pnpm install --frozen-lockfile --ignore-scripts`
 
 const fixDocumentationLinkPrompt = `Fix only the empty Markdown link labeled "environment variable configuration" in README.md. Change it from [environment variable configuration]() to [environment variable configuration](./docs/environment-variables.md). Do not modify package versions, CHANGELOG.md, dependencies, production code, or any other line. Run pnpm run build, pnpm run lint, and git diff --check. If any required check cannot pass, report the exact blocker instead of claiming completion.`
 
-const inspectDocumentationPrompt = `Inspect README.md and docs/environment-variables.md. Identify the exact correction needed for the empty link labeled "environment variable configuration". Do not modify files. Return a workflow output object with the current link, required link, and evidence that the target file exists.`
-
-const inspectValidationPrompt = `Inspect package.json and the repository structure. Identify the exact commands that should validate a one-line README link fix and any constraint that keeps the change scoped. Do not modify files. Return a workflow output object with a checks array and scope constraint.`
-
 type taskOutcome struct {
 	Status  string `json:"status"`
 	Summary string `json:"summary"`
@@ -82,12 +80,12 @@ type pullRequestArtifact struct {
 	Body  string `json:"body"`
 }
 
-func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) {
+func TestWorkflowReusesImplementationChangeThenPublishesFinalPatch(t *testing.T) {
 	environment := newLiveTestEnvironment(t)
 	environment.requireBrokenLinkOnMain(t)
 
 	_, err := environment.workflows.Start(environment.context, workflow.StartRequest{
-		Workflow:   "documentation-fix",
+		Workflow:   "focused-change",
 		Name:       environment.run,
 		Repository: testRepository,
 		Ref:        testRepositoryBase,
@@ -95,16 +93,18 @@ func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) 
 	})
 	require.NoError(t, err)
 	run := environment.requireWorkflowCompleted(t)
-	assert.Equal(t, workflow.StepCompleted, run.Steps["inspect-documentation"].State)
-	assert.Equal(t, workflow.StepCompleted, run.Steps["inspect-validation"].State)
 	assert.Equal(t, workflow.StepCompleted, run.Steps["implement"].State)
-	assert.NotEmpty(t, run.Steps["inspect-documentation"].Output)
-	assert.NotEmpty(t, run.Steps["inspect-validation"].Output)
-	require.NotNil(t, run.Steps["implement"].StartedAt)
-	require.NotNil(t, run.Steps["inspect-documentation"].FinishedAt)
-	require.NotNil(t, run.Steps["inspect-validation"].FinishedAt)
-	assert.False(t, run.Steps["implement"].StartedAt.Before(*run.Steps["inspect-documentation"].FinishedAt))
-	assert.False(t, run.Steps["implement"].StartedAt.Before(*run.Steps["inspect-validation"].FinishedAt))
+	assert.Equal(t, workflow.StepCompleted, run.Steps["test-review"].State)
+	assert.Equal(t, workflow.StepCompleted, run.Steps["finalize"].State)
+	assert.NotEmpty(t, run.Steps["implement"].Output)
+	assert.NotEmpty(t, run.Steps["test-review"].Output)
+	require.NotNil(t, run.Steps["implement"].Change)
+	require.NotNil(t, run.Steps["test-review"].StartedAt)
+	require.NotNil(t, run.Steps["implement"].FinishedAt)
+	require.NotNil(t, run.Steps["finalize"].StartedAt)
+	require.NotNil(t, run.Steps["test-review"].FinishedAt)
+	assert.False(t, run.Steps["test-review"].StartedAt.Before(*run.Steps["implement"].FinishedAt))
+	assert.False(t, run.Steps["finalize"].StartedAt.Before(*run.Steps["test-review"].FinishedAt))
 
 	workflowArtifacts, err := environment.workflows.Artifacts(environment.context, environment.run)
 	require.NoError(t, err)
@@ -123,6 +123,7 @@ func TestWorkflowUsesParallelReviewersThenPublishesImplementation(t *testing.T) 
 	require.NoError(t, json.Unmarshal(artifacts.PullRequest, &pullArtifact))
 	require.NotEmpty(t, pullArtifact.Title)
 	require.NotEmpty(t, pullArtifact.Body)
+	require.NotNil(t, artifacts.Change)
 
 	result, err := environment.publisher.Publish(environment.context, publish.Request{
 		Session:       workflowArtifacts.PublishableSession,
@@ -193,7 +194,7 @@ func newLiveTestEnvironment(t *testing.T) liveTestEnvironment {
 	require.NoError(t, err)
 	workflowControl, err := workflow.New(workflow.Config{
 		Repository: database.Workflows(), ErrorOutput: output,
-	}, sessionControl, liveWorkflowCatalog())
+	}, sessionControl, liveWorkflowCatalog(t))
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		current, getErr := workflowControl.Get(context.Background(), run)
@@ -253,50 +254,25 @@ func requiredPositiveIntegerEnvironment(t *testing.T, name string) int64 {
 	return parsed
 }
 
-func liveAgentCatalog() agentCatalog {
-	return agentCatalog{
-		"reviewer": {
-			Name: "reviewer", Description: "Inspects one bounded concern and returns structured findings.", Storage: agent.StorageEphemeral,
-			Instructions: "Follow the repository AGENTS.md. Inspect only the requested concern, do not modify files, and return concise evidence.",
-			SetupCommand: liveSetupCommand, CloneDepth: 1, StorageSize: "5Gi", Timeout: taskTimeout,
-		},
-		"implementer": {
-			Name: "implementer", Description: "Implements and publishes one focused change.", Storage: agent.StoragePersistent,
-			Instructions: "Follow the repository AGENTS.md. Keep the change limited to the requested behavior and report failed checks honestly.",
-			SetupCommand: liveSetupCommand, CloneDepth: 1, StorageSize: "5Gi", Timeout: taskTimeout,
-		},
+func liveWorkflowCatalog(t *testing.T) *catalog.Workflows {
+	t.Helper()
+	loaded, err := catalog.LoadEngineeringAgents(catalog.AgentDefaults{
+		StorageSize: "5Gi", TaskTimeout: taskTimeout,
+	})
+	require.NoError(t, err)
+	agents := agentCatalog{}
+	for _, summary := range loaded.List() {
+		definition, found := loaded.Find(summary.Name)
+		require.True(t, found)
+		definition.SetupCommand = liveSetupCommand
+		definition.Timeout = taskTimeout
+		agents[summary.Name] = definition
 	}
-}
 
-type workflowCatalog map[string]workflow.Definition
+	workflows, err := catalog.LoadEngineeringWorkflows(agents)
+	require.NoError(t, err)
 
-func liveWorkflowCatalog() workflowCatalog {
-	reviewer, _ := liveAgentCatalog().Find("reviewer")
-	implementer, _ := liveAgentCatalog().Find("implementer")
-
-	return workflowCatalog{"documentation-fix": {
-		Name: "documentation-fix", Description: "Inspect and implement one documentation fix.", MaxParallelism: 2,
-		Steps: map[string]workflow.StepDefinition{
-			"inspect-documentation": {
-				Name: "inspect-documentation", Agent: "reviewer", Prompt: inspectDocumentationPrompt, SessionDefinition: reviewer.SessionDefinition(),
-			},
-			"inspect-validation": {
-				Name: "inspect-validation", Agent: "reviewer", Prompt: inspectValidationPrompt, SessionDefinition: reviewer.SessionDefinition(),
-			},
-			"implement": {
-				Name: "implement", Agent: "implementer", Prompt: fixDocumentationLinkPrompt,
-				After: []string{"inspect-documentation", "inspect-validation"}, Publishable: true, SessionDefinition: implementer.SessionDefinition(),
-			},
-		},
-	}}
-}
-
-func (c workflowCatalog) List() []workflow.Summary { return []workflow.Summary{} }
-
-func (c workflowCatalog) Find(name string) (workflow.Definition, bool) {
-	definition, found := c[name]
-
-	return workflow.CloneDefinition(definition), found
+	return workflows
 }
 
 func (c agentCatalog) List() []agent.AgentSummary {
@@ -370,7 +346,7 @@ func (environment liveTestEnvironment) requireBrokenLinkOnMain(t *testing.T) {
 func (environment liveTestEnvironment) requireWorkflowCompleted(t *testing.T) workflow.Run {
 	t.Helper()
 	var run workflow.Run
-	err := wait.PollUntilContextTimeout(environment.context, waitInterval, taskTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(environment.context, waitInterval, workflowTimeout, true, func(ctx context.Context) (bool, error) {
 		if err := environment.workflows.Reconcile(ctx, environment.run); err != nil {
 			return false, err
 		}

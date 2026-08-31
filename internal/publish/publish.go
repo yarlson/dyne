@@ -62,6 +62,7 @@ type Record struct {
 	Image             string
 	Title             string
 	Body              string
+	Change            *session.ChangeArtifact
 	State             State
 	CommitSHA         string
 	PullRequestNumber int
@@ -212,7 +213,8 @@ func (c *Control) publish(ctx context.Context, request Request) (Result, error) 
 	record := Record{
 		Session: request.Session, IntentID: intentID, Request: request,
 		Repository: source.Repository, Image: source.Image, Title: metadata.Title, Body: metadata.Body,
-		State: StatePending, CreatedAt: now, UpdatedAt: now,
+		Change: source.Change,
+		State:  StatePending, CreatedAt: now, UpdatedAt: now,
 	}
 	record, err = c.createOrLoad(ctx, record)
 	if err != nil {
@@ -365,7 +367,7 @@ func (c *Control) publishBranch(
 		Repository: record.Repository, RepositoryCredential: token,
 		BaseRef: record.Request.BaseBranch, Branch: record.Request.Branch,
 		CommitMessage: record.Request.CommitMessage, AuthorName: authorName, AuthorEmail: authorEmail,
-		Timeout: record.Request.Timeout,
+		Change: workloadChangeArtifact(record.Change), Timeout: record.Request.Timeout,
 	})
 	if err != nil {
 		if errors.Is(err, workload.ErrExecutionFailed) {
@@ -383,6 +385,14 @@ func (c *Control) publishBranch(
 	record.State = StateBranchPublished
 
 	return c.save(ctx, record)
+}
+
+func workloadChangeArtifact(artifact *session.ChangeArtifact) *workload.ChangeArtifact {
+	if artifact == nil {
+		return nil
+	}
+
+	return &workload.ChangeArtifact{SHA256: artifact.SHA256, Bytes: artifact.Bytes}
 }
 
 func (c *Control) recoverFailedPublisher(

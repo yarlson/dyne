@@ -123,8 +123,9 @@ func (c *Control) Start(ctx context.Context, request StartRequest) (Run, error) 
 	for name, definitionStep := range definition.Steps {
 		run.Steps[name] = Step{
 			Name: name, Agent: definitionStep.Agent, Prompt: definitionStep.Prompt,
-			After: slices.Clone(definitionStep.After), Publishable: definitionStep.Publishable,
-			Session: workflowSessionName(request.Name, name), State: StepPending,
+			After: slices.Clone(definitionStep.After), ChangeFrom: definitionStep.ChangeFrom,
+			Publishable: definitionStep.Publishable,
+			Session:     workflowSessionName(request.Name, name), State: StepPending,
 		}
 	}
 
@@ -167,7 +168,11 @@ func (c *Control) Artifacts(ctx context.Context, name string) (Artifacts, error)
 		return Artifacts{}, err
 	}
 
-	result := Artifacts{Name: name, Outputs: map[string]json.RawMessage{}}
+	result := Artifacts{
+		Name:    name,
+		Outputs: map[string]json.RawMessage{},
+		Changes: map[string]session.ChangeArtifact{},
+	}
 	for stepName, step := range run.Steps {
 		if len(step.Output) > 0 {
 			result.Outputs[stepName] = slices.Clone(step.Output)
@@ -175,6 +180,10 @@ func (c *Control) Artifacts(ctx context.Context, name string) (Artifacts, error)
 
 		if step.Publishable {
 			result.PublishableSession = step.Session
+		}
+
+		if step.Change != nil {
+			result.Changes[stepName] = *step.Change
 		}
 	}
 
@@ -391,12 +400,27 @@ func (c *Control) startPersistedSteps(ctx context.Context, run *Run) ([]string, 
 		resultKind := session.ResultKindWorkflowOutput
 		if step.Publishable {
 			resultKind = session.ResultKindPullRequest
+		} else if producesChange(*run, step.Name) {
+			resultKind = session.ResultKindWorkflowChange
+		}
+
+		var changeInput *session.ChangeInput
+		if step.ChangeFrom != "" {
+			source := run.Steps[step.ChangeFrom]
+			if source.Change == nil {
+				return nil, fmt.Errorf(
+					"start workflow run %s step %s: source step %s did not retain change metadata",
+					run.Name, step.Name, source.Name,
+				)
+			}
+
+			changeInput = &session.ChangeInput{Session: source.Session, Artifact: *source.Change}
 		}
 
 		_, err = c.sessions.Start(ctx, definition, session.StartRequest{
 			Name: step.Session, Repository: run.Repository, InitialRef: run.Ref,
 			Prompt: workflowStepPrompt(*run, step), ResultKind: resultKind,
-			WorkflowRun: run.Name, WorkflowStep: step.Name,
+			WorkflowRun: run.Name, WorkflowStep: step.Name, ChangeInput: changeInput,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("start workflow run %s step %s: %w", run.Name, step.Name, err)
@@ -467,7 +491,7 @@ func (c *Control) observeRunningSteps(ctx context.Context, run *Run) (bool, erro
 			return false, fmt.Errorf("read workflow run %s step %s artifacts: %w", run.Name, step.Name, err)
 		}
 
-		if err := applyStepArtifacts(&step, artifacts); err != nil {
+		if err := applyStepArtifacts(&step, artifacts, producesChange(*run, step.Name)); err != nil {
 			step.State = StepFailed
 			step.Summary = err.Error()
 		}
@@ -615,7 +639,7 @@ func deriveRunState(run *Run) {
 	run.State = state
 }
 
-func applyStepArtifacts(step *Step, artifacts session.Artifacts) error {
+func applyStepArtifacts(step *Step, artifacts session.Artifacts, requiresChange bool) error {
 	var outcome struct {
 		Status  string `json:"status"`
 		Summary string `json:"summary"`
@@ -653,9 +677,28 @@ func applyStepArtifacts(step *Step, artifacts session.Artifacts) error {
 		step.Output = slices.Clone(artifacts.WorkflowOutput)
 	}
 
+	if requiresChange {
+		if artifacts.Change == nil {
+			return errors.New("completed workflow change step did not report retained change metadata")
+		}
+
+		change := *artifacts.Change
+		step.Change = &change
+	}
+
 	step.State = StepCompleted
 
 	return nil
+}
+
+func producesChange(run Run, stepName string) bool {
+	for _, step := range run.Steps {
+		if step.ChangeFrom == stepName {
+			return true
+		}
+	}
+
+	return false
 }
 
 func workflowStepPrompt(run Run, step Step) string {
@@ -675,13 +718,15 @@ func workflowIntent(request StartRequest, definition Definition) (string, error)
 		Agent       string   `json:"agent"`
 		Prompt      string   `json:"prompt"`
 		After       []string `json:"after,omitempty"`
+		ChangeFrom  string   `json:"change_from,omitempty"`
 		Publishable bool     `json:"publishable,omitempty"`
 	}
 	steps := make([]intentStep, 0, len(definition.Steps))
 	for _, name := range sortedDefinitionStepNames(definition.Steps) {
 		step := definition.Steps[name]
 		steps = append(steps, intentStep{
-			Name: name, Agent: step.Agent, Prompt: step.Prompt, After: step.After, Publishable: step.Publishable,
+			Name: name, Agent: step.Agent, Prompt: step.Prompt, After: step.After,
+			ChangeFrom: step.ChangeFrom, Publishable: step.Publishable,
 		})
 	}
 

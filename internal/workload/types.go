@@ -23,7 +23,21 @@ const (
 	ResultKindPullRequest ResultKind = "pull-request"
 	// ResultKindWorkflowOutput expects a workflow output object.
 	ResultKindWorkflowOutput ResultKind = "workflow-output"
+	// ResultKindWorkflowChange expects a workflow output and retained patch.
+	ResultKindWorkflowChange ResultKind = "workflow-change"
 )
+
+// ChangeArtifact identifies one retained patch without loading its contents into control-plane memory.
+type ChangeArtifact struct {
+	SHA256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
+}
+
+// ChangeInput identifies a retained patch that must be applied before a task starts.
+type ChangeInput struct {
+	Session  string
+	Artifact ChangeArtifact
+}
 
 // Skill is one instruction file projected into a coding task.
 type Skill struct {
@@ -50,6 +64,7 @@ type TaskRequest struct {
 	ResultKind           ResultKind
 	WorkflowRun          string
 	WorkflowStep         string
+	ChangeInput          *ChangeInput
 	Resume               bool
 	RepositoryCredential string
 }
@@ -73,6 +88,7 @@ type TaskArtifacts struct {
 	Outcome        []byte
 	PullRequest    []byte
 	WorkflowOutput []byte
+	Change         *ChangeArtifact
 }
 
 // TaskObservation is the runtime evidence currently available for one task.
@@ -94,6 +110,7 @@ type PublishRequest struct {
 	CommitMessage        string
 	AuthorName           string
 	AuthorEmail          string
+	Change               *ChangeArtifact
 	Timeout              time.Duration
 }
 

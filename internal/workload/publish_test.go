@@ -3,6 +3,7 @@ package workload
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,17 +58,28 @@ func TestRunPublisherReportsFailedExecutionWithoutReplacingIt(t *testing.T) {
 	assert.Equal(t, job.UID, retained.UID)
 }
 
-func TestPublisherJobUsesSessionPVCAndScopedSecret(t *testing.T) {
+func TestPublisherJobUsesRetainedChangeAndScopedSecret(t *testing.T) {
 	job := publisherJob("coding-agents", validPublisherRequest())
 	assert.Equal(t, "review-publish", job.Name)
 	assert.Equal(t, "intent-123", job.Annotations[publishIntentAnnotationKey])
 
-	workspace := volumeNamed(t, job.Spec.Template.Spec.Volumes, "workspace")
-	require.NotNil(t, workspace.PersistentVolumeClaim)
-	assert.Equal(t, "session-review", workspace.PersistentVolumeClaim.ClaimName)
+	assert.NotContains(t, volumeNames(job.Spec.Template.Spec.Volumes), "workspace")
+	artifacts := volumeNamed(t, job.Spec.Template.Spec.Volumes, "artifacts")
+	require.NotNil(t, artifacts.PersistentVolumeClaim)
+	assert.Equal(t, "session-review", artifacts.PersistentVolumeClaim.ClaimName)
 	gitAuth := volumeNamed(t, job.Spec.Template.Spec.Volumes, "git-auth")
 	require.NotNil(t, gitAuth.Secret)
 	assert.Equal(t, "review-publish-git", gitAuth.Secret.SecretName)
+}
+
+func TestPublisherJobKeepsLegacyWorkspacePathWithoutChangeMetadata(t *testing.T) {
+	request := validPublisherRequest()
+	request.Change = nil
+	job := publisherJob("coding-agents", request)
+
+	workspace := volumeNamed(t, job.Spec.Template.Spec.Volumes, "workspace")
+	require.NotNil(t, workspace.PersistentVolumeClaim)
+	assert.Equal(t, "session-review", workspace.PersistentVolumeClaim.ClaimName)
 }
 
 func TestDeletePublisherRemovesJobAndCredential(t *testing.T) {
@@ -97,7 +109,17 @@ func validPublisherRequest() PublishRequest {
 		Repository: "https://github.com/lokalise/ratchet-test-service", RepositoryCredential: "installation-token",
 		BaseRef: "main", Branch: "yar/review", CommitMessage: "Fix link",
 		AuthorName: "yar", AuthorEmail: "12345+yar@users.noreply.github.com", Timeout: 2 * time.Minute,
+		Change: &ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
 	}
+}
+
+func volumeNames(volumes []corev1.Volume) []string {
+	names := make([]string, len(volumes))
+	for i, volume := range volumes {
+		names[i] = volume.Name
+	}
+
+	return names
 }
 
 func completedPublisherJob(intent string) *batchv1.Job {

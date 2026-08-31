@@ -55,12 +55,14 @@ ORDER BY name;
 -- name: CreateSessionTask :exec
 INSERT INTO session_tasks (
     session_name, task_id, prompt, timeout_nanoseconds, result_kind, state,
-    outcome, pull_request, workflow_output, failure, created_at, finished_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);
+    change_input, outcome, pull_request, workflow_output, change_artifact,
+    failure, created_at, finished_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
 
 -- name: GetLatestSessionTask :one
 SELECT session_name, task_id, prompt, timeout_nanoseconds, result_kind, state,
-       outcome, pull_request, workflow_output, failure, created_at, finished_at
+       outcome, pull_request, workflow_output, failure, created_at, finished_at,
+       change_input, change_artifact
 FROM session_tasks
 WHERE session_name = $1
 ORDER BY created_at DESC, task_id DESC
@@ -77,8 +79,9 @@ SET state = $3,
     outcome = $4,
     pull_request = $5,
     workflow_output = $6,
-    failure = $7,
-    finished_at = $8
+    change_artifact = $7,
+    failure = $8,
+    finished_at = $9
 WHERE session_name = $1 AND task_id = $2;
 
 -- name: SetSessionDeletion :execrows

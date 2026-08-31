@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,14 +80,25 @@ func TestRepositoryRetainsCompletedTaskArtifacts(t *testing.T) {
 	now := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, repository.Create(ctx,
 		session.Record{Name: "review", IntentID: "intent-123", CreatedAt: now},
-		session.Task{ID: "review", State: session.TaskPending, CreatedAt: now},
+		session.Task{
+			ID: "review", State: session.TaskPending, CreatedAt: now,
+			ChangeInput: &session.ChangeInput{
+				Session:  "implementation",
+				Artifact: session.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 120},
+			},
+		},
 	))
 	finishedAt := now.Add(time.Minute)
 	task := session.Task{
 		ID: "review", State: session.TaskCompleted, CreatedAt: now, FinishedAt: &finishedAt,
+		ChangeInput: &session.ChangeInput{
+			Session:  "implementation",
+			Artifact: session.ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 120},
+		},
 		Artifacts: session.Artifacts{
 			Outcome:     []byte(`{"status":"completed","summary":"fixed","blocker":""}`),
 			PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
+			Change:      &session.ChangeArtifact{SHA256: strings.Repeat("b", 64), Bytes: 240},
 		},
 	}
 	require.NoError(t, repository.UpdateTask(ctx, "review", task))

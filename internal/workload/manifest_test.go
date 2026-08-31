@@ -24,6 +24,19 @@ type renderedResource struct {
 	Spec       struct {
 		Template struct {
 			Spec struct {
+				InitContainers []struct {
+					Name string   `json:"name"`
+					Args []string `json:"args"`
+					Env  []struct {
+						Name  string `json:"name"`
+						Value string `json:"value"`
+					} `json:"env"`
+					VolumeMounts []struct {
+						Name      string `json:"name"`
+						MountPath string `json:"mountPath"`
+						ReadOnly  bool   `json:"readOnly"`
+					} `json:"volumeMounts"`
+				} `json:"initContainers"`
 				Containers []struct {
 					Name string `json:"name"`
 					Env  []struct {
@@ -47,6 +60,7 @@ type renderedResource struct {
 					EmptyDir              map[string]any `json:"emptyDir"`
 					PersistentVolumeClaim *struct {
 						ClaimName string `json:"claimName"`
+						ReadOnly  bool   `json:"readOnly"`
 					} `json:"persistentVolumeClaim"`
 					ConfigMap *struct {
 						Name  string `json:"name"`
@@ -80,6 +94,39 @@ func TestRenderSelectsWorkflowOutputResultContract(t *testing.T) {
 	}
 
 	assert.Equal(t, "workflow-output", resultKind)
+}
+
+func TestRenderAppliesVerifiedChangeBeforeWorkspaceSetup(t *testing.T) {
+	spec := validSpec()
+	spec.Storage = StorageEphemeral
+	spec.WorkflowRun = "change-200"
+	spec.WorkflowStep = "review"
+	spec.ChangeInput = &ChangeInput{
+		Session:  "implementation",
+		Artifact: ChangeArtifact{SHA256: strings.Repeat("a", 64), Bytes: 123},
+	}
+
+	manifest, err := renderSessionManifest(spec)
+	require.NoError(t, err)
+	resources := decodeRenderedResources(t, manifest)
+	job := resources["Job/example"]
+	require.Len(t, job.Spec.Template.Spec.InitContainers, 5)
+	assert.Equal(t, []string{"session-init", "repo-init", "change-init", "workspace-init", "auth-init"}, []string{
+		job.Spec.Template.Spec.InitContainers[0].Name,
+		job.Spec.Template.Spec.InitContainers[1].Name,
+		job.Spec.Template.Spec.InitContainers[2].Name,
+		job.Spec.Template.Spec.InitContainers[3].Name,
+		job.Spec.Template.Spec.InitContainers[4].Name,
+	})
+	changeInit := job.Spec.Template.Spec.InitContainers[2]
+	assert.Equal(t, []string{"apply-change"}, changeInit.Args)
+	assert.Equal(t, "/change", changeInit.VolumeMounts[1].MountPath)
+	assert.True(t, changeInit.VolumeMounts[1].ReadOnly)
+	changeVolume := resources["Job/example"].Spec.Template.Spec.Volumes[4]
+	assert.Equal(t, "change-input", changeVolume.Name)
+	require.NotNil(t, changeVolume.PersistentVolumeClaim)
+	assert.Equal(t, "session-implementation", changeVolume.PersistentVolumeClaim.ClaimName)
+	assert.True(t, changeVolume.PersistentVolumeClaim.ReadOnly)
 }
 
 func TestRenderLabelsWorkflowOwnedSessionResources(t *testing.T) {

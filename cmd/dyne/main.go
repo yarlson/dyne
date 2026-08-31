@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/yarlson/dyne/internal/agent"
-	"github.com/yarlson/dyne/internal/agentconfig"
+	"github.com/yarlson/dyne/internal/catalog"
 	"github.com/yarlson/dyne/internal/controlplane"
 	dynegithub "github.com/yarlson/dyne/internal/github"
 	"github.com/yarlson/dyne/internal/kubernetes"
@@ -26,7 +26,6 @@ import (
 	"github.com/yarlson/dyne/internal/session"
 	"github.com/yarlson/dyne/internal/storage"
 	"github.com/yarlson/dyne/internal/workflow"
-	"github.com/yarlson/dyne/internal/workflowconfig"
 	"github.com/yarlson/dyne/internal/workload"
 )
 
@@ -102,36 +101,19 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 	githubAppID := set.Int64("github-app-id", 0, "GitHub App ID")
 	githubInstallationID := set.Int64("github-installation-id", 0, "GitHub App installation ID")
 	githubPrivateKeyFile := set.String("github-private-key-file", "", "GitHub App private key file")
-	agentsFile := set.String("agents-file", "", "agent definitions YAML file")
-	workflowsFile := set.String("workflows-file", "", "workflow definitions YAML file")
+	agentsFile := set.String("agents-file", "", "custom agent definitions YAML file")
+	workflowsFile := set.String("workflows-file", "", "custom workflow definitions YAML file")
 	databaseURL := set.String("database-url", defaultDatabaseURL(), "application database URL")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
 
-	var agents *agentconfig.Catalog
-	if *agentsFile != "" {
-		var err error
-		agents, err = agentconfig.Load(*agentsFile, agentconfig.Defaults{
-			StorageSize: *storageSize,
-			TaskTimeout: *taskTimeout,
-		})
-		if err != nil {
-			return fmt.Errorf("load agents file: %w", err)
-		}
-	}
-
-	var workflows *workflowconfig.Catalog
-	if *workflowsFile != "" {
-		if agents == nil {
-			return errors.New("--agents-file is required with --workflows-file")
-		}
-
-		var err error
-		workflows, err = workflowconfig.Load(*workflowsFile, agents)
-		if err != nil {
-			return fmt.Errorf("load workflows file: %w", err)
-		}
+	agents, workflows, err := loadServerCatalogs(*agentsFile, *workflowsFile, catalog.AgentDefaults{
+		StorageSize: *storageSize,
+		TaskTimeout: *taskTimeout,
+	})
+	if err != nil {
+		return err
 	}
 
 	if *githubPrivateKeyFile == "" {
@@ -248,6 +230,42 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 
 		return nil
 	}
+}
+
+func loadServerCatalogs(agentsFile, workflowsFile string, defaults catalog.AgentDefaults) (*catalog.Agents, *catalog.Workflows, error) {
+	if agentsFile == "" {
+		if workflowsFile != "" {
+			return nil, nil, errors.New("--agents-file is required with --workflows-file")
+		}
+
+		agents, err := catalog.LoadEngineeringAgents(defaults)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		workflows, err := catalog.LoadEngineeringWorkflows(agents)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return agents, workflows, nil
+	}
+
+	agents, err := catalog.LoadAgents(agentsFile, defaults)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load agents file: %w", err)
+	}
+
+	if workflowsFile == "" {
+		return agents, nil, nil
+	}
+
+	workflows, err := catalog.LoadWorkflows(workflowsFile, agents)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load workflows file: %w", err)
+	}
+
+	return agents, workflows, nil
 }
 
 func start(ctx context.Context, args []string, stdout io.Writer) error {

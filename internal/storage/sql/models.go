@@ -41,6 +41,8 @@ type SessionTask struct {
 	Failure            string        `json:"failure"`
 	CreatedAt          int64         `json:"created_at"`
 	FinishedAt         sql.NullInt64 `json:"finished_at"`
+	ChangeInput        []byte        `json:"change_input"`
+	ChangeArtifact     []byte        `json:"change_artifact"`
 }
 
 type WorkflowAgentSnapshot struct {

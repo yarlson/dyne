@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	stdsql "database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -51,7 +52,12 @@ func (r *SessionRepository) Create(ctx context.Context, record session.Record, t
 		return session.ErrConflict
 	}
 
-	if err := queries.CreateSessionTask(ctx, sessionTaskParams(record.Name, task)); err != nil {
+	taskParams, err := sessionTaskParams(record.Name, task)
+	if err != nil {
+		return fmt.Errorf("encode session %s initial task: %w", record.Name, err)
+	}
+
+	if err := queries.CreateSessionTask(ctx, taskParams); err != nil {
 		return fmt.Errorf("create session %s initial task: %w", record.Name, err)
 	}
 
@@ -93,7 +99,12 @@ func (r *SessionRepository) AddTask(ctx context.Context, name string, task sessi
 		return fmt.Errorf("get session %s before adding task: %w", name, err)
 	}
 
-	if err := r.queries.CreateSessionTask(ctx, sessionTaskParams(name, task)); err != nil {
+	params, err := sessionTaskParams(name, task)
+	if err != nil {
+		return fmt.Errorf("encode session %s task %s: %w", name, task.ID, err)
+	}
+
+	if err := r.queries.CreateSessionTask(ctx, params); err != nil {
 		active, activeErr := r.queries.CountActiveSessionTasks(ctx, name)
 		if activeErr == nil && active > 0 {
 			return session.ErrActiveTask
@@ -116,15 +127,20 @@ func (r *SessionRepository) LatestTask(ctx context.Context, name string) (sessio
 		return session.Task{}, fmt.Errorf("get session %s latest task: %w", name, err)
 	}
 
-	return decodeSessionTask(row), nil
+	return decodeSessionTask(row)
 }
 
 // UpdateTask persists an observed task state and validated result.
 func (r *SessionRepository) UpdateTask(ctx context.Context, name string, task session.Task) error {
+	change, err := encodeSessionChangeArtifact(task.Artifacts.Change)
+	if err != nil {
+		return fmt.Errorf("encode session %s task %s change artifact: %w", name, task.ID, err)
+	}
+
 	updated, err := r.queries.UpdateSessionTask(ctx, sql.UpdateSessionTaskParams{
 		SessionName: name, TaskID: task.ID, State: string(task.State),
 		Outcome: task.Artifacts.Outcome, PullRequest: task.Artifacts.PullRequest,
-		WorkflowOutput: task.Artifacts.WorkflowOutput, Failure: task.Failure,
+		WorkflowOutput: task.Artifacts.WorkflowOutput, ChangeArtifact: change, Failure: task.Failure,
 		FinishedAt: nullableTime(task.FinishedAt),
 	})
 	if err != nil {
@@ -208,14 +224,24 @@ func (r *SessionRepository) Deleting(ctx context.Context) ([]session.Record, err
 	return records, nil
 }
 
-func sessionTaskParams(name string, task session.Task) sql.CreateSessionTaskParams {
+func sessionTaskParams(name string, task session.Task) (sql.CreateSessionTaskParams, error) {
+	changeInput, err := encodeSessionChangeInput(task.ChangeInput)
+	if err != nil {
+		return sql.CreateSessionTaskParams{}, err
+	}
+
+	changeArtifact, err := encodeSessionChangeArtifact(task.Artifacts.Change)
+	if err != nil {
+		return sql.CreateSessionTaskParams{}, err
+	}
+
 	return sql.CreateSessionTaskParams{
 		SessionName: name, TaskID: task.ID, Prompt: task.Prompt,
 		TimeoutNanoseconds: int64(task.Timeout), ResultKind: string(task.ResultKind), State: string(task.State),
-		Outcome: task.Artifacts.Outcome, PullRequest: task.Artifacts.PullRequest,
-		WorkflowOutput: task.Artifacts.WorkflowOutput, Failure: task.Failure,
+		ChangeInput: changeInput, Outcome: task.Artifacts.Outcome, PullRequest: task.Artifacts.PullRequest,
+		WorkflowOutput: task.Artifacts.WorkflowOutput, ChangeArtifact: changeArtifact, Failure: task.Failure,
 		CreatedAt: task.CreatedAt.UnixNano(), FinishedAt: nullableTime(task.FinishedAt),
-	}
+	}, nil
 }
 
 func decodeSession(row sql.Session) (session.Record, error) {
@@ -237,7 +263,17 @@ func decodeSession(row sql.Session) (session.Record, error) {
 	}, nil
 }
 
-func decodeSessionTask(row sql.SessionTask) session.Task {
+func decodeSessionTask(row sql.SessionTask) (session.Task, error) {
+	changeInput, err := decodeSessionChangeInput(row.ChangeInput)
+	if err != nil {
+		return session.Task{}, fmt.Errorf("decode session %s task %s change input: %w", row.SessionName, row.TaskID, err)
+	}
+
+	changeArtifact, err := decodeSessionChangeArtifact(row.ChangeArtifact)
+	if err != nil {
+		return session.Task{}, fmt.Errorf("decode session %s task %s change artifact: %w", row.SessionName, row.TaskID, err)
+	}
+
 	var finishedAt *time.Time
 	if row.FinishedAt.Valid {
 		value := time.Unix(0, row.FinishedAt.Int64).UTC()
@@ -246,12 +282,55 @@ func decodeSessionTask(row sql.SessionTask) session.Task {
 
 	return session.Task{
 		ID: row.TaskID, Prompt: row.Prompt, Timeout: time.Duration(row.TimeoutNanoseconds),
-		ResultKind: session.ResultKind(row.ResultKind), State: session.TaskState(row.State),
+		ResultKind: session.ResultKind(row.ResultKind), ChangeInput: changeInput, State: session.TaskState(row.State),
 		Artifacts: session.Artifacts{
 			Outcome: row.Outcome, PullRequest: row.PullRequest, WorkflowOutput: row.WorkflowOutput,
+			Change: changeArtifact,
 		},
 		Failure: row.Failure, CreatedAt: time.Unix(0, row.CreatedAt).UTC(), FinishedAt: finishedAt,
+	}, nil
+}
+
+func encodeSessionChangeInput(input *session.ChangeInput) ([]byte, error) {
+	if input == nil {
+		return nil, nil
 	}
+
+	return json.Marshal(input)
+}
+
+func decodeSessionChangeInput(contents []byte) (*session.ChangeInput, error) {
+	if len(contents) == 0 {
+		return nil, nil
+	}
+
+	var input session.ChangeInput
+	if err := json.Unmarshal(contents, &input); err != nil {
+		return nil, err
+	}
+
+	return &input, nil
+}
+
+func encodeSessionChangeArtifact(artifact *session.ChangeArtifact) ([]byte, error) {
+	if artifact == nil {
+		return nil, nil
+	}
+
+	return json.Marshal(artifact)
+}
+
+func decodeSessionChangeArtifact(contents []byte) (*session.ChangeArtifact, error) {
+	if len(contents) == 0 {
+		return nil, nil
+	}
+
+	var artifact session.ChangeArtifact
+	if err := json.Unmarshal(contents, &artifact); err != nil {
+		return nil, err
+	}
+
+	return &artifact, nil
 }
 
 func nullableTime(value *time.Time) stdsql.NullInt64 {

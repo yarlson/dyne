@@ -6,7 +6,7 @@ dyne is a small HTTP control plane for coding-agent Jobs and durable multi-agent
 
 Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, and artifacts. A continuation is another Job mounted to the same PVC. SQL is the only source of application state for sessions, workflows, and publishing. Kubernetes Jobs, ConfigMaps, Secrets, and annotations are disposable execution projections. The workload package owns low-level execution requests and observations; the product packages translate them and persist every state transition in SQL.
 
-A workflow is an immutable directed acyclic graph of isolated sessions. Steps never share a workspace or PVC. Dependency steps return bounded JSON outputs that dyne stores in SQL and includes in the direct dependent step's prompt. Independent ready steps can run concurrently up to the workflow's configured limit. At most one persistent leaf is publishable; all other steps are ephemeral findings.
+A workflow is an immutable directed acyclic graph of isolated sessions. Steps never share a writable workspace or PVC. Dependency steps return bounded JSON outputs that dyne stores in SQL and includes in the direct dependent step's prompt. A persistent implementation step can also retain a verified Git patch; a dependent step named by `change_from` mounts that source artifact read-only and applies it to its own fresh clone before setup. Independent ready steps can run concurrently up to the workflow's configured limit. At most one persistent leaf is publishable. Other steps are ephemeral unless they produce a retained change for a direct dependent.
 
 This keeps recovery simple:
 
@@ -47,8 +47,6 @@ Example with kubeconfig:
 ./bin/dyne server \
   --context colima-codex-proof \
   --namespace coding-agents \
-  --agents-file ./agents.yaml \
-  --workflows-file ./workflows.yaml \
   --database-url sqlite:dyne.db \
   --github-app-id 123 \
   --github-installation-id 456 \
@@ -63,22 +61,21 @@ Example with EKS and an assumed role:
   --aws-region eu-west-1 \
   --aws-role-arn arn:aws:iam::123456789012:role/dyne-control-plane \
   --namespace coding-agents \
-  --agents-file ./agents.yaml \
-  --workflows-file ./workflows.yaml \
   --database-url "$DYNE_DATABASE_URL" \
   --github-app-id 123 \
   --github-installation-id 456 \
   --github-private-key-file /secure/dyne-app.pem
 ```
 
-`--workflows-file` is optional. Without it, the server does not expose workflow routes. The application database is still required for session and publish state. `--database-url` accepts `sqlite:path`, `postgres://...`, or `postgresql://...`; `DYNE_DATABASE_URL` supplies the default flag value. The server prepares and versions the SQL schema at startup. Use a local SQLite file for one local process and an externally managed PostgreSQL database for a production server.
+The server loads Dyne's embedded engineering agents and workflows by default. `--agents-file` replaces the built-in agents with an operator-supplied catalog. Without `--workflows-file`, that custom catalog exposes no workflow routes. A custom `--workflows-file` requires `--agents-file` so every workflow resolves against the intended agents. The application database is still required for session and publish state. `--database-url` accepts `sqlite:path`, `postgres://...`, or `postgresql://...`; `DYNE_DATABASE_URL` supplies the default flag value. The server prepares and versions the SQL schema at startup. Use a local SQLite file for one local process and an externally managed PostgreSQL database for a production server.
 
 ## Define agents
 
-An agent is a reusable session template loaded when the server starts. Changing the file requires a server restart and affects only new sessions. Existing persistent sessions continue with the immutable configuration they started with.
+An agent is a reusable session template loaded when the server starts. Changing a custom catalog requires a server restart and affects only new sessions. Existing persistent sessions continue with the immutable configuration they started with.
 
 ```yaml
 version: v1
+guidance: AGENTS.md
 
 agents:
   reviewer:
@@ -105,7 +102,9 @@ agents:
 
 Each definition requires a description, `ephemeral` or `persistent` storage, and non-empty instructions. Clone depth defaults to 1. Storage size and timeout inherit the server defaults; storage size is valid only for persistent agents. The server rejects the complete file at startup if any definition is invalid.
 
-Skill paths are relative to the agent file and must identify a regular, non-symlink `SKILL.md` inside that directory. Each skill needs YAML frontmatter with a lowercase DNS-label name and a non-empty description. dyne packages only `SKILL.md`; scripts, references, assets, plugins, and hooks are not supported. Configured skills are additive to repository and Codex system skills.
+The optional `guidance` path is relative to the agent file and must identify a regular, non-symlink `AGENTS.md` inside that directory. Dyne prepends it to every configured agent's instructions. Skill paths follow the same containment rules and must identify `SKILL.md`. Each skill needs YAML frontmatter with a lowercase DNS-label name and a non-empty description. dyne packages only `SKILL.md`; scripts, references, assets, plugins, and hooks are not supported. Configured skills are additive to repository and Codex system skills.
+
+The built-in catalog source lives under `internal/catalog/engineering` and is embedded in the Dyne binary. It combines Dyne's engineering guidance with focused investigation, planning, implementation, review, and finishing agents.
 
 List the configured agents and start a session from one:
 
@@ -123,26 +122,29 @@ The repository, ref, prompt, session name, and optional timeout belong to the se
 
 ## Define and run workflows
 
-Workflow definitions are loaded separately and resolve every named agent when the server starts. Non-publishable steps require ephemeral agents. The optional publishable step must use a persistent agent and must be a leaf.
+Workflow definitions are loaded separately and resolve every named agent when the server starts. A non-publishable step normally requires an ephemeral agent. It may use a persistent agent only when another step names it as `change_from`. The source must be a direct dependency, and each consumer receives the retained patch from that exact source session. The optional publishable step must use a persistent agent and must be a leaf.
 
 ```yaml
 version: v1
 
 workflows:
   delivery:
-    description: Review two concerns, then implement the change.
-    max_parallelism: 2
+    description: Implement, review, and finalize one change.
+    max_parallelism: 1
     steps:
-      security:
-        agent: reviewer
-        prompt: Review the trust boundary and return structured findings.
-      tests:
-        agent: reviewer
-        prompt: Review test gaps and return structured findings.
       implement:
         agent: implementer
-        prompt: Implement the requested change using the review outputs.
-        after: [security, tests]
+        prompt: Implement the requested change and run focused checks.
+      review:
+        agent: reviewer
+        prompt: Review the applied change and return structured findings.
+        after: [implement]
+        change_from: implement
+      finalize:
+        agent: implementer
+        prompt: Apply required review fixes and run final checks.
+        after: [implement, review]
+        change_from: implement
         publishable: true
 ```
 
@@ -162,7 +164,7 @@ dyne workflow-artifacts --name change-123
 
 The run snapshots the workflow and resolved agent definitions in the database. Later edits to either YAML file affect only new runs. A failed or blocked step skips its descendants while independent branches continue. `dyne workflow-cancel` records cancellation before deleting active compute. `dyne workflow-delete` is accepted only for a terminal run, destroys every step session and retained workspace, then deletes SQL state.
 
-To publish a completed workflow, read `publishable_session` from `dyne workflow-artifacts` and pass that session name to the existing `dyne publish` command. Publishing remains explicit and uses the existing idempotent session publishing contract.
+To publish a completed workflow, read `publishable_session` from `dyne workflow-artifacts` and pass that session name to the existing `dyne publish` command. Publishing remains explicit and idempotent. New persistent tasks retain a verified binary patch, and the publisher applies it to a fresh clone of the requested base branch. A conflicting base update fails without replacing unrelated files. Sessions completed by older Dyne versions without patch metadata continue to use the legacy retained-workspace publishing path.
 
 ## Run and continue sessions
 

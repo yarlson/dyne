@@ -1,4 +1,4 @@
-package agentconfig
+package catalog
 
 import (
 	"os"
@@ -12,7 +12,7 @@ import (
 	"github.com/yarlson/dyne/internal/agent"
 )
 
-func TestLoadResolvesAgentDefinitionsAndSkillFiles(t *testing.T) {
+func TestLoadAgentsResolvesAgentDefinitionsAndSkillFiles(t *testing.T) {
 	directory := t.TempDir()
 	skillDirectory := filepath.Join(directory, "skills", "code-review")
 	require.NoError(t, os.MkdirAll(skillDirectory, 0o755))
@@ -38,7 +38,7 @@ agents:
 	path := filepath.Join(directory, "agents.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(catalogContents), 0o600))
 
-	catalog, err := Load(path, Defaults{StorageSize: "10Gi", TaskTimeout: 2 * time.Hour})
+	catalog, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: 2 * time.Hour})
 	require.NoError(t, err)
 
 	assert.Equal(t, []agent.AgentSummary{
@@ -67,14 +67,34 @@ agents:
 	assert.Equal(t, "mise install", implementer.SetupCommand)
 }
 
-func TestNilCatalogBehavesAsEmpty(t *testing.T) {
-	var catalog *Catalog
+func TestLoadAgentsPrependsSharedGuidanceToEveryAgent(t *testing.T) {
+	directory := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "AGENTS.md"), []byte("Keep changes small.\n"), 0o600))
+	path := filepath.Join(directory, "agents.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`version: v1
+guidance: AGENTS.md
+agents:
+  reviewer:
+    description: Reviews changes.
+    storage: ephemeral
+    instructions: Stay read-only.
+`), 0o600))
+
+	catalog, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
+	require.NoError(t, err)
+	reviewer, found := catalog.Find("reviewer")
+	require.True(t, found)
+	assert.Equal(t, "Keep changes small.\n\nStay read-only.", reviewer.Instructions)
+}
+
+func TestNilAgentsBehavesAsEmpty(t *testing.T) {
+	var catalog *Agents
 	assert.Equal(t, []agent.AgentSummary{}, catalog.List())
 	_, found := catalog.Find("missing")
 	assert.False(t, found)
 }
 
-func TestLoadRejectsUnknownFields(t *testing.T) {
+func TestLoadAgentsRejectsUnknownFields(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "agents.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(`version: v1
@@ -86,11 +106,11 @@ agents:
     unknown: value
 `), 0o600))
 
-	_, err := Load(path, Defaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
+	_, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
 	require.ErrorContains(t, err, "unknown")
 }
 
-func TestLoadRejectsSkillOutsideCatalogDirectory(t *testing.T) {
+func TestLoadAgentsRejectsSkillOutsideCatalogDirectory(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "catalog")
 	require.NoError(t, os.MkdirAll(directory, 0o755))
@@ -106,11 +126,30 @@ agents:
       - ../SKILL.md
 `), 0o600))
 
-	_, err := Load(path, Defaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
+	_, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
 	require.ErrorContains(t, err, "must stay within")
 }
 
-func TestLoadRejectsSymlinkedSkill(t *testing.T) {
+func TestLoadAgentsRejectsGuidanceOutsideCatalogDirectory(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "catalog")
+	require.NoError(t, os.MkdirAll(directory, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Escaped guidance.\n"), 0o600))
+	path := filepath.Join(directory, "agents.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`version: v1
+guidance: ../AGENTS.md
+agents:
+  reviewer:
+    description: Reviews repository changes.
+    storage: ephemeral
+    instructions: Review the repository.
+`), 0o600))
+
+	_, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
+	require.ErrorContains(t, err, "must stay within")
+}
+
+func TestLoadAgentsRejectsSymlinkedSkill(t *testing.T) {
 	directory := t.TempDir()
 	skillDirectory := filepath.Join(directory, "skills", "linked")
 	require.NoError(t, os.MkdirAll(skillDirectory, 0o755))
@@ -128,11 +167,11 @@ agents:
       - skills/linked/SKILL.md
 `), 0o600))
 
-	_, err := Load(path, Defaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
+	_, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
 	require.ErrorContains(t, err, "must not contain symlinks")
 }
 
-func TestLoadRejectsInvalidAgentDefinitions(t *testing.T) {
+func TestLoadAgentsRejectsInvalidAgentDefinitions(t *testing.T) {
 	tests := []struct {
 		name       string
 		definition string
@@ -187,7 +226,7 @@ func TestLoadRejectsInvalidAgentDefinitions(t *testing.T) {
 			contents := "version: v1\nagents:\n  reviewer:\n" + test.definition
 			require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
 
-			_, err := Load(path, Defaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
+			_, err := LoadAgents(path, AgentDefaults{StorageSize: "10Gi", TaskTimeout: time.Hour})
 			require.ErrorContains(t, err, test.message)
 		})
 	}
