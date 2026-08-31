@@ -1,2 +1,2 @@
-// Package kubernetes manages coding-agent resources in a Kubernetes cluster.
+// Package kubernetes loads Kubernetes connections, including Amazon EKS authentication.
 package kubernetes

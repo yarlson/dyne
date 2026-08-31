@@ -1,4 +1,4 @@
-package kubernetes
+package workload
 
 import (
 	"context"
@@ -15,18 +15,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-
-	"github.com/yarlson/dyne/internal/session"
 )
 
 // Start ensures one complete task projection exists in Kubernetes.
-func (c *Client) Start(ctx context.Context, execution session.Execution) error {
-	spec := manifestSpec(execution, c.namespace)
+func (c *Runtime) Start(ctx context.Context, request TaskRequest) error {
+	spec := manifestSpec(request, c.namespace)
 	var (
 		manifest []byte
 		err      error
 	)
-	if execution.Resume {
+	if request.Resume {
 		manifest, err = renderContinuationManifest(spec)
 	} else {
 		manifest, err = renderSessionManifest(spec)
@@ -39,54 +37,50 @@ func (c *Client) Start(ctx context.Context, execution session.Execution) error {
 	return c.apply(ctx, manifest)
 }
 
-func manifestSpec(execution session.Execution, namespace string) sessionManifestSpec {
-	record := execution.Session
-	definition := record.Definition
-	task := execution.Task
-
+func manifestSpec(request TaskRequest, namespace string) sessionManifestSpec {
 	return sessionManifestSpec{
-		Name: record.Name, TaskName: task.ID, Namespace: namespace, Image: record.Image,
-		Storage: definition.Storage, Repository: record.Repository, InitialRef: record.InitialRef,
-		SetupCommand: definition.SetupCommand, Prompt: task.Prompt,
-		AgentName: definition.Agent, Instructions: definition.Instructions, Skills: definition.Skills,
-		CloneDepth: definition.CloneDepth, StorageSize: definition.StorageSize,
-		TimeoutSeconds: int64(task.Timeout.Seconds()), ResultKind: task.ResultKind,
-		WorkflowRun: record.WorkflowRun, WorkflowStep: record.WorkflowStep,
-		Resume: execution.Resume, GitCredential: execution.RepositoryCredential,
+		Name: request.SessionName, TaskName: request.TaskName, Namespace: namespace, Image: request.Image,
+		Storage: request.Storage, Repository: request.Repository, InitialRef: request.InitialRef,
+		SetupCommand: request.SetupCommand, Prompt: request.Prompt,
+		AgentName: request.AgentName, Instructions: request.Instructions, Skills: request.Skills,
+		CloneDepth: request.CloneDepth, StorageSize: request.StorageSize,
+		TimeoutSeconds: int64(request.Timeout.Seconds()), ResultKind: request.ResultKind,
+		WorkflowRun: request.WorkflowRun, WorkflowStep: request.WorkflowStep,
+		Resume: request.Resume, GitCredential: request.RepositoryCredential,
 	}
 }
 
 // Observe returns the current runtime evidence for one task.
-func (c *Client) Observe(ctx context.Context, sessionName, taskID string) (session.Observation, error) {
+func (c *Runtime) Observe(ctx context.Context, sessionName, taskID string) (TaskObservation, error) {
 	job, err := c.typed.BatchV1().Jobs(c.namespace).Get(ctx, taskID, metav1.GetOptions{})
 	if err != nil {
-		return session.Observation{}, fmt.Errorf("get session %s task %s Job: %w", sessionName, taskID, err)
+		return TaskObservation{}, fmt.Errorf("get session %s task %s Job: %w", sessionName, taskID, err)
 	}
 
 	if job.Status.Succeeded > 0 || jobConditionTrue(job, batchv1.JobComplete) {
 		artifacts, err := c.taskArtifacts(ctx, sessionName, taskID)
 		if err != nil {
-			return session.Observation{}, err
+			return TaskObservation{}, err
 		}
 
-		return session.Observation{State: session.TaskCompleted, Artifacts: artifacts}, nil
+		return TaskObservation{Phase: TaskSucceeded, Artifacts: artifacts}, nil
 	}
 
 	if job.Status.Failed > 0 || jobConditionTrue(job, batchv1.JobFailed) {
 		artifacts, _ := c.taskArtifacts(ctx, sessionName, taskID)
 
-		return session.Observation{State: session.TaskFailed, Artifacts: artifacts, Failure: jobFailure(job)}, nil
+		return TaskObservation{Phase: TaskFailed, Artifacts: artifacts, Failure: jobFailure(job)}, nil
 	}
 
 	if job.Status.Active > 0 {
-		return session.Observation{State: session.TaskRunning}, nil
+		return TaskObservation{Phase: TaskRunning}, nil
 	}
 
-	return session.Observation{State: session.TaskPending}, nil
+	return TaskObservation{Phase: TaskPending}, nil
 }
 
 // WriteLogs streams logs from one task's newest agent Pod.
-func (c *Client) WriteLogs(
+func (c *Runtime) WriteLogs(
 	ctx context.Context, sessionName, taskID string, follow bool, output io.Writer,
 ) (result error) {
 	pod, err := c.taskPod(ctx, sessionName, taskID)
@@ -115,7 +109,7 @@ func (c *Client) WriteLogs(
 }
 
 // Delete removes disposable projections and optionally the session PVC.
-func (c *Client) Delete(ctx context.Context, name string, deleteStorage bool) error {
+func (c *Runtime) Delete(ctx context.Context, name string, deleteStorage bool) error {
 	selector := sessionSelector(name)
 	var deleteErrors []error
 
@@ -164,10 +158,10 @@ func (c *Client) Delete(ctx context.Context, name string, deleteStorage bool) er
 	return errors.Join(deleteErrors...)
 }
 
-func (c *Client) taskArtifacts(ctx context.Context, sessionName, taskID string) (session.Artifacts, error) {
+func (c *Runtime) taskArtifacts(ctx context.Context, sessionName, taskID string) (TaskArtifacts, error) {
 	pod, err := c.taskPod(ctx, sessionName, taskID)
 	if err != nil {
-		return session.Artifacts{}, err
+		return TaskArtifacts{}, err
 	}
 
 	for _, status := range pod.Status.ContainerStatuses {
@@ -176,10 +170,10 @@ func (c *Client) taskArtifacts(ctx context.Context, sessionName, taskID string) 
 		}
 	}
 
-	return session.Artifacts{}, fmt.Errorf("session Pod %s has no terminated agent result", pod.Name)
+	return TaskArtifacts{}, fmt.Errorf("session Pod %s has no terminated agent result", pod.Name)
 }
 
-func (c *Client) taskPod(ctx context.Context, sessionName, taskID string) (*corev1.Pod, error) {
+func (c *Runtime) taskPod(ctx context.Context, sessionName, taskID string) (*corev1.Pod, error) {
 	selector := labels.Set{
 		"coding-agent/session": sessionName,
 		"coding-agent/task":    taskID,
@@ -205,8 +199,8 @@ func (c *Client) taskPod(ctx context.Context, sessionName, taskID string) (*core
 	return newest, nil
 }
 
-func parseTaskArtifacts(message string) (session.Artifacts, error) {
-	var result session.Artifacts
+func parseTaskArtifacts(message string) (TaskArtifacts, error) {
+	var result TaskArtifacts
 	for line := range strings.SplitSeq(message, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
@@ -215,7 +209,7 @@ func parseTaskArtifacts(message string) (session.Artifacts, error) {
 
 		contents, err := base64.StdEncoding.DecodeString(value)
 		if err != nil || !json.Valid(contents) {
-			return session.Artifacts{}, fmt.Errorf("task artifact %s is invalid", key)
+			return TaskArtifacts{}, fmt.Errorf("task artifact %s is invalid", key)
 		}
 
 		switch key {
@@ -229,7 +223,7 @@ func parseTaskArtifacts(message string) (session.Artifacts, error) {
 	}
 
 	if len(result.Outcome) == 0 {
-		return session.Artifacts{}, errors.New("task did not report an outcome artifact")
+		return TaskArtifacts{}, errors.New("task did not report an outcome artifact")
 	}
 
 	return result, nil

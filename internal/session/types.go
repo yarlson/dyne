@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"time"
+
+	"github.com/yarlson/dyne/internal/workload"
 )
 
 // Storage controls whether a session retains files after a task finishes.
@@ -142,21 +144,6 @@ type Task struct {
 	FinishedAt *time.Time
 }
 
-// Execution contains the complete disposable runtime projection of one task.
-type Execution struct {
-	Session              Record
-	Task                 Task
-	Resume               bool
-	RepositoryCredential string
-}
-
-// Observation is the runtime's current evidence for one task execution.
-type Observation struct {
-	State     TaskState
-	Artifacts Artifacts
-	Failure   string
-}
-
 // PublicationSource is the durable eligible source for one publish operation.
 type PublicationSource struct {
 	Repository  string
@@ -173,8 +160,8 @@ type RepositoryTokenProvider interface {
 // Runtime executes disposable session operations in one concrete environment.
 type Runtime interface {
 	Scope() string
-	Start(context.Context, Execution) error
-	Observe(context.Context, string, string) (Observation, error)
+	Start(context.Context, workload.TaskRequest) error
+	Observe(context.Context, string, string) (workload.TaskObservation, error)
 	WriteLogs(context.Context, string, string, bool, io.Writer) error
 	Delete(context.Context, string, bool) error
 }

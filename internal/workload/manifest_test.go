@@ -1,4 +1,4 @@
-package kubernetes
+package workload
 
 import (
 	"encoding/json"
@@ -9,8 +9,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/yarlson/dyne/internal/session"
 )
 
 type renderedResource struct {
@@ -68,7 +66,7 @@ type renderedResource struct {
 
 func TestRenderSelectsWorkflowOutputResultContract(t *testing.T) {
 	spec := validSpec()
-	spec.ResultKind = session.ResultKindWorkflowOutput
+	spec.ResultKind = ResultKindWorkflowOutput
 
 	manifest, err := renderSessionManifest(spec)
 	require.NoError(t, err)
@@ -104,14 +102,14 @@ func TestRenderLabelsWorkflowOwnedSessionResources(t *testing.T) {
 func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 	tests := []struct {
 		name          string
-		storage       session.Storage
+		storage       Storage
 		workload      string
 		wantResources []string
 		wantStorage   map[string]string
 	}{
 		{
 			name:     "ephemeral session uses emptyDir",
-			storage:  session.StorageEphemeral,
+			storage:  StorageEphemeral,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
@@ -125,7 +123,7 @@ func TestRenderSelectsExplicitSessionStorage(t *testing.T) {
 		},
 		{
 			name:     "persistent session uses one claim",
-			storage:  session.StoragePersistent,
+			storage:  StoragePersistent,
 			workload: "Job/example",
 			wantResources: []string{
 				"Job/example",
@@ -182,7 +180,7 @@ func TestRenderPackagesAgentInstructionsAndSkills(t *testing.T) {
 	spec := validSpec()
 	spec.AgentName = "reviewer"
 	spec.Instructions = "Review correctness and tests."
-	spec.Skills = []session.Skill{{
+	spec.Skills = []Skill{{
 		Name:     "code-review",
 		Contents: "---\nname: code-review\ndescription: Review code.\n---\n\nReview changed code.\n",
 	}}
@@ -239,7 +237,7 @@ func TestRenderContinuationProjectsDurableAgentConfiguration(t *testing.T) {
 	spec.Resume = true
 	spec.AgentName = "reviewer"
 	spec.Instructions = "Review correctness and tests."
-	spec.Skills = []session.Skill{{Name: "code-review", Contents: "retained skill"}}
+	spec.Skills = []Skill{{Name: "code-review", Contents: "retained skill"}}
 
 	manifest, err := renderContinuationManifest(spec)
 	require.NoError(t, err)
@@ -333,7 +331,7 @@ func validSpec() sessionManifestSpec {
 		Name:           "example",
 		Namespace:      "coding-agents",
 		Image:          "coding-agent:local",
-		Storage:        session.StoragePersistent,
+		Storage:        StoragePersistent,
 		InitialRef:     "main",
 		Prompt:         "inspect the repository",
 		CloneDepth:     1,

@@ -1,4 +1,4 @@
-package kubernetes
+package workload
 
 import (
 	"context"
@@ -19,16 +19,10 @@ import (
 	"k8s.io/client-go/restmapper"
 )
 
-const (
-	fieldManagerName = "dyne"
-	// DefaultNamespace is the namespace used when the server flag is omitted.
-	DefaultNamespace = "coding-agents"
-	// DefaultImage is the coding-session image used when the server flag is omitted.
-	DefaultImage = "coding-agent:local"
-)
+const fieldManagerName = "dyne"
 
-// Client projects session and publisher executions into Kubernetes.
-type Client struct {
+// Runtime projects session and publisher executions into Kubernetes.
+type Runtime struct {
 	typed     clientset.Interface
 	dynamic   dynamic.Interface
 	mapper    meta.RESTMapper
@@ -43,7 +37,7 @@ type Config struct {
 }
 
 // NewForConfig creates a runtime using server-owned Kubernetes credentials.
-func NewForConfig(restConfig *rest.Config, config Config) (*Client, error) {
+func NewForConfig(restConfig *rest.Config, config Config) (*Runtime, error) {
 	if restConfig == nil {
 		return nil, errors.New("kubernetes configuration is required")
 	}
@@ -68,16 +62,16 @@ func NewForConfig(restConfig *rest.Config, config Config) (*Client, error) {
 
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(typed.Discovery()))
 
-	return &Client{
+	return &Runtime{
 		typed: typed, dynamic: dynamicClient, mapper: mapper,
 		stdout: config.Output, namespace: config.Namespace,
 	}, nil
 }
 
 // Scope identifies the namespace owned by this runtime.
-func (c *Client) Scope() string { return c.namespace }
+func (c *Runtime) Scope() string { return c.namespace }
 
-func (c *Client) apply(ctx context.Context, manifest []byte) error {
+func (c *Runtime) apply(ctx context.Context, manifest []byte) error {
 	var list unstructured.UnstructuredList
 	if err := json.Unmarshal(manifest, &list); err != nil {
 		return fmt.Errorf("decode resource list: %w", err)
@@ -92,7 +86,7 @@ func (c *Client) apply(ctx context.Context, manifest []byte) error {
 	return nil
 }
 
-func (c *Client) applyResource(ctx context.Context, resource *unstructured.Unstructured) error {
+func (c *Runtime) applyResource(ctx context.Context, resource *unstructured.Unstructured) error {
 	if resource.GetName() == "" {
 		return fmt.Errorf("apply %s: resource name is required", resource.GroupVersionKind().String())
 	}

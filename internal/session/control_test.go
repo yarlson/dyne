@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yarlson/dyne/internal/workload"
 )
 
 func TestStartRecordsIntentBeforeProjectingExecution(t *testing.T) {
@@ -20,10 +22,10 @@ func TestStartRecordsIntentBeforeProjectingExecution(t *testing.T) {
 		assert.NotEmpty(t, record.IntentID)
 		assert.Equal(t, TaskPending, task.State)
 	}
-	runtime := runtimeStub{start: func(execution Execution) error {
+	runtime := runtimeStub{start: func(request workload.TaskRequest) error {
 		operations = append(operations, "start runtime")
-		assert.Equal(t, "installation-token", execution.RepositoryCredential)
-		assert.Equal(t, "Review correctness.", execution.Session.Definition.Instructions)
+		assert.Equal(t, "installation-token", request.RepositoryCredential)
+		assert.Equal(t, "Review correctness.", request.Instructions)
 
 		return nil
 	}}
@@ -43,7 +45,7 @@ func TestStartWithSameIntentEnsuresPendingExecutionAfterRestart(t *testing.T) {
 	require.NoError(t, err)
 
 	starts := 0
-	secondRuntime := runtimeStub{start: func(Execution) error {
+	secondRuntime := runtimeStub{start: func(workload.TaskRequest) error {
 		starts++
 
 		return nil
@@ -71,8 +73,8 @@ func TestStartRejectsDifferentIntentBeforeRuntimeMutation(t *testing.T) {
 
 func TestStatusPersistsValidatedRuntimeResult(t *testing.T) {
 	repository := newMemoryRepository()
-	runtime := runtimeStub{observe: func(string, string) (Observation, error) {
-		return Observation{State: TaskCompleted, Artifacts: Artifacts{
+	runtime := runtimeStub{observe: func(string, string) (workload.TaskObservation, error) {
+		return workload.TaskObservation{Phase: workload.TaskSucceeded, Artifacts: workload.TaskArtifacts{
 			Outcome:     []byte(`{"status":"completed","summary":"fixed","blocker":""}`),
 			PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
 		}}, nil
@@ -85,8 +87,8 @@ func TestStatusPersistsValidatedRuntimeResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, TaskCompleted, status.State)
 
-	restarted := newTestControl(t, repository, runtimeStub{observe: func(string, string) (Observation, error) {
-		return Observation{}, errors.New("runtime result was deleted")
+	restarted := newTestControl(t, repository, runtimeStub{observe: func(string, string) (workload.TaskObservation, error) {
+		return workload.TaskObservation{}, errors.New("runtime result was deleted")
 	}}, nil)
 	artifacts, err := restarted.Artifacts(context.Background(), "review")
 	require.NoError(t, err)
@@ -101,9 +103,9 @@ func TestContinueUsesDurableDefinitionInsteadOfRuntimeMetadata(t *testing.T) {
 	_, err = control.Status(context.Background(), "review")
 	require.NoError(t, err)
 
-	var continuation Execution
-	restarted := newTestControl(t, repository, runtimeStub{start: func(execution Execution) error {
-		continuation = execution
+	var continuation workload.TaskRequest
+	restarted := newTestControl(t, repository, runtimeStub{start: func(request workload.TaskRequest) error {
+		continuation = request
 
 		return nil
 	}}, nil)
@@ -111,14 +113,18 @@ func TestContinueUsesDurableDefinitionInsteadOfRuntimeMetadata(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "fixed-task", result.TaskID)
 	assert.True(t, continuation.Resume)
-	assert.Equal(t, "Review correctness.", continuation.Session.Definition.Instructions)
-	assert.Equal(t, "make tools", continuation.Session.Definition.SetupCommand)
+	assert.Equal(t, "Review correctness.", continuation.Instructions)
+	assert.Equal(t, "make tools", continuation.SetupCommand)
 }
 
 func TestDeleteKeepsDurableCleanupIntentAfterRuntimeFailure(t *testing.T) {
 	repository := newMemoryRepository()
 	runtimeFailure := errors.New("cluster unavailable")
-	control := newTestControl(t, repository, runtimeStub{delete: func(string, bool) error {
+	control := newTestControl(t, repository, runtimeStub{delete: func(name string, _ bool) error {
+		task, err := repository.LatestTask(context.Background(), name)
+		require.NoError(t, err)
+		assert.Equal(t, TaskCanceled, task.State)
+
 		return runtimeFailure
 	}}, nil)
 	_, err := control.Start(context.Background(), validDefinition(), validStartRequest())
@@ -127,11 +133,62 @@ func TestDeleteKeepsDurableCleanupIntentAfterRuntimeFailure(t *testing.T) {
 	err = control.Destroy(context.Background(), "review")
 	require.ErrorIs(t, err, runtimeFailure)
 	assert.Equal(t, &Deletion{Storage: true}, repository.records["review"].Deletion)
+	task, taskErr := repository.LatestTask(context.Background(), "review")
+	require.NoError(t, taskErr)
+	assert.Equal(t, TaskCanceled, task.State)
 
 	restarted := newTestControl(t, repository, runtimeStub{}, nil)
 	require.NoError(t, restarted.ReconcileDeletions(context.Background()))
 	_, exists := repository.records["review"]
 	assert.False(t, exists)
+}
+
+func TestDeletePersistsCompletedTaskBeforeRemovingRuntimeEvidence(t *testing.T) {
+	repository := newMemoryRepository()
+	runtime := runtimeStub{
+		observe: completedObservation,
+		delete: func(name string, storage bool) error {
+			task, err := repository.LatestTask(context.Background(), name)
+			require.NoError(t, err)
+			assert.Equal(t, TaskCompleted, task.State)
+			assert.JSONEq(t, `{"status":"completed","summary":"fixed","blocker":""}`, string(task.Artifacts.Outcome))
+			assert.False(t, storage)
+
+			return nil
+		},
+	}
+	control := newTestControl(t, repository, runtime, nil)
+	_, err := control.Start(context.Background(), validDefinition(), validStartRequest())
+	require.NoError(t, err)
+
+	require.NoError(t, control.Delete(context.Background(), "review"))
+	task, err := repository.LatestTask(context.Background(), "review")
+	require.NoError(t, err)
+	assert.Equal(t, TaskCompleted, task.State)
+}
+
+func TestDeleteKeepsRuntimeEvidenceWhenObservationFails(t *testing.T) {
+	repository := newMemoryRepository()
+	observationFailure := errors.New("cluster unavailable")
+	deleted := false
+	runtime := runtimeStub{
+		observe: func(string, string) (workload.TaskObservation, error) {
+			return workload.TaskObservation{}, observationFailure
+		},
+		delete: func(string, bool) error {
+			deleted = true
+
+			return nil
+		},
+	}
+	control := newTestControl(t, repository, runtime, nil)
+	_, err := control.Start(context.Background(), validDefinition(), validStartRequest())
+	require.NoError(t, err)
+
+	err = control.Delete(context.Background(), "review")
+	require.ErrorIs(t, err, observationFailure)
+	assert.False(t, deleted)
+	assert.Equal(t, &Deletion{Storage: false}, repository.records["review"].Deletion)
 }
 
 func TestPreparePublicationUsesOnlyDurableSessionState(t *testing.T) {
@@ -148,8 +205,8 @@ func TestPreparePublicationUsesOnlyDurableSessionState(t *testing.T) {
 	assert.JSONEq(t, `{"title":"Fix link","body":"Updates the README."}`, string(publication.Source.PullRequest))
 }
 
-func completedObservation(string, string) (Observation, error) {
-	return Observation{State: TaskCompleted, Artifacts: Artifacts{
+func completedObservation(string, string) (workload.TaskObservation, error) {
+	return workload.TaskObservation{Phase: workload.TaskSucceeded, Artifacts: workload.TaskArtifacts{
 		Outcome:     []byte(`{"status":"completed","summary":"fixed","blocker":""}`),
 		PullRequest: []byte(`{"title":"Fix link","body":"Updates the README."}`),
 	}}, nil
@@ -192,26 +249,26 @@ func (t tokenProviderStub) InstallationToken(context.Context) (string, error) { 
 
 type runtimeStub struct {
 	scope   string
-	start   func(Execution) error
-	observe func(string, string) (Observation, error)
+	start   func(workload.TaskRequest) error
+	observe func(string, string) (workload.TaskObservation, error)
 	delete  func(string, bool) error
 }
 
 func (r runtimeStub) Scope() string { return r.scope }
-func (r runtimeStub) Start(_ context.Context, execution Execution) error {
+func (r runtimeStub) Start(_ context.Context, request workload.TaskRequest) error {
 	if r.start != nil {
-		return r.start(execution)
+		return r.start(request)
 	}
 
 	return nil
 }
 
-func (r runtimeStub) Observe(_ context.Context, name, task string) (Observation, error) {
+func (r runtimeStub) Observe(_ context.Context, name, task string) (workload.TaskObservation, error) {
 	if r.observe != nil {
 		return r.observe(name, task)
 	}
 
-	return Observation{State: TaskPending}, nil
+	return workload.TaskObservation{Phase: workload.TaskPending}, nil
 }
 
 func (r runtimeStub) WriteLogs(context.Context, string, string, bool, io.Writer) error { return nil }

@@ -1,4 +1,4 @@
-package kubernetes
+package workload
 
 import (
 	"encoding/json"
@@ -7,8 +7,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-
-	"github.com/yarlson/dyne/internal/session"
 )
 
 const (
@@ -20,7 +18,7 @@ type sessionManifestSpec struct {
 	Name           string
 	Namespace      string
 	Image          string
-	Storage        session.Storage
+	Storage        Storage
 	TaskName       string
 	Resume         bool
 	Repository     string
@@ -29,11 +27,11 @@ type sessionManifestSpec struct {
 	Prompt         string
 	AgentName      string
 	Instructions   string
-	Skills         []session.Skill
+	Skills         []Skill
 	CloneDepth     int
 	StorageSize    string
 	TimeoutSeconds int64
-	ResultKind     session.ResultKind
+	ResultKind     ResultKind
 	WorkflowRun    string
 	WorkflowStep   string
 	GitCredential  string
@@ -51,7 +49,7 @@ var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
 func (s sessionManifestSpec) validate(initial bool) error {
 	if s.ResultKind == "" {
-		s.ResultKind = session.ResultKindPullRequest
+		s.ResultKind = ResultKindPullRequest
 	}
 
 	if !dnsLabelPattern.MatchString(s.Name) || len(s.Name) > 40 {
@@ -132,13 +130,13 @@ func (s sessionManifestSpec) validate(initial bool) error {
 	}
 
 	switch s.Storage {
-	case session.StorageEphemeral, session.StoragePersistent:
+	case StorageEphemeral, StoragePersistent:
 	default:
 		return fmt.Errorf("unsupported storage %q", s.Storage)
 	}
 
 	switch s.ResultKind {
-	case "", session.ResultKindPullRequest, session.ResultKindWorkflowOutput:
+	case "", ResultKindPullRequest, ResultKindWorkflowOutput:
 	default:
 		return fmt.Errorf("unsupported result kind %q", s.ResultKind)
 	}
@@ -151,7 +149,7 @@ func renderSessionManifest(s sessionManifestSpec) ([]byte, error) {
 }
 
 func renderContinuationManifest(s sessionManifestSpec) ([]byte, error) {
-	if s.Storage != session.StoragePersistent {
+	if s.Storage != StoragePersistent {
 		return nil, errors.New("continuation requires persistent storage")
 	}
 
@@ -168,7 +166,7 @@ func render(s sessionManifestSpec, initial bool) ([]byte, error) {
 	}
 
 	items := []manifestResource{denyIngressPolicy(s.Namespace)}
-	if initial && s.Storage == session.StoragePersistent {
+	if initial && s.Storage == StoragePersistent {
 		items = append(items, persistentVolumeClaim(s))
 	}
 
@@ -248,7 +246,7 @@ func sessionJob(s sessionManifestSpec) manifestResource {
 }
 
 func sessionPodTemplate(s sessionManifestSpec) map[string]any {
-	workspaceReadOnly := s.Storage == session.StorageEphemeral
+	workspaceReadOnly := s.Storage == StorageEphemeral
 
 	return map[string]any{
 		"metadata": map[string]any{"labels": taskLabels(s)},
@@ -381,9 +379,9 @@ func sessionContainer(s sessionManifestSpec, name string, args []any, workspaceR
 	}
 }
 
-func resultKind(kind session.ResultKind) session.ResultKind {
+func resultKind(kind ResultKind) ResultKind {
 	if kind == "" {
-		return session.ResultKindPullRequest
+		return ResultKindPullRequest
 	}
 
 	return kind
@@ -415,7 +413,7 @@ func sessionDirectoryContainer(s sessionManifestSpec) map[string]any {
 
 func sessionVolumes(s sessionManifestSpec) []any {
 	sessionVolume := map[string]any{"name": "session"}
-	if s.Storage == session.StorageEphemeral {
+	if s.Storage == StorageEphemeral {
 		sessionVolume["emptyDir"] = map[string]any{"sizeLimit": "7Gi"}
 	} else {
 		sessionVolume["persistentVolumeClaim"] = map[string]any{"claimName": sessionClaimName(s.Name)}
@@ -450,7 +448,7 @@ func sessionVolumes(s sessionManifestSpec) []any {
 	if len(s.Skills) > 0 {
 		items := make([]any, len(s.Skills))
 		skills := slices.Clone(s.Skills)
-		slices.SortFunc(skills, func(left, right session.Skill) int {
+		slices.SortFunc(skills, func(left, right Skill) int {
 			return strings.Compare(left.Name, right.Name)
 		})
 		for i, skill := range skills {
@@ -514,7 +512,7 @@ func agentSkillKey(name string) string {
 	return "skill-" + name
 }
 
-func validateAgentSkills(skills []session.Skill) error {
+func validateAgentSkills(skills []Skill) error {
 	names := make(map[string]struct{}, len(skills))
 	for _, skill := range skills {
 		if !dnsLabelPattern.MatchString(skill.Name) || len(skill.Name) > 63 {

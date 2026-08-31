@@ -27,9 +27,14 @@ import (
 	"github.com/yarlson/dyne/internal/storage"
 	"github.com/yarlson/dyne/internal/workflow"
 	"github.com/yarlson/dyne/internal/workflowconfig"
+	"github.com/yarlson/dyne/internal/workload"
 )
 
-const defaultServerURL = "http://127.0.0.1:8080"
+const (
+	defaultServerURL = "http://127.0.0.1:8080"
+	defaultNamespace = "coding-agents"
+	defaultImage     = "coding-agent:local"
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -85,8 +90,8 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 	set := flag.NewFlagSet("server", flag.ContinueOnError)
 	set.SetOutput(stderr)
 	listenAddress := set.String("listen", "127.0.0.1:8080", "HTTP listen address")
-	namespace := set.String("namespace", kubernetes.DefaultNamespace, "Kubernetes namespace owned by this server")
-	image := set.String("image", kubernetes.DefaultImage, "coding-agent image")
+	namespace := set.String("namespace", defaultNamespace, "Kubernetes namespace owned by this server")
+	image := set.String("image", defaultImage, "coding-agent image")
 	storageSize := set.String("storage-size", "10Gi", "persistent session claim size")
 	taskTimeout := set.Duration("task-timeout", 2*time.Hour, "default task deadline")
 	kubeconfig := set.String("kubeconfig", "", "kubeconfig file")
@@ -154,7 +159,7 @@ func serve(ctx context.Context, args []string, stderr io.Writer) (result error) 
 		return err
 	}
 
-	runtime, err := kubernetes.NewForConfig(restConfig, kubernetes.Config{
+	runtime, err := workload.NewForConfig(restConfig, workload.Config{
 		Namespace: *namespace, Output: io.Discard,
 	})
 	if err != nil {

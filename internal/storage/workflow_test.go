@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,26 +72,6 @@ func TestRepositoryDeletesRunAndSnapshotsTogether(t *testing.T) {
 	assert.ErrorIs(t, err, workflow.ErrRunNotFound)
 	_, err = repository.SessionDefinition(ctx, "delivery-123", "reviewer")
 	assert.ErrorIs(t, err, workflow.ErrRunNotFound)
-}
-
-func TestRepositoryReadsEstablishedAgentSnapshotShape(t *testing.T) {
-	database := openTestDatabase(t)
-	defer func() { require.NoError(t, database.Close()) }()
-	repository := database.Workflows()
-	ctx := context.Background()
-	_, err := repository.Create(ctx, workflow.Run{Version: "v1", Name: "delivery-123"}, nil)
-	require.NoError(t, err)
-	_, err = database.database.ExecContext(ctx, `
-		INSERT INTO workflow_agent_snapshots (run_name, agent_name, contents)
-		VALUES (?, ?, ?)
-	`, "delivery-123", "reviewer", []byte(`{"Name":"reviewer","Storage":"ephemeral","Instructions":"review","Timeout":3600000000000}`))
-	require.NoError(t, err)
-
-	definition, err := repository.SessionDefinition(ctx, "delivery-123", "reviewer")
-	require.NoError(t, err)
-	assert.Equal(t, session.Definition{
-		Agent: "reviewer", Storage: session.StorageEphemeral, Instructions: "review", Timeout: time.Hour,
-	}, definition)
 }
 
 func TestOpenRejectsUnsupportedURL(t *testing.T) {

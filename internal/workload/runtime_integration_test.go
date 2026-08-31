@@ -1,6 +1,6 @@
 //go:build integration
 
-package kubernetes
+package workload
 
 import (
 	"context"
@@ -15,6 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/yarlson/dyne/internal/kubernetes"
 )
 
 func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
@@ -23,7 +25,7 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 		t.Skip("KUBERNETES_INTEGRATION_CONTEXT is required")
 	}
 
-	config, err := LoadConnectionConfig(context.Background(), ConnectionConfig{ContextName: contextName})
+	config, err := kubernetes.LoadConnectionConfig(context.Background(), kubernetes.ConnectionConfig{ContextName: contextName})
 	require.NoError(t, err)
 	namespace := integrationNamespace(t)
 	client, err := NewForConfig(config, Config{Namespace: namespace, Output: io.Discard})
@@ -47,14 +49,14 @@ func TestClientAppliesAndRemovesSessionResources(t *testing.T) {
 	require.NoError(t, client.Delete(testContext, "session", false))
 	assertSessionWorkloadDeleted(t, testContext, client, namespace)
 	_, err = client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, "session-session", metav1.GetOptions{})
-	assert.NoError(t, err, "persistent state was not retained")
+	assert.NoError(t, err, "persistent files were not retained")
 
 	require.NoError(t, client.Delete(testContext, "session", true))
 	require.Eventually(t, func() bool {
 		_, err := client.typed.CoreV1().PersistentVolumeClaims(namespace).Get(testContext, "session-session", metav1.GetOptions{})
 
 		return apierrors.IsNotFound(err)
-	}, 30*time.Second, 100*time.Millisecond, "persistent state was not destroyed")
+	}, 30*time.Second, 100*time.Millisecond, "persistent files were not destroyed")
 }
 
 func integrationNamespace(t *testing.T) string {
@@ -100,7 +102,7 @@ func integrationManifest(namespace string) []byte {
 }`, namespace)
 }
 
-func assertSessionWorkloadDeleted(t *testing.T, ctx context.Context, client *Client, namespace string) {
+func assertSessionWorkloadDeleted(t *testing.T, ctx context.Context, client *Runtime, namespace string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		jobs, err := client.typed.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{LabelSelector: "coding-agent/session=session"})

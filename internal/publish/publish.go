@@ -12,6 +12,7 @@ import (
 
 	"github.com/yarlson/dyne/internal/github"
 	"github.com/yarlson/dyne/internal/session"
+	"github.com/yarlson/dyne/internal/workload"
 )
 
 var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -71,31 +72,10 @@ type Record struct {
 	Revision          int64
 }
 
-// RuntimeRequest contains the complete disposable publisher projection.
-type RuntimeRequest struct {
-	Session              string
-	IntentID             string
-	Image                string
-	Repository           string
-	RepositoryCredential string
-	BaseRef              string
-	Branch               string
-	CommitMessage        string
-	AuthorName           string
-	AuthorEmail          string
-	Timeout              time.Duration
-}
-
-// RuntimeResult identifies the branch and commit produced by a publisher execution.
-type RuntimeResult struct {
-	Branch    string
-	CommitSHA string
-}
-
 // Runtime executes isolated workspace publication.
 type Runtime interface {
 	Scope() string
-	RunPublisher(context.Context, RuntimeRequest) (RuntimeResult, error)
+	RunPublisher(context.Context, workload.PublishRequest) (workload.PublishResult, error)
 	DeletePublisher(context.Context, string) error
 }
 
@@ -244,6 +224,10 @@ func (c *Control) publish(ctx context.Context, request Request) (Result, error) 
 	}
 
 	if record.State == StateConflicted {
+		if err := c.runtime.DeletePublisher(ctx, record.Session); err != nil {
+			return Result{}, fmt.Errorf("clean conflicted publisher execution: %w", err)
+		}
+
 		return Result{}, fmt.Errorf("%w: %s", ErrConflict, record.Failure)
 	}
 
@@ -278,7 +262,7 @@ func (c *Control) publish(ctx context.Context, request Request) (Result, error) 
 	}
 
 	if record.State == StateReady {
-		record, err = c.publishBranch(ctx, record, token)
+		record, err = c.publishBranch(ctx, record, token, repository, client)
 		if err != nil {
 			return Result{}, err
 		}
@@ -372,9 +356,11 @@ func (c *Control) publishBranch(
 	ctx context.Context,
 	record Record,
 	token string,
+	repository github.Repository,
+	client githubClient,
 ) (Record, error) {
 	authorName, authorEmail := github.CommitAuthor()
-	result, err := c.runtime.RunPublisher(ctx, RuntimeRequest{
+	result, err := c.runtime.RunPublisher(ctx, workload.PublishRequest{
 		Session: record.Session, IntentID: record.IntentID, Image: record.Image,
 		Repository: record.Repository, RepositoryCredential: token,
 		BaseRef: record.Request.BaseBranch, Branch: record.Request.Branch,
@@ -382,6 +368,10 @@ func (c *Control) publishBranch(
 		Timeout: record.Request.Timeout,
 	})
 	if err != nil {
+		if errors.Is(err, workload.ErrExecutionFailed) {
+			return c.recoverFailedPublisher(ctx, record, repository, client, result, err)
+		}
+
 		return Record{}, err
 	}
 
@@ -393,6 +383,55 @@ func (c *Control) publishBranch(
 	record.State = StateBranchPublished
 
 	return c.save(ctx, record)
+}
+
+func (c *Control) recoverFailedPublisher(
+	ctx context.Context,
+	record Record,
+	repository github.Repository,
+	client githubClient,
+	result workload.PublishResult,
+	executionFailure error,
+) (Record, error) {
+	remoteCommit, exists, err := client.BranchCommitSHA(ctx, repository, record.Request.Branch)
+	if err != nil {
+		return Record{}, errors.Join(executionFailure, fmt.Errorf("check branch after failed publisher execution: %w", err))
+	}
+
+	if !exists {
+		if err := c.runtime.DeletePublisher(ctx, record.Session); err != nil {
+			return Record{}, errors.Join(executionFailure, fmt.Errorf("clean failed publisher execution: %w", err))
+		}
+
+		return Record{}, executionFailure
+	}
+
+	if result.Branch == record.Request.Branch && commitSHAPattern.MatchString(result.CommitSHA) && remoteCommit == result.CommitSHA {
+		record.CommitSHA = result.CommitSHA
+		record.State = StateBranchPublished
+
+		recovered, err := c.save(ctx, record)
+		if err != nil {
+			return Record{}, errors.Join(executionFailure, err)
+		}
+
+		return recovered, nil
+	}
+
+	record.State = StateConflicted
+	record.Failure = fmt.Sprintf(
+		"remote branch %s changed while the publisher execution was running", record.Request.Branch,
+	)
+	if _, err := c.save(ctx, record); err != nil {
+		return Record{}, errors.Join(executionFailure, err)
+	}
+
+	conflict := fmt.Errorf("%w: %s", ErrConflict, record.Failure)
+	if err := c.runtime.DeletePublisher(ctx, record.Session); err != nil {
+		return Record{}, errors.Join(conflict, fmt.Errorf("clean conflicted publisher execution: %w", err))
+	}
+
+	return Record{}, conflict
 }
 
 func (c *Control) finish(ctx context.Context, record Record) (Result, error) {

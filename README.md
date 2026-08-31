@@ -4,7 +4,7 @@ dyne is a small HTTP control plane for coding-agent Jobs and durable multi-agent
 
 ## Runtime model
 
-Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, and artifacts. A continuation is another Job mounted to the same PVC. SQL stores the immutable session definition and task history. Kubernetes ConfigMaps and Jobs are runtime projections of that durable state.
+Every task is a bounded Kubernetes Job. An ephemeral session uses one `emptyDir`. A persistent session uses one PVC with separate directories for the workspace, tool home, agent state, logs, and artifacts. A continuation is another Job mounted to the same PVC. SQL is the only source of application state for sessions, workflows, and publishing. Kubernetes Jobs, ConfigMaps, Secrets, and annotations are disposable execution projections. The workload package owns low-level execution requests and observations; the product packages translate them and persist every state transition in SQL.
 
 A workflow is an immutable directed acyclic graph of isolated sessions. Steps never share a workspace or PVC. Dependency steps return bounded JSON outputs that dyne stores in SQL and includes in the direct dependent step's prompt. Independent ready steps can run concurrently up to the workflow's configured limit. At most one persistent leaf is publishable; all other steps are ephemeral findings.
 
@@ -13,7 +13,7 @@ This keeps recovery simple:
 - Kubernetes replaces a failed task Pod. Persistent work written before the failure remains on the PVC.
 - A new `dyne task` continues the retained Codex thread and workspace after a task completes or fails.
 - SQL stores the immutable session definition, tasks, validated results, and deletion progress, so continuation still works after old Kubernetes resources are deleted or the dyne server restarts.
-- `dyne delete` removes Kubernetes runtime resources and keeps a persistent session's SQL record and PVC. `dyne delete --storage` also deletes that durable state.
+- `dyne delete` removes Kubernetes runtime resources and keeps a persistent session's SQL record and PVC. `dyne delete --storage` also deletes the SQL record and retained files.
 - SQLite stores product state for a local server. PostgreSQL stores the same state in production. SQL transactions retain session, workflow, and publish intent and progress across server restarts.
 
 The namespace must already exist and enforce the security policy appropriate for the cluster. Codex credentials must already exist in a Secret named `coding-agent-auth`. The Secret can contain `auth.json` or `CODEX_API_KEY`. Repository credentials are not stored there.

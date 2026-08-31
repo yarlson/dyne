@@ -1,4 +1,4 @@
-package kubernetes
+package workload
 
 import (
 	"context"
@@ -14,8 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-
-	"github.com/yarlson/dyne/internal/session"
 )
 
 func TestObserveReturnsCompletedTaskArtifacts(t *testing.T) {
@@ -34,11 +32,11 @@ func TestObserveReturnsCompletedTaskArtifacts(t *testing.T) {
 			}},
 		}}},
 	}
-	client := &Client{typed: fake.NewClientset(job, pod), namespace: "coding-agents"}
+	client := &Runtime{typed: fake.NewClientset(job, pod), namespace: "coding-agents"}
 
 	observation, err := client.Observe(context.Background(), "review", "review")
 	require.NoError(t, err)
-	assert.Equal(t, session.TaskCompleted, observation.State)
+	assert.Equal(t, TaskSucceeded, observation.Phase)
 	assert.JSONEq(t, `{"status":"completed"}`, string(observation.Artifacts.Outcome))
 	assert.JSONEq(t, `{"title":"Fix","body":"Body"}`, string(observation.Artifacts.PullRequest))
 }
@@ -48,11 +46,11 @@ func TestObserveReturnsRunningWithoutInspectingOtherResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "review-next", Namespace: "coding-agents"},
 		Status:     batchv1.JobStatus{Active: 1},
 	}
-	client := &Client{typed: fake.NewClientset(job), namespace: "coding-agents"}
+	client := &Runtime{typed: fake.NewClientset(job), namespace: "coding-agents"}
 
 	observation, err := client.Observe(context.Background(), "review", "review-next")
 	require.NoError(t, err)
-	assert.Equal(t, session.TaskRunning, observation.State)
+	assert.Equal(t, TaskRunning, observation.Phase)
 }
 
 func TestDeleteRemovesDisposableProjectionsAndRetainsPVC(t *testing.T) {
@@ -63,7 +61,7 @@ func TestDeleteRemovesDisposableProjectionsAndRetainsPVC(t *testing.T) {
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "review-git", Namespace: "coding-agents", Labels: resourceLabels}},
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "session-review", Namespace: "coding-agents", Labels: resourceLabels}},
 	)
-	client := &Client{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
+	client := &Runtime{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
 
 	require.NoError(t, client.Delete(context.Background(), "review", false))
 	_, err := clientset.BatchV1().Jobs("coding-agents").Get(context.Background(), "review", metav1.GetOptions{})
@@ -83,7 +81,7 @@ func TestDeleteStorageReportsPVCFailure(t *testing.T) {
 	clientset.PrependReactor("delete", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, assert.AnError
 	})
-	client := &Client{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
+	client := &Runtime{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
 
 	err := client.Delete(context.Background(), "review", true)
 	require.ErrorIs(t, err, assert.AnError)

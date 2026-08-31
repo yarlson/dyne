@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,17 +12,18 @@ import (
 
 	"github.com/yarlson/dyne/internal/github"
 	"github.com/yarlson/dyne/internal/session"
+	"github.com/yarlson/dyne/internal/workload"
 )
 
 func TestPublishRecordsIntentBeforeCheckingOrChangingGitHub(t *testing.T) {
 	var operations []string
 	repository := newMemoryRepository()
 	repository.created = func(Record) { operations = append(operations, "record intent") }
-	runtime := runtimeStub{run: func(request RuntimeRequest) (RuntimeResult, error) {
+	runtime := runtimeStub{run: func(request workload.PublishRequest) (workload.PublishResult, error) {
 		operations = append(operations, "publish branch")
 		assert.Equal(t, "installation-token", request.RepositoryCredential)
 
-		return RuntimeResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
+		return workload.PublishResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
 	}}
 	client := githubClientStub{
 		findPull: func() (*github.PullRequest, error) {
@@ -53,10 +55,10 @@ func TestPublishRecordsIntentBeforeCheckingOrChangingGitHub(t *testing.T) {
 func TestPublishDoesNotClaimBranchThatPredatesDurableOwnership(t *testing.T) {
 	repository := newMemoryRepository()
 	runtimeCalls := 0
-	runtime := runtimeStub{run: func(RuntimeRequest) (RuntimeResult, error) {
+	runtime := runtimeStub{run: func(workload.PublishRequest) (workload.PublishResult, error) {
 		runtimeCalls++
 
-		return RuntimeResult{}, nil
+		return workload.PublishResult{}, nil
 	}}
 	client := githubClientStub{
 		findPull:     func() (*github.PullRequest, error) { return nil, nil },
@@ -74,8 +76,8 @@ func TestPublishDoesNotClaimBranchThatPredatesDurableOwnership(t *testing.T) {
 func TestPublishRecoversPullRequestAfterAmbiguousCreateFailure(t *testing.T) {
 	createFailure := errors.New("connection reset")
 	repository := newMemoryRepository()
-	runtime := runtimeStub{run: func(RuntimeRequest) (RuntimeResult, error) {
-		return RuntimeResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
+	runtime := runtimeStub{run: func(workload.PublishRequest) (workload.PublishResult, error) {
+		return workload.PublishResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
 	}}
 	findCalls := 0
 	client := githubClientStub{
@@ -102,8 +104,8 @@ func TestPublishRecoversPullRequestAfterAmbiguousCreateFailure(t *testing.T) {
 func TestPublishDoesNotClaimBranchAfterAmbiguousPublisherFailure(t *testing.T) {
 	repository := newMemoryRepository()
 	publishFailure := errors.New("publisher connection lost")
-	runtime := runtimeStub{run: func(RuntimeRequest) (RuntimeResult, error) {
-		return RuntimeResult{}, publishFailure
+	runtime := runtimeStub{run: func(workload.PublishRequest) (workload.PublishResult, error) {
+		return workload.PublishResult{}, publishFailure
 	}}
 	branchChecks := 0
 	client := githubClientStub{
@@ -125,12 +127,111 @@ func TestPublishDoesNotClaimBranchAfterAmbiguousPublisherFailure(t *testing.T) {
 	assert.Empty(t, repository.records["review"].CommitSHA)
 }
 
+func TestPublishRemovesFailedExecutionBeforeAllowingRetry(t *testing.T) {
+	repository := newMemoryRepository()
+	var operations []string
+	runtime := runtimeStub{
+		run: func(workload.PublishRequest) (workload.PublishResult, error) {
+			operations = append(operations, "run publisher")
+
+			return workload.PublishResult{}, fmt.Errorf("container exited: %w", workload.ErrExecutionFailed)
+		},
+		delete: func(string) error {
+			operations = append(operations, "delete publisher")
+
+			return nil
+		},
+	}
+	client := githubClientStub{
+		findPull:     func() (*github.PullRequest, error) { return nil, nil },
+		branchCommit: func() (string, bool, error) { return "", false, nil },
+	}
+	control := newTestControl(t, repository, runtime, client)
+
+	_, err := control.Publish(context.Background(), validRequest())
+	require.ErrorIs(t, err, workload.ErrExecutionFailed)
+	assert.Equal(t, []string{"run publisher", "delete publisher"}, operations)
+	assert.Equal(t, StateReady, repository.records["review"].State)
+}
+
+func TestPublishRecoversOwnedBranchAfterTerminalPublisherFailure(t *testing.T) {
+	repository := newMemoryRepository()
+	deleted := 0
+	runtime := runtimeStub{
+		run: func(workload.PublishRequest) (workload.PublishResult, error) {
+			return workload.PublishResult{Branch: "yar/review", CommitSHA: validCommitSHA}, fmt.Errorf("lost completion: %w", workload.ErrExecutionFailed)
+		},
+		delete: func(string) error {
+			deleted++
+
+			return nil
+		},
+	}
+	branchChecks := 0
+	client := githubClientStub{
+		findPull: func() (*github.PullRequest, error) { return nil, nil },
+		branchCommit: func() (string, bool, error) {
+			branchChecks++
+			if branchChecks == 1 {
+				return "", false, nil
+			}
+
+			return validCommitSHA, true, nil
+		},
+		createPull: func() (github.PullRequest, error) {
+			return github.PullRequest{Number: 31, URL: "https://github.com/lokalise/ratchet-test-service/pull/31"}, nil
+		},
+	}
+	control := newTestControl(t, repository, runtime, client)
+
+	result, err := control.Publish(context.Background(), validRequest())
+	require.NoError(t, err)
+	assert.Equal(t, 31, result.PullRequestNumber)
+	assert.Equal(t, validCommitSHA, result.CommitSHA)
+	assert.Equal(t, StateCompleted, repository.records["review"].State)
+	assert.Equal(t, 1, deleted)
+}
+
+func TestPublishRejectsDifferentBranchCommitAfterTerminalPublisherFailure(t *testing.T) {
+	repository := newMemoryRepository()
+	deleted := 0
+	runtime := runtimeStub{
+		run: func(workload.PublishRequest) (workload.PublishResult, error) {
+			return workload.PublishResult{Branch: "yar/review", CommitSHA: validCommitSHA}, fmt.Errorf("lost completion: %w", workload.ErrExecutionFailed)
+		},
+		delete: func(string) error {
+			deleted++
+
+			return nil
+		},
+	}
+	branchChecks := 0
+	client := githubClientStub{
+		findPull: func() (*github.PullRequest, error) { return nil, nil },
+		branchCommit: func() (string, bool, error) {
+			branchChecks++
+			if branchChecks == 1 {
+				return "", false, nil
+			}
+
+			return "1111111111111111111111111111111111111111", true, nil
+		},
+	}
+	control := newTestControl(t, repository, runtime, client)
+
+	_, err := control.Publish(context.Background(), validRequest())
+	assert.Equal(t, ErrorConflict, ErrorKindOf(err))
+	assert.ErrorIs(t, err, ErrConflict)
+	assert.Equal(t, StateConflicted, repository.records["review"].State)
+	assert.Equal(t, 1, deleted)
+}
+
 func TestPublishRetryFinishesCleanupFromDurablePullRequestState(t *testing.T) {
 	repository := newMemoryRepository()
 	runtimeFailure := errors.New("cluster unavailable")
 	runtime := runtimeStub{
-		run: func(RuntimeRequest) (RuntimeResult, error) {
-			return RuntimeResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
+		run: func(workload.PublishRequest) (workload.PublishResult, error) {
+			return workload.PublishResult{Branch: "yar/review", CommitSHA: validCommitSHA}, nil
 		},
 		delete: func(string) error { return runtimeFailure },
 	}
@@ -191,17 +292,17 @@ type tokenProviderStub string
 func (t tokenProviderStub) InstallationToken(context.Context) (string, error) { return string(t), nil }
 
 type runtimeStub struct {
-	run    func(RuntimeRequest) (RuntimeResult, error)
+	run    func(workload.PublishRequest) (workload.PublishResult, error)
 	delete func(string) error
 }
 
 func (runtimeStub) Scope() string { return "coding-agents" }
-func (r runtimeStub) RunPublisher(_ context.Context, request RuntimeRequest) (RuntimeResult, error) {
+func (r runtimeStub) RunPublisher(_ context.Context, request workload.PublishRequest) (workload.PublishResult, error) {
 	if r.run != nil {
 		return r.run(request)
 	}
 
-	return RuntimeResult{}, nil
+	return workload.PublishResult{}, nil
 }
 
 func (r runtimeStub) DeletePublisher(_ context.Context, sessionName string) error {

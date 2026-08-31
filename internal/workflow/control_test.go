@@ -158,6 +158,20 @@ func (c definitionCatalog) Find(name string) (Definition, bool) {
 	return CloneDefinition(definition), found
 }
 
+func TestStartRejectsWorkflowRunNamesThatCannotBeProjected(t *testing.T) {
+	for _, name := range []string{"Change", "change-", "abcdefghijklmnopqrstuvwxyzabcdef"} {
+		t.Run(name, func(t *testing.T) {
+			control := newControl(newMemoryRepository(), &fakeSessions{}, testCatalog(), time.Now)
+
+			_, err := control.Start(context.Background(), StartRequest{
+				Workflow: "delivery", Name: name, Repository: "https://github.com/example/service.git", Prompt: "Fix it.",
+			})
+			assert.Equal(t, ErrorInvalid, ErrorKindOf(err))
+			assert.EqualError(t, err, "workflow run name must be a lowercase DNS label no longer than 31 characters")
+		})
+	}
+}
+
 func TestReconcileRunsIndependentStepsThenPassesOutputsToDependentStep(t *testing.T) {
 	repository := newMemoryRepository()
 	sessions := &fakeSessions{statuses: map[string]session.Status{}, artifacts: map[string]session.Artifacts{}}

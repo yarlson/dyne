@@ -42,7 +42,8 @@ Before implementation, report the existing pattern, how the change will follow i
 - `internal/workflow` owns durable multi-session orchestration, dependency scheduling, cancellation, and run artifacts.
 - `internal/publish` owns publish intent identity, branch ownership, retry recovery, pull-request sequencing, and publisher cleanup.
 - `internal/storage` owns the SQLite and PostgreSQL connection, schema, and repositories for session, workflow, and publish state.
-- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS authentication; resource validation and rendering; Kubernetes API operations; and session and publisher Job execution. It implements the runtime contracts owned by `internal/session` and `internal/publish`.
+- `internal/kubernetes` owns kubeconfig, in-cluster, and EKS connection authentication.
+- `internal/workload` owns low-level task and publisher execution contracts, Kubernetes resource validation and rendering, API operations, retained filesystem projections, and Job execution. `internal/session` and `internal/publish` translate their durable domain state into workload requests and own every state transition.
 - `internal/github` owns GitHub App installation authentication, supported repository URLs, commit identity, branch visibility, and pull-request operations.
 - `container/` owns the runtime image and entrypoint. It prepares workspaces, runs bounded Codex tasks, validates result artifacts, and publishes through a clean clone.
 
@@ -57,6 +58,7 @@ cmd/dyne -> internal/publish
 cmd/dyne -> internal/workflow
 cmd/dyne -> internal/kubernetes
 cmd/dyne -> internal/storage
+cmd/dyne -> internal/workload
 internal/controlplane -> internal/agent
 internal/controlplane -> internal/session
 internal/controlplane -> internal/publish
@@ -66,11 +68,11 @@ internal/agent -> internal/session
 internal/workflow -> internal/session
 internal/publish -> internal/session
 internal/publish -> internal/github
+internal/session -> internal/workload
+internal/publish -> internal/workload
 internal/storage -> internal/session
 internal/storage -> internal/publish
 internal/storage -> internal/workflow
-internal/kubernetes -> internal/session
-internal/kubernetes -> internal/publish
 ```
 
 Do not bypass an owning module. Keep external SDK types inside their integration package and translate them at the boundary.
@@ -104,7 +106,7 @@ Kubernetes and GitHub are external integration boundaries. Docker and Colima bui
 - Never put credentials in errors, logs, prompts, setup commands, repository URLs, serialized results, or test fixtures.
 - Close streams and response bodies. Stop timers, signal subscriptions, and goroutines. Bound waits and background work with contexts and timeouts. Pair terminal restoration with terminal setup.
 - Prefer the standard library and existing dependencies. Add a module only when it materially reduces current complexity or risk.
-- Never invoke `kubectl` from product code. Kubernetes access goes through `client-go` in `internal/kubernetes`.
+- Never invoke `kubectl` from product code. Connection loading uses `client-go` in `internal/kubernetes`; workload operations use `client-go` in `internal/workload`.
 
 The repository uses gofumpt, goimports, and gci through golangci-lint. Imports are grouped as standard library, external packages, then `github.com/yarlson/dyne` packages. Separate a return or branch from preceding work, but keep a function containing only that return compact. Add a blank line after a block before the next statement. `make fmt-check` verifies formatting without changing files; `make check` runs the same check in CI.
 

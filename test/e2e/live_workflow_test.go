@@ -29,11 +29,11 @@ import (
 
 	"github.com/yarlson/dyne/internal/agent"
 	dynegithub "github.com/yarlson/dyne/internal/github"
-	dynekubernetes "github.com/yarlson/dyne/internal/kubernetes"
 	"github.com/yarlson/dyne/internal/publish"
 	"github.com/yarlson/dyne/internal/session"
 	"github.com/yarlson/dyne/internal/storage"
 	"github.com/yarlson/dyne/internal/workflow"
+	"github.com/yarlson/dyne/internal/workload"
 )
 
 const (
@@ -334,7 +334,7 @@ func createCodexSecret(t *testing.T, ctx context.Context, client clientset.Inter
 
 func newKubernetesClients(
 	t *testing.T, contextName, namespace string, output io.Writer,
-) (clientset.Interface, *dynekubernetes.Client) {
+) (clientset.Interface, *workload.Runtime) {
 	t.Helper()
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
@@ -343,7 +343,7 @@ func newKubernetesClients(
 
 	client, err := clientset.NewForConfig(config)
 	require.NoError(t, err)
-	runtime, err := dynekubernetes.NewForConfig(config, dynekubernetes.Config{Namespace: namespace, Output: output})
+	runtime, err := workload.NewForConfig(config, workload.Config{Namespace: namespace, Output: output})
 	require.NoError(t, err)
 
 	return client, runtime

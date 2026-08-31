@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yarlson/dyne/internal/workload"
 )
 
 const maxAgentConfigBytes = 900 * 1024
@@ -171,9 +173,7 @@ func (c *Control) Start(ctx context.Context, definition Definition, request Star
 			return StartResult{}, newOperationError(ErrorUnavailable, "prepare repository credential failed", err)
 		}
 
-		if err := c.runtime.Start(ctx, Execution{
-			Session: record, Task: task, RepositoryCredential: credential,
-		}); err != nil {
+		if err := c.runtime.Start(ctx, taskRequest(record, task, false, credential)); err != nil {
 			return StartResult{}, newOperationError(ErrorUnavailable, "start session execution failed", err)
 		}
 	}
@@ -236,7 +236,7 @@ func (c *Control) Continue(ctx context.Context, request ContinueRequest) (TaskRe
 		return TaskResult{}, newOperationError(ErrorUnavailable, "record session task failed", err)
 	}
 
-	if err := c.runtime.Start(ctx, Execution{Session: record, Task: task, Resume: true}); err != nil {
+	if err := c.runtime.Start(ctx, taskRequest(record, task, true, "")); err != nil {
 		return TaskResult{}, newOperationError(ErrorUnavailable, "start session task failed", err)
 	}
 
@@ -387,11 +387,15 @@ func (c *Control) finishDeletion(ctx context.Context, record Record, deleteStora
 		return fmt.Errorf("session runtime scope is %q, server runtime scope is %q", record.RuntimeScope, c.runtime.Scope())
 	}
 
-	if err := c.runtime.Delete(ctx, record.Name, deleteStorage); err != nil {
+	task, err := c.repository.LatestTask(ctx, record.Name)
+	if err == nil && !taskTerminal(task.State) {
+		task, err = c.synchronizeLatestTask(ctx, record)
+	}
+
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
 
-	task, err := c.repository.LatestTask(ctx, record.Name)
 	if err == nil && !taskTerminal(task.State) {
 		now := c.now().UTC()
 		task.State = TaskCanceled
@@ -399,7 +403,9 @@ func (c *Control) finishDeletion(ctx context.Context, record Record, deleteStora
 		if err := c.repository.UpdateTask(ctx, record.Name, task); err != nil {
 			return err
 		}
-	} else if err != nil && !errors.Is(err, ErrNotFound) {
+	}
+
+	if err := c.runtime.Delete(ctx, record.Name, deleteStorage); err != nil {
 		return err
 	}
 
@@ -536,23 +542,35 @@ func (c *Control) synchronizeLatestTask(ctx context.Context, record Record) (Tas
 	return task, nil
 }
 
-func applyObservation(task *Task, observation Observation, now time.Time) error {
-	switch observation.State {
-	case TaskPending, TaskRunning:
-		task.State = observation.State
+func applyObservation(task *Task, observation workload.TaskObservation, now time.Time) error {
+	switch observation.Phase {
+	case workload.TaskPending:
+		task.State = TaskPending
 		task.Failure = observation.Failure
 
 		return nil
-	case TaskFailed, TaskCanceled:
-		task.State = observation.State
-		task.Artifacts = observation.Artifacts
+	case workload.TaskRunning:
+		task.State = TaskRunning
+		task.Failure = observation.Failure
+
+		return nil
+	case workload.TaskFailed:
+		task.State = TaskFailed
+		task.Artifacts = taskArtifacts(observation.Artifacts)
 		task.Failure = observation.Failure
 		task.FinishedAt = &now
 
 		return nil
-	case TaskCompleted:
+	case workload.TaskCanceled:
+		task.State = TaskCanceled
+		task.Artifacts = taskArtifacts(observation.Artifacts)
+		task.Failure = observation.Failure
+		task.FinishedAt = &now
+
+		return nil
+	case workload.TaskSucceeded:
 	default:
-		return fmt.Errorf("runtime returned unsupported task state %q", observation.State)
+		return fmt.Errorf("runtime returned unsupported task phase %q", observation.Phase)
 	}
 
 	var outcome struct {
@@ -586,11 +604,35 @@ func applyObservation(task *Task, observation Observation, now time.Time) error 
 		}
 	}
 
-	task.Artifacts = observation.Artifacts
+	task.Artifacts = taskArtifacts(observation.Artifacts)
 	task.Failure = observation.Failure
 	task.FinishedAt = &now
 
 	return nil
+}
+
+func taskRequest(record Record, task Task, resume bool, credential string) workload.TaskRequest {
+	skills := make([]workload.Skill, len(record.Definition.Skills))
+	for i, skill := range record.Definition.Skills {
+		skills[i] = workload.Skill{Name: skill.Name, Contents: skill.Contents}
+	}
+
+	return workload.TaskRequest{
+		SessionName: record.Name, TaskName: task.ID, Image: record.Image,
+		Storage: workload.Storage(record.Definition.Storage), Repository: record.Repository,
+		InitialRef: record.InitialRef, SetupCommand: record.Definition.SetupCommand, Prompt: task.Prompt,
+		AgentName: record.Definition.Agent, Instructions: record.Definition.Instructions, Skills: skills,
+		CloneDepth: record.Definition.CloneDepth, StorageSize: record.Definition.StorageSize,
+		Timeout: task.Timeout, ResultKind: workload.ResultKind(task.ResultKind),
+		WorkflowRun: record.WorkflowRun, WorkflowStep: record.WorkflowStep,
+		Resume: resume, RepositoryCredential: credential,
+	}
+}
+
+func taskArtifacts(artifacts workload.TaskArtifacts) Artifacts {
+	return Artifacts{
+		Outcome: artifacts.Outcome, PullRequest: artifacts.PullRequest, WorkflowOutput: artifacts.WorkflowOutput,
+	}
 }
 
 func validateStart(definition Definition, request StartRequest) error {

@@ -41,7 +41,7 @@ sqlc-check: require-sqlc ## Check generated database access
 .PHONY: integration-test
 integration-test: ## Run live Kubernetes tests with KUBERNETES_INTEGRATION_CONTEXT
 	@test -n "$(KUBERNETES_INTEGRATION_CONTEXT)" || { printf 'KUBERNETES_INTEGRATION_CONTEXT is required\n'; exit 1; }
-	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" go test -cover -tags=integration -count=1 ./internal/kubernetes
+	KUBERNETES_INTEGRATION_CONTEXT="$(KUBERNETES_INTEGRATION_CONTEXT)" go test -cover -tags=integration -count=1 ./internal/workload
 
 .PHONY: e2e-test
 e2e-test: image ## Run the real private-repository coding and publish journey

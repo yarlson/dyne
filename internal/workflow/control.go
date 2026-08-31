@@ -8,15 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/validation"
-
 	"github.com/yarlson/dyne/internal/session"
 )
+
+var workflowRunNamePattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 
 type sessionOperations interface {
 	Start(context.Context, session.Definition, session.StartRequest) (session.StartResult, error)
@@ -348,7 +349,7 @@ func (c *Control) validateStart(request StartRequest) (Definition, error) {
 		)
 	}
 
-	if messages := validation.IsDNS1123Label(request.Name); len(messages) > 0 || len(request.Name) > 31 {
+	if !workflowRunNamePattern.MatchString(request.Name) || len(request.Name) > 31 {
 		return Definition{}, newOperationError(
 			ErrorInvalid, "workflow run name must be a lowercase DNS label no longer than 31 characters", nil,
 		)

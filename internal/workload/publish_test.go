@@ -1,4 +1,4 @@
-package kubernetes
+package workload
 
 import (
 	"context"
@@ -13,18 +13,16 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"github.com/yarlson/dyne/internal/publish"
 )
 
 func TestRunPublisherUsesExecutionScopedCredentialAndCompletedResult(t *testing.T) {
 	request := validPublisherRequest()
 	clientset := fake.NewClientset(completedPublisherJob(request.IntentID), completedPublisherPod())
-	client := &Client{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
+	client := &Runtime{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
 
 	result, err := client.RunPublisher(context.Background(), request)
 	require.NoError(t, err)
-	assert.Equal(t, publish.RuntimeResult{Branch: "yar/review", CommitSHA: validPublisherCommit}, result)
+	assert.Equal(t, PublishResult{Branch: "yar/review", CommitSHA: validPublisherCommit}, result)
 	secret, err := clientset.CoreV1().Secrets("coding-agents").Get(context.Background(), "review-publish-git", metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, []byte("installation-token"), secret.Data["token"])
@@ -32,7 +30,7 @@ func TestRunPublisherUsesExecutionScopedCredentialAndCompletedResult(t *testing.
 
 func TestRunPublisherPreservesJobWithDifferentCorrelationIntent(t *testing.T) {
 	clientset := fake.NewClientset(completedPublisherJob("another-intent"))
-	client := &Client{
+	client := &Runtime{
 		typed:  clientset,
 		stdout: io.Discard, namespace: "coding-agents",
 	}
@@ -41,6 +39,22 @@ func TestRunPublisherPreservesJobWithDifferentCorrelationIntent(t *testing.T) {
 	require.EqualError(t, err, "publisher Job belongs to a different publish intent")
 	_, err = clientset.CoreV1().Secrets("coding-agents").Get(context.Background(), "review-publish-git", metav1.GetOptions{})
 	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestRunPublisherReportsFailedExecutionWithoutReplacingIt(t *testing.T) {
+	request := validPublisherRequest()
+	job := failedPublisherJob(request.IntentID)
+	clientset := fake.NewClientset(job, failedPublisherPod())
+	runtime := &Runtime{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
+
+	result, err := runtime.RunPublisher(context.Background(), request)
+	require.ErrorIs(t, err, ErrExecutionFailed)
+	assert.Equal(t, PublishResult{Branch: "yar/review", CommitSHA: validPublisherCommit}, result)
+	retained, getErr := clientset.BatchV1().Jobs("coding-agents").Get(
+		context.Background(), "review-publish", metav1.GetOptions{},
+	)
+	require.NoError(t, getErr)
+	assert.Equal(t, job.UID, retained.UID)
 }
 
 func TestPublisherJobUsesSessionPVCAndScopedSecret(t *testing.T) {
@@ -61,7 +75,7 @@ func TestDeletePublisherRemovesJobAndCredential(t *testing.T) {
 		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "review-publish", Namespace: "coding-agents"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "review-publish-git", Namespace: "coding-agents"}},
 	)
-	client := &Client{typed: clientset, namespace: "coding-agents"}
+	client := &Runtime{typed: clientset, namespace: "coding-agents"}
 	require.NoError(t, client.DeletePublisher(context.Background(), "review"))
 
 	_, err := clientset.BatchV1().Jobs("coding-agents").Get(context.Background(), "review-publish", metav1.GetOptions{})
@@ -72,13 +86,13 @@ func TestDeletePublisherRemovesJobAndCredential(t *testing.T) {
 
 func TestParsePublisherJobResultReadsBranchAndCommit(t *testing.T) {
 	result := parsePublisherJobResult("branch=yar/review\ncommit=" + validPublisherCommit + "\ntitle=ignored\n")
-	assert.Equal(t, publish.RuntimeResult{Branch: "yar/review", CommitSHA: validPublisherCommit}, result)
+	assert.Equal(t, PublishResult{Branch: "yar/review", CommitSHA: validPublisherCommit}, result)
 }
 
 const validPublisherCommit = "9a4484441215661904e02a807adf5034d13f5bbe"
 
-func validPublisherRequest() publish.RuntimeRequest {
-	return publish.RuntimeRequest{
+func validPublisherRequest() PublishRequest {
+	return PublishRequest{
 		Session: "review", IntentID: "intent-123", Image: "coding-agent:test",
 		Repository: "https://github.com/lokalise/ratchet-test-service", RepositoryCredential: "installation-token",
 		BaseRef: "main", Branch: "yar/review", CommitMessage: "Fix link",
@@ -109,6 +123,21 @@ func completedPublisherPod() *corev1.Pod {
 			}},
 		}}},
 	}
+}
+
+func failedPublisherJob(intent string) *batchv1.Job {
+	job := completedPublisherJob(intent)
+	job.UID = "failed-job"
+	job.Status.Conditions[0].Type = batchv1.JobFailed
+
+	return job
+}
+
+func failedPublisherPod() *corev1.Pod {
+	pod := completedPublisherPod()
+	pod.UID = "failed-pod"
+
+	return pod
 }
 
 func volumeNamed(t *testing.T, volumes []corev1.Volume, name string) corev1.VolumeSource {

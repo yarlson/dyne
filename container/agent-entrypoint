@@ -84,6 +84,7 @@ publish_workspace() {
   git_publish -c "user.name=${PUBLISH_AUTHOR_NAME}" -c "user.email=${PUBLISH_AUTHOR_EMAIL}" commit -m "${PUBLISH_COMMIT_MESSAGE}"
   local commit_sha remote_sha
   commit_sha="$(git_publish rev-parse HEAD)"
+  printf 'branch=%s\ncommit=%s\n' "${PUBLISH_BRANCH}" "${commit_sha}" > /dev/termination-log
   if ! git_publish push --porcelain -- "${PUBLISH_REPOSITORY}" "HEAD:refs/heads/${PUBLISH_BRANCH}"; then
     remote_sha="$(git_publish ls-remote --heads -- "${PUBLISH_REPOSITORY}" "refs/heads/${PUBLISH_BRANCH}" | awk 'NR == 1 { print $1 }')"
     if [[ "${remote_sha}" != "${commit_sha}" ]]; then
