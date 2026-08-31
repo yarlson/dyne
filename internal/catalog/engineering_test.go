@@ -32,6 +32,11 @@ func TestEmbeddedCatalogLoadsAgentsSkillsAndWorkflows(t *testing.T) {
 	assert.Equal(t, "behavior-implement", implementer.Skills[0].Name)
 	assert.Contains(t, implementer.Instructions, "## Engineering Quality Gate")
 
+	testReviewer, found := agents.Find("test-reviewer")
+	require.True(t, found)
+	assert.Equal(t, "ephemeral", string(testReviewer.Storage))
+	assert.Contains(t, testReviewer.Instructions, "Do not run builds, generators, formatters")
+
 	workflows, err := LoadEngineeringWorkflows(agents)
 	require.NoError(t, err)
 	require.Len(t, workflows.List(), 2)

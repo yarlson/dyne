@@ -1,19 +1,19 @@
 # dyne
 
-dyne is a private Kubernetes control plane for coding sessions. It runs each task as a bounded Job, retains persistent work when requested, and can publish a completed change as a draft pull request.
+dyne runs coding sessions and multi-agent workflows as bounded Kubernetes Jobs.
 
-The `dyne` client calls one server. The server owns the Kubernetes connection, GitHub App identity, agent catalog, and SQL state. The client does not read cluster credentials or GitHub credentials.
+Give dyne a repository and a goal. It starts the work asynchronously and keeps durable state in SQL. A persistent session retains its workspace, Codex thread, logs, and artifacts on one PVC. A later Job can continue the same work.
 
-## What dyne does
+The built-in workflows move a change through explicit engineering stages:
 
-- Run a task with a configured agent.
-- Retain a persistent session's workspace, Codex state, logs, and artifacts on one PVC.
-- Continue a persistent session in a later Job.
-- Run a configured workflow as a durable directed acyclic graph (DAG) of isolated sessions.
-- Publish one completed persistent session through a clean clone and a non-force-pushed branch.
-- Keep session, workflow, and publishing state in SQLite or PostgreSQL.
+```text
+focused-change:     implement → test review → finalize
+engineering-change: investigate → plan → implement → test + security review → finalize
+```
 
-Every task is asynchronous. A start or continuation request succeeds when Kubernetes accepts the Job. Use the status, logs, and artifacts commands to observe the final result.
+Each agent works in an isolated clone. dyne passes verified Git patches and bounded outputs between dependent steps. A completed final session remains available for an explicit publish command. By default, publishing creates a new branch and draft pull request without force-pushing.
+
+The `dyne` client calls one server to start work and read its status, logs, and artifacts. The server owns the Kubernetes connection, GitHub App identity, agent catalog, and SQL state. The client does not need cluster or GitHub credentials.
 
 ## Operating boundary
 

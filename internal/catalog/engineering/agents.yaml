@@ -40,6 +40,8 @@ agents:
     storage: ephemeral
     instructions: |
       Use $test-gap-review to inspect the applied change and its tests without modifying files.
+      The workspace is read-only. Do not run builds, generators, formatters, or other commands that write repository files.
+      Review existing evidence; the persistent finisher owns write-producing validation.
       Return only evidence-backed gaps, or state why the current proof is sufficient.
     skills:
       - skills/test-gap-review/SKILL.md

@@ -15,7 +15,7 @@ workflows:
         change_from: implement
       finalize:
         agent: finisher
-        prompt: Address required review findings and complete final validation.
+        prompt: Address required review findings and run the required validation in your writable workspace.
         after: [implement, test-review]
         change_from: implement
         publishable: true
@@ -47,7 +47,7 @@ workflows:
         change_from: implement
       finalize:
         agent: finisher
-        prompt: Address required review findings and complete final validation.
+        prompt: Address required review findings and run the required validation in your writable workspace.
         after: [implement, test-review, security-review]
         change_from: implement
         publishable: true
