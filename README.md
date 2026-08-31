@@ -1,8 +1,47 @@
 # dyne
 
-dyne coordinates coding agents to investigate, plan, implement, review, and publish code changes.
+dyne runs coding agents in bounded Kubernetes sandboxes and coordinates their work from task to pull request.
 
-Use one agent for a single task, or run a workflow with separate planning, implementation, test review, and security review steps. Tasks run in the cluster, so you can close the client and come back later. You can read the logs, continue a persistent session with another prompt, or publish the finished change.
+An agent bundles instructions, skills, setup, storage, and runtime limits. A session runs one agent against a Git repository in a Kubernetes `Job`. A workflow connects multiple sessions, passes structured results and Git patches between them, and runs independent steps in parallel.
+
+dyne retains logs and validated artifacts, so work continues after the client disconnects. Publishing is always a separate, explicit action.
+
+## Core concepts
+
+| Concept     | What dyne owns                                                                                                                     |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Sandbox     | One bounded Kubernetes `Job` for each coding task, with an isolated workspace and explicit resource and security settings.         |
+| Agent       | A reusable, server-configured definition containing instructions, skills, setup, clone depth, storage, and timeout.                |
+| Skill       | An instruction-only `SKILL.md` file mounted into the agent's Codex home for the task.                                              |
+| Session     | The durable identity, task history, workspace policy, logs, and validated results for one agent working in one repository.         |
+| Workflow    | A durable graph of isolated agent sessions with dependencies, bounded parallelism, structured output, and optional patch handoffs. |
+| Artifact    | A validated outcome, pull-request draft, workflow result, or content-addressed Git patch produced by a task.                       |
+| Publication | An explicit, recoverable operation that turns one completed persistent session into a new branch and pull request.                 |
+
+SQL is the source of truth for session, workflow, and publication state. Kubernetes is the execution layer. Each initial or continued task becomes a `Job`; ephemeral sessions use pod-owned storage, and persistent sessions use a PVC. The CLI talks only to the dyne server.
+
+## How a sandbox runs
+
+Each task uses an ordered init-container chain before the coding agent starts:
+
+```mermaid
+flowchart LR
+    intent[Durable task intent] --> directories[Create session directories]
+    directories --> clone[repo-init: clone repository]
+    clone --> patch[change-init: verify and apply optional patch]
+    patch --> setup[workspace-init: run setup]
+    setup --> auth[auth-init: prepare Codex auth]
+    auth --> agent[agent: run bounded Codex task]
+    agent --> results[Validate outcome and artifacts]
+```
+
+`repo-init` checks out the requested ref and records its base commit. It is the only session container that mounts the short-lived GitHub credential. The main coding-agent container receives neither that credential nor a Kubernetes service-account token.
+
+When a workflow step receives an earlier change, `change-init` mounts the producer's PVC read-only. It verifies the patch's SHA-256 digest and byte count, then applies the patch to the fresh clone before setup runs.
+
+## Built-in engineering workflows
+
+Use one configured agent for a focused task, or use a workflow to divide a change across agents with different responsibilities.
 
 `engineering-change` investigates and plans before implementation, then runs test and security review in parallel:
 
@@ -18,11 +57,13 @@ flowchart LR
     publishStep --> pullRequest[Draft pull request]
 ```
 
-`focused-change` follows Implement → Test review → Finalize. Each workflow step gets its own workspace. Reviewers receive the proposed change and results from earlier steps. No remote branch or pull request is created until you run `dyne publish`. By default, the command opens a draft pull request and never force-pushes.
+`focused-change` follows Implement → Test review → Finalize. Each step gets its own session and workspace. Direct dependencies pass structured JSON results to the next step. A step can also receive a validated Git patch from one direct dependency.
+
+No workflow creates a remote branch or pull request until you run `dyne publish`.
 
 ## Prerequisites
 
-Before you start the server, provide these resources:
+Before you start the server, provide:
 
 - Go 1.26.7 to build from source.
 - A Kubernetes cluster and an existing namespace for the server and its Jobs.
@@ -34,7 +75,7 @@ Before you start the server, provide these resources:
 
 The server does not check `coding-agent-auth` when it starts. A task that needs Codex authentication will fail if the Secret is absent or invalid.
 
-Build the binary and image:
+Build the binary and coding-agent image:
 
 ```bash
 make doctor
@@ -45,7 +86,7 @@ make image
 
 `make image` uses the Docker context in `DOCKER_CONTEXT` and tags the image in `IMAGE`. Their defaults are `colima-codex-k8s` and `coding-agent:local`.
 
-## Start the server
+## Start the control plane
 
 The server defaults to `127.0.0.1:8080`, namespace `coding-agents`, a `10Gi` persistent claim, and a two-hour task timeout.
 
@@ -63,7 +104,7 @@ For local use with a kubeconfig:
   --github-private-key-file /secure/dyne-app.pem
 ```
 
-For a Kubernetes Service, make the server listen on its pod interface. Keep the Service private, for example as a `ClusterIP` service protected by your network policy.
+For a Kubernetes Service, make the server listen on its pod interface. Keep the Service private, for example as a `ClusterIP` service protected by a network policy.
 
 ```bash
 ./bin/dyne server --listen 0.0.0.0:8080 [other server options]
@@ -93,7 +134,7 @@ Do not combine `--eks-cluster` with `--kubeconfig` or `--context`.
 
 The server applies database schema updates at startup. SQLite uses one connection and a local file with restrictive permissions. PostgreSQL is the safer choice when the database must outlive one local process.
 
-## Run a session
+## Run an agent
 
 Set `DYNE_SERVER` when the client cannot use the default `http://127.0.0.1:8080` address. You can also pass `--server` to every client command.
 
@@ -110,9 +151,9 @@ export DYNE_SERVER=http://127.0.0.1:8080
   --prompt 'Fix the parser bug and run the parser tests.'
 ```
 
-The agent definition sets its instructions, skills, setup command, clone depth, storage type, storage size, and default timeout. The client supplies the session name, repository, ref, prompt, and optional timeout. It cannot change the agent settings.
+The server resolves the selected agent into an immutable session definition. The client supplies only the session name, repository, ref, prompt, and optional timeout. It cannot replace the agent's instructions, skills, setup command, clone depth, or storage policy.
 
-Observe the task:
+The task is accepted after its intent is stored in SQL and Kubernetes accepts its resources. The client can then disconnect.
 
 ```bash
 ./bin/dyne status --name parser-fix
@@ -120,16 +161,16 @@ Observe the task:
 ./bin/dyne artifacts --name parser-fix
 ```
 
-`logs --follow` streams newline-delimited JSON. A finished task returns its outcome. Completed standalone tasks also return pull-request metadata. Completed workflow steps can return a size-limited JSON result and a saved Git patch.
+`logs --follow` streams newline-delimited JSON. `artifacts` returns the latest finished task's validated outputs.
 
-### Session storage and cleanup
+### Session storage and continuation
 
-| Session type | Behavior                                                                                                                                     |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ephemeral    | The session workspace uses temporary storage. You cannot continue or publish the session.                                                    |
-| Persistent   | The session retains its workspace, tool home, Codex state, logs, and artifacts on one PVC. You can continue and publish a completed session. |
+| Session type | Behavior                                                                                                                                |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Ephemeral    | Uses pod-owned temporary storage for one task. The workspace is read-only while the agent runs. The session cannot continue or publish. |
+| Persistent   | Retains the workspace, tool home, Codex state, logs, and artifacts on one PVC. A completed session can continue or publish.             |
 
-Continue a persistent session:
+Continue a persistent session with another bounded `Job`:
 
 ```bash
 ./bin/dyne task \
@@ -137,7 +178,7 @@ Continue a persistent session:
   'Address the remaining failed test.'
 ```
 
-Only one task can be active in a persistent session. dyne writes the new task to SQL before it creates Kubernetes resources.
+Only one task can be active in a persistent session. dyne records the new task in SQL before creating Kubernetes resources.
 
 Delete compute resources while keeping a persistent session's PVC and SQL record:
 
@@ -145,7 +186,7 @@ Delete compute resources while keeping a persistent session's PVC and SQL record
 ./bin/dyne delete --name parser-fix
 ```
 
-Delete the persistent storage and state as well:
+Delete the persistent storage and durable state as well:
 
 ```bash
 ./bin/dyne delete --name parser-fix --storage
@@ -153,24 +194,23 @@ Delete the persistent storage and state as well:
 
 If cleanup stops partway through, the server continues it when it next starts.
 
-## Publish a completed change
+## Artifacts and patch handoffs
 
-`dyne publish` works only after a persistent session completes successfully. The repository URL must be an HTTPS `github.com` owner/repository URL. The command requires a new branch and commit message. It uses the session's initial ref as the default pull-request base branch.
+Every task must report an outcome with a status, summary, and blocker. A successful task also reports the result required by its role:
 
-```bash
-./bin/dyne publish \
-  --name parser-fix \
-  --branch dyne/parser-fix \
-  --commit-message 'Fix parser edge case'
-```
+- A standalone or publishable session produces pull-request title and body metadata.
+- A workflow step produces a size-limited JSON object for its direct dependents.
+- A persistent workflow step whose change is needed later produces a content-addressed Git patch.
 
-dyne creates a draft pull request by default. Pass `--ready` to create a ready-for-review pull request.
+After a patch-producing step completes, the container stages the workspace and writes a binary, full-index diff from the base commit recorded by `repo-init`. It stores the patch as `/artifacts/changes/<sha256>.patch` on the session PVC and reports its SHA-256 digest and byte count. The control plane validates and stores this metadata without loading the patch contents into SQL.
 
-The publisher starts from a clean clone. It applies the saved change, commits it, checks the remote branch, and opens the pull request with the title and description from the agent. It does not force-push. Run the same publish command again after a failure; dyne finds the existing branch or pull request instead of creating another one.
+A workflow consumer selects one direct dependency with `change_from`. dyne adds the producer session and patch metadata to the consumer's durable task intent. The consumer starts from its own clean clone, mounts the producer PVC read-only, verifies the patch, and applies it with `git apply --index --binary`. It then runs its setup command and agent. Reviewers and finishers receive the implementation change without sharing a writable workspace.
 
 ## Run a workflow
 
-A workflow defines dependencies between sessions. Steps do not share a writable workspace. With `change_from`, a step can receive a Git patch from one of its direct dependencies. Each run saves the selected workflow and agent settings before it starts any session.
+A workflow is a validated dependency graph of agent sessions. The scheduler starts ready steps up to `max_parallelism` and skips steps whose dependencies do not complete. It stores run and step state so reconciliation can continue after a server restart.
+
+Each run snapshots the selected workflow and agent definitions before it starts the first session.
 
 The built-in catalog contains these agents:
 
@@ -178,9 +218,9 @@ The built-in catalog contains these agents:
 | ------------------- | ---------- | -------------------------------------------------------------- |
 | `investigator`      | Ephemeral  | Examine the current code and recommend what to change.         |
 | `planner`           | Ephemeral  | Write an implementation plan from the investigation results.   |
-| `implementer`       | Persistent | Make the code change and save it for later steps.              |
+| `implementer`       | Persistent | Make the code change and retain it for later steps.            |
 | `test-reviewer`     | Ephemeral  | Check whether the tests prove the changed behavior.            |
-| `security-reviewer` | Ephemeral  | Check changed trust boundaries and ways to exploit the change. |
+| `security-reviewer` | Ephemeral  | Check changed trust boundaries and concrete exploit paths.     |
 | `finisher`          | Persistent | Fix review findings, run final checks, and prepare the change. |
 
 It also contains these workflows:
@@ -203,7 +243,7 @@ List and start workflows:
   --prompt 'Fix the parser bug. Keep the current API behavior.'
 ```
 
-Inspect and control a run:
+Inspect or control a run:
 
 ```bash
 ./bin/dyne workflow-status --name change-123
@@ -212,11 +252,13 @@ Inspect and control a run:
 ./bin/dyne workflow-delete --name change-123
 ```
 
-`workflow-delete` accepts only a finished run. It deletes every step session and its saved files before it removes the workflow record. `workflow-artifacts` returns `publishable_session` when the workflow has a session that you can publish. Pass that name to `dyne publish`.
+`workflow-delete` accepts only a finished run. It deletes every step session and its saved files before removing the workflow record.
 
-## Configure custom agents and workflows
+`workflow-artifacts` returns structured outputs and retained change metadata. It also returns `publishable_session` when the workflow has a session ready for publication.
 
-An agents file is a YAML catalog. Each agent needs a description, storage type, and instructions. `guidance` and every skill path must stay inside the catalog directory. A skill path must name `SKILL.md`.
+## Define agents, skills, and workflows
+
+An agents file is a YAML catalog. Each agent needs a description, storage type, and instructions. Optional shared guidance must name an `AGENTS.md` file. Every skill path must name a `SKILL.md` file. Guidance and skill paths must remain inside the catalog directory and cannot contain symlinks.
 
 ```yaml
 version: v1
@@ -234,13 +276,44 @@ agents:
     timeout: 2h
 ```
 
-Use `persistent` storage only when a session must continue, save a patch for a later workflow step, or publish. `storage_size` is valid only for persistent agents.
+dyne reads each skill's name and description from its front matter. It mounts the complete file at `~/.agents/skills/<name>/SKILL.md` in the agent container. Shared guidance is prepended to the agent's own instructions.
 
-Passing `--agents-file` replaces the built-in agents. Without `--workflows-file`, the server does not expose workflow routes. A custom workflow file must use the custom agent catalog. A workflow can have one publishable leaf step. The source of a `change_from` patch must be a direct dependency.
+Use `persistent` storage only when a session must continue, retain a patch for a later workflow step, or publish. `storage_size` is valid only for persistent agents.
+
+Passing `--agents-file` replaces the built-in agents. Without `--workflows-file`, the server does not expose workflow routes. A custom workflow file must use the custom agent catalog.
+
+A workflow can have one publishable leaf step. The source of a `change_from` patch must be a direct dependency.
+
+## Publish a completed change
+
+`dyne publish` works only after a persistent session completes successfully. The repository URL must be an HTTPS `github.com` owner/repository URL. The command requires a new branch and commit message. It uses the session's initial ref as the default pull-request base branch.
+
+```bash
+./bin/dyne publish \
+  --name parser-fix \
+  --branch dyne/parser-fix \
+  --commit-message 'Fix parser edge case'
+```
+
+dyne creates a draft pull request by default. Pass `--ready` to create a ready-for-review pull request.
+
+The publisher starts from a clean clone. It applies the retained patch when one is available; otherwise, it copies the completed workspace into the clone. It then commits the change, verifies the remote branch, and opens the pull request with the title and description supplied by the agent. It never force-pushes.
+
+Run the same publish command again after a failure. dyne checks the durable publication state, remote branch, and pull request before it retries a non-idempotent operation.
+
+## Deployment model
+
+dyne does not deploy itself. This repository provides the server, CLI client, and coding-agent image. It does not include a Kubernetes Deployment, Service, ServiceAccount, RBAC policy, Helm chart, or Kustomize package.
+
+One server owns one Kubernetes namespace. Only the server reads Kubernetes credentials and the long-lived GitHub App configuration. It loads the catalogs, stores application state in SQL, creates workload resources, and exposes the private HTTP API.
+
+A session pod mounts a short-lived repository credential only in `repo-init`. The main agent container does not receive GitHub credentials or a Kubernetes service-account token.
+
+Use dyne only for trusted repositories in a private cluster. The Kubernetes pod is the command-execution boundary, but it is not designed as hostile multi-tenant isolation. Codex runs inside the agent container with approvals and its own sandbox bypassed.
 
 ## Private HTTP API
 
-The CLI uses these private routes:
+The CLI uses these routes:
 
 | Area                | Routes                                                                                                                                                                                                                                                   |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -249,22 +322,14 @@ The CLI uses these private routes:
 
 Session creation and continuation return `202 Accepted` after Kubernetes accepts the resource. The logs route returns `application/x-ndjson`.
 
-## Deployment model
-
-dyne does not deploy itself. This repository provides the server, client, and coding-agent image. It does not include a Kubernetes Deployment, Service, ServiceAccount, RBAC policy, Helm chart, or Kustomize package.
-
-The `dyne` client calls one server to start work and read its status, logs, and artifacts. Only the server reads Kubernetes and GitHub credentials. It also loads the agent catalog and stores application state in SQL.
-
-Run one server for one namespace. Restrict its Kubernetes identity to that namespace, and keep its HTTP endpoint on a private network. The API has no application authentication.
-
-Use dyne only for trusted repositories in a private cluster. The coding-agent container runs Codex with approvals and its sandbox bypassed. The agent container has no GitHub credential or Kubernetes service-account token, but it can use its Codex credential and network access.
+The API has no application authentication. Keep it behind a private network boundary.
 
 ## Security notes
 
 - The HTTP API has no application authentication. Keep it on a private network.
 - The server creates short-lived GitHub App installation tokens for clone init containers and publisher Jobs. It does not mount them in the coding-agent container.
 - Agent definitions, instructions, skills, setup commands, prompts, repository URLs, and refs can appear in Kubernetes workload resources. Do not put secrets in them.
-- Agent and publisher Pods run as non-root UID/GID 1000. They use a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, and no privilege escalation. Their service-account tokens are disabled. Ingress is denied, but egress is allowed.
+- Agent and publisher pods run as non-root UID/GID 1000. They use a read-only root filesystem, `RuntimeDefault` seccomp, no Linux capabilities, and no privilege escalation. Their service-account tokens are disabled. Ingress is denied, but egress is allowed.
 - The database, workload resources, and server files can contain operational data. Limit who can read them.
 
 ## Development and tests
@@ -277,7 +342,7 @@ make test
 make check
 ```
 
-`make check` runs formatting checks, SQL generation checks, module checks, vet, lint, race tests, and a build. Run `make generate` only after you change the SQL queries or schema.
+`make check` runs formatting checks, SQL generation checks, module checks, vet, lint, race tests, and a build. Run `make generate` only after changing SQL queries or schema.
 
 Set the Kubernetes context when you run the integration test:
 
