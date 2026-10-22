@@ -1,6 +1,6 @@
 module github.com/yarlson/dyne
 
-go 1.26.7
+go 1.27.3
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1

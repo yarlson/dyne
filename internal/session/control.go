@@ -490,13 +490,13 @@ func (c *Control) initialIntent(definition Definition, request StartRequest) (Re
 	now := c.now().UTC()
 
 	return Record{
-			Name: request.Name, IntentID: intentID, RuntimeScope: c.runtime.Scope(), Image: c.image,
-			Definition: definition, Repository: request.Repository, InitialRef: request.InitialRef,
-			WorkflowRun: request.WorkflowRun, WorkflowStep: request.WorkflowStep, CreatedAt: now,
-		}, Task{
-			ID: request.Name, Prompt: request.Prompt, Timeout: request.Timeout, ResultKind: request.ResultKind,
-			ChangeInput: cloneChangeInput(request.ChangeInput), State: TaskPending, CreatedAt: now,
-		}
+		Name: request.Name, IntentID: intentID, RuntimeScope: c.runtime.Scope(), Image: c.image,
+		Definition: definition, Repository: request.Repository, InitialRef: request.InitialRef,
+		WorkflowRun: request.WorkflowRun, WorkflowStep: request.WorkflowStep, CreatedAt: now,
+	}, Task{
+		ID: request.Name, Prompt: request.Prompt, Timeout: request.Timeout, ResultKind: request.ResultKind,
+		ChangeInput: cloneChangeInput(request.ChangeInput), State: TaskPending, CreatedAt: now,
+	}
 }
 
 func (c *Control) session(ctx context.Context, name string) (Record, error) {

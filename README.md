@@ -65,7 +65,7 @@ No workflow creates a remote branch or pull request until you run `dyne publish`
 
 Before you start the server, provide:
 
-- Go 1.26.7 to build from source.
+- Go 1.27.3 to build from source.
 - A Kubernetes cluster and an existing namespace for the server and its Jobs.
 - A storage class that supports the `ReadWriteOnce` PVCs used by persistent sessions.
 - A coding-agent image that cluster nodes can pull. The default image name is `coding-agent:local`.
