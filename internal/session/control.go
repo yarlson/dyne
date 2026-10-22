@@ -49,8 +49,7 @@ func (e *operationError) Unwrap() error { return e.cause }
 
 // ErrorKindOf returns the stable classification of a session operation error.
 func ErrorKindOf(err error) ErrorKind {
-	var target *operationError
-	if errors.As(err, &target) {
+	if target, ok := errors.AsType[*operationError](err); ok {
 		return target.kind
 	}
 

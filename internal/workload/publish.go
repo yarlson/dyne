@@ -84,8 +84,8 @@ func (c *Runtime) ensurePublisherCredential(ctx context.Context, request Publish
 	secret, err := secrets.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		_, err = secrets.Create(ctx, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.namespace, Labels: publisherLabels(request.Session)},
-			Type:       corev1.SecretTypeOpaque, Data: map[string][]byte{"token": []byte(request.RepositoryCredential)},
+			Name: name, Namespace: c.namespace, Labels: publisherLabels(request.Session),
+			Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"token": []byte(request.RepositoryCredential)},
 		}, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("create publisher credential Secret: %w", err)
@@ -269,33 +269,31 @@ func publisherJob(namespace string, request PublishRequest) *batchv1.Job {
 	volumes := []corev1.Volume{
 		{
 			Name: "artifacts",
-			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 				ClaimName: sessionClaimName(request.Session), ReadOnly: true,
-			}},
+			},
 		},
-		{Name: "publish", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resourceQuantity("4Gi"))}}},
-		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: new(resourceQuantity("1Gi"))}}},
+		{Name: "publish", EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resourceQuantity("4Gi"))}},
+		{Name: "tmp", EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: new(resourceQuantity("1Gi"))}},
 		{
 			Name: "git-auth",
-			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			Secret: &corev1.SecretVolumeSource{
 				SecretName: publisherCredentialName(request.Session), DefaultMode: new(int32(0o440)),
-			}},
+			},
 		},
 	}
 	if request.Change == nil {
 		volumes = append([]corev1.Volume{{
 			Name: "workspace",
-			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 				ClaimName: sessionClaimName(request.Session), ReadOnly: true,
-			}},
+			},
 		}}, volumes...)
 	}
 
 	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: publisherJobName(request.Session), Namespace: namespace, Labels: jobLabels,
-			Annotations: map[string]string{publishIntentAnnotationKey: request.IntentID},
-		},
+		Name: publisherJobName(request.Session), Namespace: namespace, Labels: jobLabels,
+		Annotations: map[string]string{publishIntentAnnotationKey: request.IntentID},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: new(int32(0)), ActiveDeadlineSeconds: new(int64(request.Timeout.Seconds())),
 			Template: corev1.PodTemplateSpec{

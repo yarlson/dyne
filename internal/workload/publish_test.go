@@ -84,8 +84,8 @@ func TestPublisherJobKeepsLegacyWorkspacePathWithoutChangeMetadata(t *testing.T)
 
 func TestDeletePublisherRemovesJobAndCredential(t *testing.T) {
 	clientset := fake.NewClientset(
-		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "review-publish", Namespace: "coding-agents"}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "review-publish-git", Namespace: "coding-agents"}},
+		&batchv1.Job{Name: "review-publish", Namespace: "coding-agents"},
+		&corev1.Secret{Name: "review-publish-git", Namespace: "coding-agents"},
 	)
 	client := &Runtime{typed: clientset, namespace: "coding-agents"}
 	require.NoError(t, client.DeletePublisher(context.Background(), "review"))
@@ -124,10 +124,8 @@ func volumeNames(volumes []corev1.Volume) []string {
 
 func completedPublisherJob(intent string) *batchv1.Job {
 	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "review-publish", Namespace: "coding-agents",
-			Annotations: map[string]string{publishIntentAnnotationKey: intent},
-		},
+		Name: "review-publish", Namespace: "coding-agents",
+		Annotations: map[string]string{publishIntentAnnotationKey: intent},
 		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
 			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
 		}}},
@@ -136,9 +134,7 @@ func completedPublisherJob(intent string) *batchv1.Job {
 
 func completedPublisherPod() *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "review-publish-pod", Namespace: "coding-agents", Labels: map[string]string{"job-name": "review-publish"},
-		},
+		Name: "review-publish-pod", Namespace: "coding-agents", Labels: map[string]string{"job-name": "review-publish"},
 		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
 			Name: "publisher", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 				Message: "branch=yar/review\ncommit=" + validPublisherCommit + "\n",
