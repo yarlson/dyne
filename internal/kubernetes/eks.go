@@ -90,10 +90,8 @@ func eksRESTConfig(awsConfig aws.Config, clusterName string, output *eks.Describ
 	tokens := newEKSTokenCache(newEKSTokenGenerator(awsConfig, clusterName), time.Now)
 
 	return &rest.Config{
-		Host: *output.Cluster.Endpoint,
-		TLSClientConfig: rest.TLSClientConfig{
-			CAData: certificateAuthority,
-		},
+		Host:   *output.Cluster.Endpoint,
+		CAData: certificateAuthority,
 		WrapTransport: func(base http.RoundTripper) http.RoundTripper {
 			return eksAuthorizationTransport{base: base, tokens: tokens}
 		},

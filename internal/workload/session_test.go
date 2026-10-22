@@ -20,14 +20,12 @@ import (
 
 func TestObserveReturnsCompletedTaskArtifacts(t *testing.T) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "coding-agents"},
-		Status:     batchv1.JobStatus{Succeeded: 1},
+		Name: "review", Namespace: "coding-agents",
+		Status: batchv1.JobStatus{Succeeded: 1},
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "review-pod", Namespace: "coding-agents",
-			Labels: map[string]string{"coding-agent/session": "review", "coding-agent/task": "review"},
-		},
+		Name: "review-pod", Namespace: "coding-agents",
+		Labels: map[string]string{"coding-agent/session": "review", "coding-agent/task": "review"},
 		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
 			Name: "agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 				Message: "outcome=eyJzdGF0dXMiOiJjb21wbGV0ZWQifQ==\npull-request=eyJ0aXRsZSI6IkZpeCIsImJvZHkiOiJCb2R5In0=\n",
@@ -45,8 +43,8 @@ func TestObserveReturnsCompletedTaskArtifacts(t *testing.T) {
 
 func TestObserveReturnsRunningWithoutInspectingOtherResources(t *testing.T) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: "review-next", Namespace: "coding-agents"},
-		Status:     batchv1.JobStatus{Active: 1},
+		Name: "review-next", Namespace: "coding-agents",
+		Status: batchv1.JobStatus{Active: 1},
 	}
 	client := &Runtime{typed: fake.NewClientset(job), namespace: "coding-agents"}
 
@@ -58,10 +56,10 @@ func TestObserveReturnsRunningWithoutInspectingOtherResources(t *testing.T) {
 func TestDeleteRemovesDisposableProjectionsAndRetainsPVC(t *testing.T) {
 	resourceLabels := map[string]string{"coding-agent/session": "review"}
 	clientset := fake.NewClientset(
-		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "coding-agents", Labels: resourceLabels}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "session-review-agent", Namespace: "coding-agents", Labels: resourceLabels}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "review-git", Namespace: "coding-agents", Labels: resourceLabels}},
-		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "session-review", Namespace: "coding-agents", Labels: resourceLabels}},
+		&batchv1.Job{Name: "review", Namespace: "coding-agents", Labels: resourceLabels},
+		&corev1.ConfigMap{Name: "session-review-agent", Namespace: "coding-agents", Labels: resourceLabels},
+		&corev1.Secret{Name: "review-git", Namespace: "coding-agents", Labels: resourceLabels},
+		&corev1.PersistentVolumeClaim{Name: "session-review", Namespace: "coding-agents", Labels: resourceLabels},
 	)
 	client := &Runtime{typed: clientset, stdout: io.Discard, namespace: "coding-agents"}
 
@@ -78,7 +76,7 @@ func TestDeleteRemovesDisposableProjectionsAndRetainsPVC(t *testing.T) {
 
 func TestDeleteStorageReportsPVCFailure(t *testing.T) {
 	clientset := fake.NewClientset(&corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "session-review", Namespace: "coding-agents"},
+		Name: "session-review", Namespace: "coding-agents",
 	})
 	clientset.PrependReactor("delete", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, assert.AnError

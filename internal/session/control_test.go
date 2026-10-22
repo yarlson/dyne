@@ -331,6 +331,7 @@ func (r runtimeStub) Observe(_ context.Context, name, task string) (workload.Tas
 }
 
 func (r runtimeStub) WriteLogs(context.Context, string, string, bool, io.Writer) error { return nil }
+
 func (r runtimeStub) Delete(_ context.Context, name string, storage bool) error {
 	if r.delete != nil {
 		return r.delete(name, storage)

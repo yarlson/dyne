@@ -133,12 +133,10 @@ func (c *Client) WaitForBranchCommit(ctx context.Context, repository Repository,
 // FindOpenPullRequest returns the matching open pull request, nil when none exists, and an error for multiple matches.
 func (c *Client) FindOpenPullRequest(ctx context.Context, repository Repository, baseBranch, branch string) (*PullRequest, error) {
 	pulls, _, err := c.api.PullRequests.List(ctx, repository.owner, repository.name, &gh.PullRequestListOptions{
-		State: "open",
-		Head:  repository.owner + ":" + branch,
-		Base:  baseBranch,
-		ListOptions: gh.ListOptions{
-			PerPage: 2,
-		},
+		State:   "open",
+		Head:    repository.owner + ":" + branch,
+		Base:    baseBranch,
+		PerPage: 2,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("find existing GitHub pull request: %w", err)
